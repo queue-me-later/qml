@@ -1,6 +1,6 @@
 [package]
 name = "qml-rs"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["QML Contributors"]
 description = "A Rust implementation of QML background job processing"

@@ -10,6 +10,20 @@ use uuid::Uuid;
 use super::{PostgresConfig, Storage, StorageError};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob};
 
+/// Default name of the jobs table. `PostgresConfig::table_name` defaults to
+/// this and can be overridden, but the recurring-jobs table is not
+/// configurable and always lives alongside it.
+const JOBS_TABLE_NAME: &str = "qml_jobs";
+
+/// Tables the current release expects under the configured schema.
+///
+/// Used by [`PostgresStorage::schema_is_current`] to decide whether an
+/// already-installed schema needs `install.sql` rerun for new tables.
+/// Keeping this list here (instead of probing `install.sql` at runtime)
+/// keeps the check O(1) per table and visible in code review when a table
+/// is added.
+const CURRENT_SCHEMA_TABLES: &[&str] = &[JOBS_TABLE_NAME, "qml_recurring_jobs"];
+
 /// PostgreSQL storage implementation for jobs
 ///
 /// This storage implementation uses PostgreSQL with sqlx for persistence.
@@ -47,16 +61,54 @@ impl PostgresStorage {
         Ok(storage)
     }
 
-    /// Check if the schema and tables exist
+    /// Check if the schema and primary jobs table exist.
     ///
-    /// This method checks for the existence of the required schema and table
-    /// before attempting any operations. This is useful for detecting when
-    /// migrations need to be run.
+    /// This is the literal "has QML ever been installed here?" check. It
+    /// returns `true` as soon as the configured schema and `qml_jobs` table
+    /// are present, even if the database predates newer tables like
+    /// `qml_recurring_jobs`. Use [`schema_is_current`](Self::schema_is_current)
+    /// when you need to gate migrations on the *current* release's full
+    /// surface area.
     pub async fn schema_exists(&self) -> Result<bool, StorageError> {
-        // Check if schema exists
+        if !self.check_schema_present().await? {
+            return Ok(false);
+        }
+        self.table_exists(&self.config.table_name).await
+    }
+
+    /// Check whether every table the current release expects is already
+    /// installed.
+    ///
+    /// This is stricter than [`schema_exists`](Self::schema_exists): it
+    /// returns `false` when the main jobs table is present but newer tables
+    /// (e.g. `qml_recurring_jobs`, introduced after 1.0.1) are missing. That
+    /// lets `migrate_if_needed` trigger the idempotent `install.sql` on an
+    /// upgrade from 1.0.1 rather than treating the schema as already up to
+    /// date.
+    pub async fn schema_is_current(&self) -> Result<bool, StorageError> {
+        if !self.check_schema_present().await? {
+            return Ok(false);
+        }
+        for table in CURRENT_SCHEMA_TABLES {
+            if !self.table_exists(table).await? {
+                return Ok(false);
+            }
+        }
+        // Also verify the user-configured jobs table (which may differ from
+        // the default "qml_jobs" when with_table_name is used).
+        if self.config.table_name != JOBS_TABLE_NAME
+            && !self.table_exists(&self.config.table_name).await?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Check whether the configured schema itself exists.
+    async fn check_schema_present(&self) -> Result<bool, StorageError> {
         let schema_query =
             "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)";
-        let schema_exists = sqlx::query_scalar::<_, bool>(schema_query)
+        sqlx::query_scalar::<_, bool>(schema_query)
             .bind(&self.config.schema_name)
             .fetch_one(&self.pool)
             .await
@@ -64,26 +116,26 @@ impl PostgresStorage {
                 operation: "schema_check".to_string(),
                 message: format!("Failed to check schema existence: {}", e),
                 source: Some(Box::new(e)),
-            })?;
+            })
+    }
 
-        if !schema_exists {
-            return Ok(false);
-        }
-
-        // Check if table exists
-        let table_query = "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)";
-        let table_exists = sqlx::query_scalar::<_, bool>(table_query)
+    /// Check whether a specific table exists under the configured schema.
+    async fn table_exists(&self, table_name: &str) -> Result<bool, StorageError> {
+        let table_query = "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                           WHERE table_schema = $1 AND table_name = $2)";
+        sqlx::query_scalar::<_, bool>(table_query)
             .bind(&self.config.schema_name)
-            .bind(&self.config.table_name)
+            .bind(table_name)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::OperationFailed {
                 operation: "table_check".to_string(),
-                message: format!("Failed to check table existence: {}", e),
+                message: format!(
+                    "Failed to check table existence for '{}': {}",
+                    table_name, e
+                ),
                 source: Some(Box::new(e)),
-            })?;
-
-        Ok(table_exists)
+            })
     }
 
     /// Helper method to detect if a database error is schema-related
@@ -227,22 +279,27 @@ impl PostgresStorage {
 
     /// Migrate with automatic schema detection
     ///
-    /// This is a convenience method that combines schema detection and migration.
-    /// It will only run migrations if the schema doesn't exist or is incomplete.
+    /// This is a convenience method that combines schema detection and
+    /// migration. It runs `install.sql` whenever the schema is absent *or*
+    /// out of date relative to the current release — e.g. upgrading a
+    /// 1.0.1 database to 2.0, where `qml_jobs` exists but
+    /// `qml_recurring_jobs` does not yet. `install.sql` uses
+    /// `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION`, so
+    /// rerunning it against an already-populated database is safe.
     pub async fn migrate_if_needed(&self) -> Result<bool, StorageError> {
-        match self.schema_exists().await {
+        match self.schema_is_current().await {
             Ok(true) => {
-                tracing::debug!("Schema exists, skipping migration");
+                tracing::debug!("Schema is current, skipping migration");
                 Ok(false)
             }
             Ok(false) => {
-                tracing::info!("Schema not found, running migrations...");
+                tracing::info!("Schema missing or out of date, running install.sql...");
                 self.migrate().await?;
                 Ok(true)
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to check schema existence, attempting migration anyway: {}",
+                    "Failed to check schema currency, attempting migration anyway: {}",
                     e
                 );
                 self.migrate().await?;

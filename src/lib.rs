@@ -24,7 +24,7 @@
 //!
 //! # tokio_test::block_on(async {
 //! let storage = Arc::new(MemoryStorage::new());
-//! let job = Job::new("process_data", vec!["input.csv".to_string()]);
+//! let job = Job::new("process_data", serde_json::json!({ "file": "input.csv" }));
 //! storage.enqueue(&job).await.unwrap();
 //! # });
 //! ```
@@ -73,9 +73,8 @@
 //! #[async_trait]
 //! impl Worker for EmailWorker {
 //!     async fn execute(&self, job: &Job, _context: &WorkerContext) -> Result<WorkerResult, QmlError> {
-//!         let email = &job.arguments[0];
+//!         let email = job.payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
 //!         println!("Sending email to: {}", email);
-//!         // Email sending logic here
 //!         Ok(WorkerResult::success(None, 0))
 //!     }
 //!
@@ -173,7 +172,7 @@
 //! ```rust
 //! use qml_rs::{Job, JobState};
 //!
-//! let mut job = Job::new("process_payment", vec!["order_123".to_string()]);
+//! let mut job = Job::new("process_payment", serde_json::json!({ "order": "order_123" }));
 //!
 //! // Job starts as Enqueued
 //! assert!(matches!(job.state, JobState::Enqueued { .. }));
@@ -258,7 +257,7 @@
 //! #[tokio::test]
 //! async fn test_job_processing() {
 //!     let storage = MemoryStorage::new();
-//!     let job = Job::new("test_job", vec!["arg1".to_string()]);
+//!     let job = Job::new("test_job", serde_json::json!({ "arg": "arg1" }));
 //!
 //!     storage.enqueue(&job).await.unwrap();
 //!     let retrieved = storage.get(&job.id).await.unwrap().unwrap();
@@ -278,7 +277,7 @@
 //!
 //!     // Create 100 jobs concurrently
 //!     let jobs: Vec<_> = (0..100).map(|i| {
-//!         Job::new("concurrent_job", vec![i.to_string()])
+//!         Job::new("concurrent_job", serde_json::json!({ "i": i }))
 //!     }).collect();
 //!
 //!     let futures: Vec<_> = jobs.iter().map(|job| {
@@ -369,8 +368,9 @@ pub use dashboard::{
 };
 pub use error::{QmlError, Result};
 pub use processing::{
-    BackgroundJobServer, JobActivator, JobProcessor, JobScheduler, RetryPolicy, RetryStrategy,
-    ServerConfig, Worker, WorkerConfig, WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, JobProcessor, JobScheduler, RetryPolicy, RetryStrategy, ServerConfig,
+    TypedWorker, TypedWorkerAdapter, Worker, WorkerConfig, WorkerContext, WorkerRegistry,
+    WorkerResult,
 };
 pub use storage::{MemoryStorage, Storage, StorageConfig, StorageError, StorageInstance};
 

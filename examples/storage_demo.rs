@@ -47,7 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "redis")]
     {
         // Set environment variable for Redis URL
-        std::env::set_var("REDIS_URL", "redis://127.0.0.1:6379");
+        unsafe {
+            std::env::set_var("REDIS_URL", "redis://127.0.0.1:6379");
+        }
 
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -103,7 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Clean up environment variable
-        std::env::remove_var("REDIS_URL");
+        unsafe {
+            std::env::remove_var("REDIS_URL");
+        }
     }
 
     #[cfg(not(feature = "redis"))]
@@ -128,13 +132,16 @@ async fn demo_storage_operations(
     // Create sample jobs
     let job1 = Job::new(
         "send_email",
-        vec!["user@example.com".to_string(), "Welcome!".to_string()],
+        serde_json::json!(["user@example.com".to_string(), "Welcome!".to_string()]),
     );
     let job2 = Job::new(
         "process_payment",
-        vec!["order_123".to_string(), "99.99".to_string()],
+        serde_json::json!(["order_123".to_string(), "99.99".to_string()]),
     );
-    let mut job3 = Job::new("generate_report", vec!["monthly".to_string()]);
+    let mut job3 = Job::new(
+        "generate_report",
+        serde_json::json!(["monthly".to_string()]),
+    );
 
     // Set different priorities and states
     job3.priority = 10; // High priority
@@ -221,7 +228,9 @@ async fn demo_config_serialization() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "redis")]
     let redis_config = {
         // Set environment variable for Redis configuration demo
-        std::env::set_var("REDIS_URL", "redis://localhost:6379");
+        unsafe {
+            std::env::set_var("REDIS_URL", "redis://localhost:6379");
+        }
         StorageConfig::Redis(
             RedisConfig::new()
                 .with_url("redis://localhost:6379")
@@ -247,7 +256,9 @@ async fn demo_config_serialization() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _: StorageConfig = serde_json::from_str(&redis_json)?;
         // Clean up environment variable
-        std::env::remove_var("REDIS_URL");
+        unsafe {
+            std::env::remove_var("REDIS_URL");
+        }
     }
 
     println!("✅ Configuration serialization test passed");

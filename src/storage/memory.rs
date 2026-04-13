@@ -306,10 +306,11 @@ impl Storage for MemoryStorage {
 
         for mut job in available_jobs {
             // Check if job matches queue filter
-            if let Some(queues) = queues {
-                if !queues.is_empty() && !queues.contains(&job.queue) {
-                    continue;
-                }
+            if let Some(queues) = queues
+                && !queues.is_empty()
+                && !queues.contains(&job.queue)
+            {
+                continue;
             }
 
             // Check if job is already locked
@@ -368,11 +369,11 @@ impl Storage for MemoryStorage {
     async fn release_job_lock(&self, job_id: &str, worker_id: &str) -> Result<bool, StorageError> {
         let mut locks = self.locks.lock().unwrap();
 
-        if let Some(lock) = locks.get(job_id) {
-            if lock.worker_id == worker_id {
-                locks.remove(job_id);
-                return Ok(true);
-            }
+        if let Some(lock) = locks.get(job_id)
+            && lock.worker_id == worker_id
+        {
+            locks.remove(job_id);
+            return Ok(true);
         }
 
         Ok(false)
@@ -415,7 +416,7 @@ mod tests {
     use chrono::Duration;
 
     fn create_test_job() -> Job {
-        Job::new("test_job", vec!["test_arg".to_string()])
+        Job::new("test_job", serde_json::json!(["test_arg".to_string()]))
     }
 
     #[tokio::test]

@@ -204,7 +204,7 @@ impl JobProcessor {
 
         // Add execution metadata
         for (key, value) in metadata {
-            job.add_metadata(&format!("exec_{}", key), value);
+            job.add_metadata(format!("exec_{}", key), value);
         }
 
         // Update in storage
@@ -420,7 +420,7 @@ mod tests {
         let config = WorkerConfig::new("test-worker");
         let processor = JobProcessor::new(registry, storage.clone(), config);
 
-        let job = Job::new("test_method", vec!["arg1".to_string()]);
+        let job = Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         let job_id = job.id.clone();
 
         // Store the job first
@@ -446,7 +446,7 @@ mod tests {
         let processor =
             JobProcessor::with_retry_policy(registry, storage.clone(), config, retry_policy);
 
-        let job = Job::new("test_method", vec!["arg1".to_string()]);
+        let job = Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         let job_id = job.id.clone();
 
         // Store the job first
@@ -470,7 +470,7 @@ mod tests {
         let config = WorkerConfig::new("test-worker");
         let processor = JobProcessor::new(registry, storage.clone(), config);
 
-        let job = Job::new("test_method", vec!["arg1".to_string()]);
+        let job = Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         let job_id = job.id.clone();
 
         // Store the job first
@@ -496,7 +496,7 @@ mod tests {
         let processor =
             JobProcessor::with_retry_policy(registry, storage.clone(), config, retry_policy);
 
-        let job = Job::new("limited_retry_method", vec![]);
+        let job = Job::new("limited_retry_method", serde_json::Value::Null);
         let job_id = job.id.clone();
         storage.enqueue(&job).await.unwrap();
 
@@ -534,7 +534,13 @@ mod tests {
         let processor =
             JobProcessor::with_retry_policy(registry, storage.clone(), config, retry_policy);
 
-        let job = Job::with_config("job_specific_limit", vec![], "default", 0, 1);
+        let job = Job::with_config(
+            "job_specific_limit",
+            serde_json::Value::Null,
+            "default",
+            0,
+            1,
+        );
         let job_id = job.id.clone();
         storage.enqueue(&job).await.unwrap();
 
@@ -571,7 +577,7 @@ mod tests {
         let config = WorkerConfig::new("test-worker");
         let processor = JobProcessor::new(registry, storage.clone(), config);
 
-        let job = Job::new("manual_retry_method", vec![]);
+        let job = Job::new("manual_retry_method", serde_json::Value::Null);
         let job_id = job.id.clone();
         storage.enqueue(&job).await.unwrap();
 
@@ -584,9 +590,7 @@ mod tests {
 
         // Manual retry: Failed → Enqueued is a legal transition.
         let mut manual = after_first;
-        manual
-            .set_state(JobState::enqueued(&manual.queue))
-            .unwrap();
+        manual.set_state(JobState::enqueued(&manual.queue)).unwrap();
         storage.update(&manual).await.unwrap();
 
         // Second attempt: fails again, attempt counter must advance.

@@ -31,7 +31,7 @@ fn test_qml_environment_variables() {
 
     // Verify they can be read back
     for (key, expected_value) in &test_vars {
-        let actual_value = env::var(key).expect(&format!("{} should be set", key));
+        let actual_value = env::var(key).unwrap_or_else(|_| panic!("{} should be set", key));
         assert_eq!(&actual_value, expected_value);
         println!("✅ {}: {}", key, actual_value);
     }
@@ -85,7 +85,10 @@ async fn test_axum_qml_integration_with_env_vars() {
     };
 
     // Test job creation (typical Axum handler pattern)
-    let job = Job::new("test_job", vec!["arg1".to_string(), "arg2".to_string()]);
+    let job = Job::new(
+        "test_job",
+        serde_json::json!(["arg1".to_string(), "arg2".to_string()]),
+    );
     let job_id = job.id.to_string();
 
     // This is exactly how you'd use it in an Axum handler

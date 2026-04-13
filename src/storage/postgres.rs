@@ -272,12 +272,7 @@ impl PostgresStorage {
     ) -> Result<(String, serde_json::Value, serde_json::Value), StorageError> {
         let state_name = Self::job_state_to_name(&job.state);
         let state_data = Self::job_state_to_data(&job.state)?;
-        let arguments =
-            serde_json::to_value(&job.arguments).map_err(|e| StorageError::SerializationError {
-                message: format!("Failed to serialize job arguments: {}", e),
-            })?;
-
-        Ok((state_name, state_data, arguments))
+        Ok((state_name, state_data, job.payload.clone()))
     }
 
     /// Convert database row to Job
@@ -294,17 +289,11 @@ impl PostgresStorage {
                     message: format!("Failed to get method name: {}", e),
                 })?;
 
-        let arguments_json: serde_json::Value =
+        let payload: serde_json::Value =
             row.try_get("arguments")
                 .map_err(|e| StorageError::DeserializationError {
-                    message: format!("Failed to get arguments: {}", e),
+                    message: format!("Failed to get payload: {}", e),
                 })?;
-
-        let arguments: Vec<String> = serde_json::from_value(arguments_json).map_err(|e| {
-            StorageError::DeserializationError {
-                message: format!("Failed to deserialize arguments: {}", e),
-            }
-        })?;
 
         let created_at: DateTime<Utc> =
             row.try_get("created_at")
@@ -379,7 +368,7 @@ impl PostgresStorage {
         Ok(Job {
             id: id.to_string(),
             method: method_name,
-            arguments,
+            payload,
             created_at,
             state,
             queue: queue_name,
@@ -877,7 +866,8 @@ impl Storage for PostgresStorage {
         // and removes a window where the row is locked but not yet marked.
         let queue_filter = match queues {
             Some(qs) if !qs.is_empty() => {
-                let placeholders: Vec<String> = (3..3 + qs.len()).map(|i| format!("${}", i)).collect();
+                let placeholders: Vec<String> =
+                    (3..3 + qs.len()).map(|i| format!("${}", i)).collect();
                 format!(" AND queue_name = ANY(ARRAY[{}])", placeholders.join(","))
             }
             _ => String::new(),
@@ -903,19 +893,20 @@ impl Storage for PostgresStorage {
             queue_filter = queue_filter,
         );
 
-        let mut sqlx_query = sqlx::query(&query).bind(&new_state_name).bind(&new_state_data);
+        let mut sqlx_query = sqlx::query(&query)
+            .bind(&new_state_name)
+            .bind(&new_state_data);
         if let Some(qs) = queues {
             for queue in qs {
                 sqlx_query = sqlx_query.bind(queue);
             }
         }
 
-        let row = sqlx_query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::OperationError {
+        let row = sqlx_query.fetch_optional(&self.pool).await.map_err(|e| {
+            StorageError::OperationError {
                 message: format!("Failed to fetch and lock job: {}", e),
-            })?;
+            }
+        })?;
 
         match row {
             Some(row) => Ok(Some(Self::row_to_job(&row)?)),
@@ -1024,7 +1015,7 @@ mod tests {
 
         // Test that we can instantiate the config without errors
         // This indirectly tests that our functions are available and don't cause compilation issues
-        assert_eq!(config.auto_migrate, false);
+        assert!(!config.auto_migrate);
         assert!(!config.database_url.is_empty());
 
         // Test direct access to the is_schema_error function to ensure it's available

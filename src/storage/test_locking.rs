@@ -556,15 +556,14 @@ where
 fn create_test_job(method: &str) -> Job {
     Job::new(
         method.to_string(),
-        vec!["arg1".to_string(), "arg2".to_string()],
+        serde_json::json!(["arg1".to_string(), "arg2".to_string()]),
     )
 }
 
 #[cfg(feature = "redis")]
 async fn create_redis_storage() -> Option<RedisStorage> {
     let config = RedisConfig::default();
-    let result = RedisStorage::with_config(config).await.ok();
-    result
+    RedisStorage::with_config(config).await.ok()
 }
 
 #[cfg(feature = "postgres")]

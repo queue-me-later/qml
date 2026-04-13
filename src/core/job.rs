@@ -18,71 +18,40 @@
 //! ### Basic Job Creation
 //! ```rust
 //! use qml_rs::Job;
+//! use serde_json::json;
 //!
-//! // Simple job with method and arguments
-//! let job = Job::new("send_email", vec!["user@example.com".to_string()]);
+//! // Simple job with a JSON payload
+//! let job = Job::new("send_email", json!({ "to": "user@example.com" }));
 //!
-//! // Job with custom configuration
-//! let job = Job::with_config(
+//! // Typed payload via Serialize
+//! #[derive(serde::Serialize)]
+//! struct Payment { order_id: String, amount: f64 }
+//! let job = Job::new_typed(
 //!     "process_payment",
-//!     vec!["order_123".to_string(), "99.99".to_string()],
-//!     "payments",  // queue
-//!     10,          // priority (higher = more important)
-//!     3            // max retries
-//! );
+//!     &Payment { order_id: "order_123".into(), amount: 99.99 },
+//! ).unwrap();
 //! ```
 //!
 //! ### Job Serialization
 //! ```rust
 //! use qml_rs::Job;
+//! use serde_json::json;
 //!
-//! let job = Job::new("process_data", vec!["file.csv".to_string()]);
+//! let job = Job::new("process_data", json!({ "file": "file.csv" }));
 //!
 //! // Serialize for storage
-//! let json = job.serialize().unwrap();
-//! println!("Serialized: {}", json);
+//! let s = job.serialize().unwrap();
 //!
 //! // Deserialize from storage
-//! let restored_job = Job::deserialize(&json).unwrap();
-//! assert_eq!(job.id, restored_job.id);
-//! ```
-//!
-//! ### State Management
-//! ```rust
-//! use qml_rs::{Job, JobState};
-//!
-//! let mut job = Job::new("generate_report", vec!["Q4".to_string()]);
-//!
-//! // Transition to processing
-//! job.set_state(JobState::processing("worker-1", "server-1")).unwrap();
-//!
-//! // Mark as succeeded
-//! job.set_state(JobState::succeeded(2500, Some("Report generated".to_string()))).unwrap();
-//! ```
-//!
-//! ### Metadata and Configuration
-//! ```rust
-//! use qml_rs::Job;
-//!
-//! let mut job = Job::new("backup_database", vec!["production".to_string()]);
-//!
-//! // Add metadata for tracking
-//! job.add_metadata("user_id", "123");
-//! job.add_metadata("department", "IT");
-//!
-//! // Set job type for organization
-//! job.set_type("maintenance");
-//!
-//! // Set timeout (5 minutes)
-//! job.set_timeout(300);
-//!
-//! println!("Job configured: {:?}", job);
+//! let restored = Job::deserialize(&s).unwrap();
+//! assert_eq!(job.id, restored.id);
 //! ```
 
 use crate::core::JobState;
 use crate::error::{QmlError, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -96,7 +65,7 @@ use uuid::Uuid;
 ///
 /// - **`id`**: Unique identifier (UUID) for the job
 /// - **`method`**: The method/function name to execute (e.g., "send_email")
-/// - **`arguments`**: JSON-serialized arguments to pass to the method
+/// - **`payload`**: JSON payload passed to the worker
 /// - **`created_at`**: Timestamp when the job was created
 /// - **`state`**: Current job state (Enqueued, Processing, Succeeded, etc.)
 /// - **`queue`**: Queue name for job organization and priority
@@ -108,40 +77,19 @@ use uuid::Uuid;
 ///
 /// ## Examples
 ///
-/// ### Creating Jobs
 /// ```rust
 /// use qml_rs::Job;
+/// use serde_json::json;
 ///
-/// // Basic job
-/// let job = Job::new("process_order", vec!["order_123".to_string()]);
+/// let job = Job::new("process_order", json!({ "order_id": "order_123" }));
 ///
-/// // Configured job
 /// let job = Job::with_config(
 ///     "send_notification",
-///     vec!["user_456".to_string(), "Welcome!".to_string()],
-///     "notifications", // queue
-///     5,              // priority
-///     2               // max_retries
+///     json!({ "user": "user_456", "msg": "Welcome!" }),
+///     "notifications",
+///     5,
+///     2,
 /// );
-/// ```
-///
-/// ### Working with Job Data
-/// ```rust
-/// use qml_rs::Job;
-///
-/// let mut job = Job::new("analyze_data", vec!["dataset.csv".to_string()]);
-///
-/// // Add contextual metadata
-/// job.add_metadata("user_id", "789");
-/// job.add_metadata("analysis_type", "statistical");
-/// job.set_type("analytics");
-/// job.set_timeout(1800); // 30 minutes
-///
-/// // Check job properties
-/// println!("Job ID: {}", job.id);
-/// println!("Method: {}", job.method);
-/// println!("Queue: {}", job.queue);
-/// println!("Age: {} seconds", job.age_seconds());
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
@@ -159,22 +107,25 @@ pub struct Job {
     /// [`WorkerRegistry`]: crate::processing::WorkerRegistry
     pub method: String,
 
-    /// Arguments to pass to the method (serialized as JSON strings)
+    /// JSON payload passed to the worker.
     ///
-    /// Each argument is stored as a JSON string to support complex data types.
-    /// The worker implementation is responsible for deserializing these arguments.
+    /// Arbitrary `serde_json::Value`. Typed workers (see
+    /// [`TypedWorker`](crate::TypedWorker)) can declare an `Args` type and
+    /// the adapter will deserialize this field into it. Untyped workers
+    /// receive the raw value.
     ///
     /// ## Example
     /// ```rust
     /// use qml_rs::Job;
+    /// use serde_json::json;
     ///
-    /// let job = Job::new("process_user", vec![
-    ///     "123".to_string(),                    // user_id
-    ///     "john@example.com".to_string(),       // email
-    ///     "{\"premium\": true}".to_string()     // JSON object
-    /// ]);
+    /// let job = Job::new("process_user", json!({
+    ///     "user_id": "123",
+    ///     "email": "john@example.com",
+    ///     "premium": true,
+    /// }));
     /// ```
-    pub arguments: Vec<String>,
+    pub payload: JsonValue,
 
     /// When the job was created (UTC timestamp)
     ///
@@ -200,9 +151,10 @@ pub struct Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let critical_job = Job::with_config("send_alert", vec![], "critical", 10, 1);
-    /// let normal_job = Job::with_config("send_email", vec![], "normal", 5, 3);
-    /// let bulk_job = Job::with_config("export_data", vec![], "bulk", 1, 1);
+    /// let v = serde_json::Value::Null;
+    /// let critical_job = Job::with_config("send_alert", v.clone(), "critical", 10, 1);
+    /// let normal_job = Job::with_config("send_email", v.clone(), "normal", 5, 3);
+    /// let bulk_job = Job::with_config("export_data", v, "bulk", 1, 1);
     /// ```
     pub queue: String,
 
@@ -243,7 +195,7 @@ pub struct Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let mut job = Job::new("process_order", vec!["order_123".to_string()]);
+    /// let mut job = Job::new("process_order", serde_json::json!({ "order_id": "order_123" }));
     /// job.add_metadata("customer_id", "456");
     /// job.add_metadata("order_type", "premium");
     /// job.add_metadata("source", "web_app");
@@ -265,55 +217,39 @@ pub struct Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let mut quick_job = Job::new("send_sms", vec![]);
+    /// let mut quick_job = Job::new("send_sms", serde_json::Value::Null);
     /// quick_job.set_timeout(30); // 30 seconds
     ///
-    /// let mut long_job = Job::new("generate_report", vec![]);
+    /// let mut long_job = Job::new("generate_report", serde_json::Value::Null);
     /// long_job.set_timeout(3600); // 1 hour
     /// ```
     pub timeout_seconds: Option<u64>,
 }
 
 impl Job {
-    /// Creates a new job with the specified method and arguments.
+    /// Creates a new job with the specified method and JSON payload.
     ///
-    /// The job is created with default settings:
-    /// - Queue: "default"
-    /// - Priority: 0
-    /// - Max retries: 0
-    /// - No timeout
+    /// Defaults: queue `"default"`, priority `0`, no retries, no timeout.
     ///
-    /// ## Arguments
-    /// * `method` - The method name to execute (must match a registered worker)
-    /// * `arguments` - Vector of string arguments to pass to the method
-    ///
-    /// ## Returns
-    /// A new [`Job`] instance with a unique ID and current timestamp
+    /// Pass [`serde_json::Value::Null`] (or `json!(null)`) if the worker
+    /// takes no arguments, or use [`Job::new_typed`] to serialize a typed
+    /// payload automatically.
     ///
     /// ## Example
     /// ```rust
     /// use qml_rs::Job;
+    /// use serde_json::json;
     ///
-    /// // Simple job
-    /// let job = Job::new("send_email", vec!["user@example.com".to_string()]);
-    ///
-    /// // Job with multiple arguments
-    /// let job = Job::new("process_order", vec![
-    ///     "order_123".to_string(),
-    ///     "user_456".to_string(),
-    ///     "99.99".to_string()
-    /// ]);
-    ///
-    /// println!("Created job {} for method {}", job.id, job.method);
+    /// let job = Job::new("send_email", json!({ "to": "user@example.com" }));
     /// ```
-    pub fn new(method: impl Into<String>, arguments: Vec<String>) -> Self {
+    pub fn new(method: impl Into<String>, payload: JsonValue) -> Self {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
 
         Self {
             id,
             method: method.into(),
-            arguments,
+            payload,
             created_at: now,
             state: JobState::enqueued("default"),
             queue: "default".to_string(),
@@ -326,40 +262,54 @@ impl Job {
         }
     }
 
-    /// Creates a new job with custom configuration.
+    /// Creates a new job from a typed, serializable payload.
     ///
-    /// Provides full control over job settings at creation time.
-    ///
-    /// ## Arguments
-    /// * `method` - The method name to execute
-    /// * `arguments` - Vector of string arguments
-    /// * `queue` - Queue name for the job
-    /// * `priority` - Job priority (higher = more important)
-    /// * `max_retries` - Maximum retry attempts on failure
-    ///
-    /// ## Returns
-    /// A new [`Job`] instance with the specified configuration
+    /// Convenience wrapper around [`Job::new`] that calls
+    /// [`serde_json::to_value`] on `args`. Returns a [`QmlError`] if
+    /// serialization fails (only possible for types with non-string map
+    /// keys or other JSON-hostile shapes).
     ///
     /// ## Example
     /// ```rust
     /// use qml_rs::Job;
+    /// use serde::Serialize;
     ///
-    /// // High-priority payment job with retries
+    /// #[derive(Serialize)]
+    /// struct SendEmail { to: String, subject: String }
+    ///
+    /// let job = Job::new_typed(
+    ///     "send_email",
+    ///     &SendEmail { to: "alice@example.com".into(), subject: "Hi".into() },
+    /// ).unwrap();
+    /// ```
+    pub fn new_typed<A: Serialize>(method: impl Into<String>, args: &A) -> Result<Self> {
+        let payload = serde_json::to_value(args).map_err(|e| QmlError::SerializationError {
+            message: format!("Failed to serialize job payload: {}", e),
+        })?;
+        Ok(Self::new(method, payload))
+    }
+
+    /// Creates a new job with custom configuration.
+    ///
+    /// ## Example
+    /// ```rust
+    /// use qml_rs::Job;
+    /// use serde_json::json;
+    ///
     /// let job = Job::with_config(
     ///     "process_payment",
-    ///     vec!["order_123".to_string(), "99.99".to_string()],
-    ///     "payments",  // critical payment queue
-    ///     10,          // high priority
-    ///     3            // allow 3 retries for payment failures
+    ///     json!({ "order": "order_123", "amount": 99.99 }),
+    ///     "payments",
+    ///     10,
+    ///     3,
     /// );
-    ///
     /// assert_eq!(job.queue, "payments");
     /// assert_eq!(job.priority, 10);
     /// assert_eq!(job.max_retries, 3);
     /// ```
     pub fn with_config(
         method: impl Into<String>,
-        arguments: Vec<String>,
+        payload: JsonValue,
         queue: impl Into<String>,
         priority: i32,
         max_retries: u32,
@@ -371,7 +321,7 @@ impl Job {
         Self {
             id,
             method: method.into(),
-            arguments,
+            payload,
             created_at: now,
             state: JobState::enqueued(&queue),
             queue,
@@ -396,13 +346,12 @@ impl Job {
     /// ## Example
     /// ```rust
     /// use qml_rs::Job;
+    /// use serde_json::json;
     ///
-    /// let job = Job::new("process_data", vec!["file.csv".to_string()]);
-    /// let json = job.serialize().unwrap();
-    ///
-    /// // JSON contains all job data
-    /// assert!(json.contains(&job.id));
-    /// assert!(json.contains("process_data"));
+    /// let job = Job::new("process_data", json!({ "file": "file.csv" }));
+    /// let s = job.serialize().unwrap();
+    /// assert!(s.contains(&job.id));
+    /// assert!(s.contains("process_data"));
     /// ```
     pub fn serialize(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|e| QmlError::SerializationError {
@@ -424,17 +373,14 @@ impl Job {
     /// ## Example
     /// ```rust
     /// use qml_rs::Job;
+    /// use serde_json::json;
     ///
-    /// // Serialize a job
-    /// let original = Job::new("test_method", vec!["arg1".to_string()]);
-    /// let json = original.serialize().unwrap();
-    ///
-    /// // Deserialize it back
-    /// let restored = Job::deserialize(&json).unwrap();
-    ///
+    /// let original = Job::new("test_method", json!({ "arg": "arg1" }));
+    /// let s = original.serialize().unwrap();
+    /// let restored = Job::deserialize(&s).unwrap();
     /// assert_eq!(original.id, restored.id);
     /// assert_eq!(original.method, restored.method);
-    /// assert_eq!(original.arguments, restored.arguments);
+    /// assert_eq!(original.payload, restored.payload);
     /// ```
     pub fn deserialize(json: &str) -> Result<Self> {
         serde_json::from_str(json).map_err(|e| QmlError::SerializationError {
@@ -465,7 +411,7 @@ impl Job {
     /// ```rust
     /// use qml_rs::{Job, JobState};
     ///
-    /// let mut job = Job::new("test_job", vec![]);
+    /// let mut job = Job::new("test_job", serde_json::Value::Null);
     ///
     /// // Valid transition: Enqueued → Processing
     /// job.set_state(JobState::processing("worker-1", "server-1")).unwrap();
@@ -502,7 +448,7 @@ impl Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let mut job = Job::new("process_user", vec!["123".to_string()]);
+    /// let mut job = Job::new("process_user", serde_json::json!({ "user_id": "123" }));
     ///
     /// // Add tracking metadata
     /// job.add_metadata("user_id", "123");
@@ -527,13 +473,13 @@ impl Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let mut email_job = Job::new("send_welcome_email", vec![]);
+    /// let mut email_job = Job::new("send_welcome_email", serde_json::Value::Null);
     /// email_job.set_type("notification");
     ///
-    /// let mut payment_job = Job::new("process_payment", vec![]);
+    /// let mut payment_job = Job::new("process_payment", serde_json::Value::Null);
     /// payment_job.set_type("financial");
     ///
-    /// let mut report_job = Job::new("generate_monthly_report", vec![]);
+    /// let mut report_job = Job::new("generate_monthly_report", serde_json::Value::Null);
     /// report_job.set_type("reporting");
     /// ```
     pub fn set_type(&mut self, job_type: impl Into<String>) {
@@ -552,13 +498,13 @@ impl Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let mut quick_job = Job::new("send_sms", vec![]);
+    /// let mut quick_job = Job::new("send_sms", serde_json::Value::Null);
     /// quick_job.set_timeout(30); // 30 seconds max
     ///
-    /// let mut batch_job = Job::new("process_batch", vec![]);
+    /// let mut batch_job = Job::new("process_batch", serde_json::Value::Null);
     /// batch_job.set_timeout(3600); // 1 hour max
     ///
-    /// let mut report_job = Job::new("generate_report", vec![]);
+    /// let mut report_job = Job::new("generate_report", serde_json::Value::Null);
     /// report_job.set_timeout(7200); // 2 hours max
     /// ```
     pub fn set_timeout(&mut self, timeout_seconds: u64) {
@@ -579,7 +525,7 @@ impl Job {
     /// use std::thread;
     /// use std::time::Duration;
     ///
-    /// let job = Job::new("test_job", vec![]);
+    /// let job = Job::new("test_job", serde_json::Value::Null);
     ///
     /// // Job was just created
     /// assert!(job.age_seconds() < 1);
@@ -606,14 +552,14 @@ impl Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let mut job = Job::new("long_running_task", vec![]);
+    /// let mut job = Job::new("long_running_task", serde_json::Value::Null);
     /// job.set_timeout(5); // 5 second timeout
     ///
     /// // Job just created, not timed out
     /// assert!(!job.is_timed_out());
     ///
     /// // No timeout set = never times out
-    /// let job_no_timeout = Job::new("no_timeout_task", vec![]);
+    /// let job_no_timeout = Job::new("no_timeout_task", serde_json::Value::Null);
     /// assert!(!job_no_timeout.is_timed_out());
     /// ```
     pub fn is_timed_out(&self) -> bool {
@@ -636,7 +582,7 @@ impl Job {
     /// ```rust
     /// use qml_rs::Job;
     ///
-    /// let original = Job::new("process_data", vec!["file.csv".to_string()]);
+    /// let original = Job::new("process_data", serde_json::json!({ "file": "file.csv" }));
     /// let copy = original.clone_with_new_id();
     ///
     /// // Different IDs
@@ -644,7 +590,7 @@ impl Job {
     ///
     /// // Same configuration
     /// assert_eq!(original.method, copy.method);
-    /// assert_eq!(original.arguments, copy.arguments);
+    /// assert_eq!(original.payload, copy.payload);
     /// assert_eq!(original.queue, copy.queue);
     /// ```
     pub fn clone_with_new_id(&self) -> Self {

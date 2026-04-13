@@ -193,7 +193,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let scheduler = JobScheduler::new(storage.clone());
 
-        let job = Job::new("test_method", vec!["arg1".to_string()]);
+        let job = Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         let job_id = job.id.clone();
         let execute_at = Utc::now() + Duration::seconds(1);
 
@@ -213,7 +213,7 @@ mod tests {
         let scheduler = JobScheduler::new(storage.clone());
 
         // Create a job scheduled for immediate execution
-        let job = Job::new("test_method", vec!["arg1".to_string()]);
+        let job = Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         let job_id = job.id.clone();
         let execute_at = Utc::now() - Duration::seconds(1); // Past time
 
@@ -238,7 +238,7 @@ mod tests {
 
         // 1000 jobs scheduled far in the future.
         for _ in 0..1000 {
-            let mut job = Job::new("noop", vec![]);
+            let mut job = Job::new("noop", serde_json::Value::Null);
             job.set_state(JobState::scheduled(
                 Utc::now() + Duration::hours(1),
                 "future",
@@ -250,7 +250,7 @@ mod tests {
         // 10 jobs already past due.
         let mut due_ids = Vec::with_capacity(10);
         for _ in 0..10 {
-            let mut job = Job::new("noop", vec![]);
+            let mut job = Job::new("noop", serde_json::Value::Null);
             job.set_state(JobState::scheduled(
                 Utc::now() - Duration::seconds(5),
                 "past",
@@ -265,7 +265,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(due.len(), 10, "storage should only return the 10 past-due jobs");
+        assert_eq!(
+            due.len(),
+            10,
+            "storage should only return the 10 past-due jobs"
+        );
         for job in &due {
             assert!(due_ids.contains(&job.id));
         }
@@ -291,20 +295,16 @@ mod tests {
         // AwaitingRetry is only reachable via Processing → AwaitingRetry, so
         // bypass state validation by assigning the state field directly for
         // this fixture.
-        let mut future_retry = Job::new("noop", vec![]);
-        future_retry.state =
-            JobState::awaiting_retry(Utc::now() + Duration::minutes(10), "later");
+        let mut future_retry = Job::new("noop", serde_json::Value::Null);
+        future_retry.state = JobState::awaiting_retry(Utc::now() + Duration::minutes(10), "later");
         storage.enqueue(&future_retry).await.unwrap();
 
-        let mut due_retry = Job::new("noop", vec![]);
+        let mut due_retry = Job::new("noop", serde_json::Value::Null);
         due_retry.state = JobState::awaiting_retry(Utc::now() - Duration::seconds(1), "now");
         let due_id = due_retry.id.clone();
         storage.enqueue(&due_retry).await.unwrap();
 
-        let due = storage
-            .fetch_due_retry_jobs(Utc::now(), 100)
-            .await
-            .unwrap();
+        let due = storage.fetch_due_retry_jobs(Utc::now(), 100).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, due_id);
     }
@@ -314,7 +314,7 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let scheduler = JobScheduler::new(storage.clone());
 
-        let job = Job::new("test_method", vec!["arg1".to_string()]);
+        let job = Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         let job_id = job.id.clone();
 
         scheduler

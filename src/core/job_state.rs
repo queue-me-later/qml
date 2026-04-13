@@ -239,10 +239,7 @@ impl JobState {
     }
 
     /// Creates a new AwaitingRetry state.
-    pub fn awaiting_retry(
-        retry_at: DateTime<Utc>,
-        last_exception: impl Into<String>,
-    ) -> Self {
+    pub fn awaiting_retry(retry_at: DateTime<Utc>, last_exception: impl Into<String>) -> Self {
         JobState::AwaitingRetry {
             scheduled_at: Utc::now(),
             retry_at,

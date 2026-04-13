@@ -207,7 +207,10 @@ impl BackgroundJobServer {
         match self.storage.requeue_stranded_jobs(stale_before).await {
             Ok(0) => {}
             Ok(n) => info!("Recovered {} stranded Processing job(s) on startup", n),
-            Err(e) => warn!("Failed to recover stranded Processing jobs on startup: {}", e),
+            Err(e) => warn!(
+                "Failed to recover stranded Processing jobs on startup: {}",
+                e
+            ),
         }
 
         // Fresh shutdown token so a restart isn't born cancelled.
@@ -551,7 +554,7 @@ mod tests {
 
         let server = BackgroundJobServer::new(config, storage.clone(), registry);
 
-        let job = crate::core::Job::new("slow_method", vec![]);
+        let job = crate::core::Job::new("slow_method", serde_json::Value::Null);
         let job_id = job.id.clone();
         storage.enqueue(&job).await.unwrap();
 
@@ -628,7 +631,7 @@ mod tests {
 
         let server = BackgroundJobServer::new(config, storage.clone(), registry);
 
-        let job = crate::core::Job::new("cancellable", vec![]);
+        let job = crate::core::Job::new("cancellable", serde_json::Value::Null);
         storage.enqueue(&job).await.unwrap();
 
         server.start().await.unwrap();
@@ -651,7 +654,7 @@ mod tests {
 
         // Seed a job stuck in Processing with a very old started_at,
         // simulating a crashed worker from a previous server instance.
-        let mut stranded = crate::core::Job::new("noop", vec![]);
+        let mut stranded = crate::core::Job::new("noop", serde_json::Value::Null);
         stranded.state = crate::core::JobState::Processing {
             started_at: chrono::Utc::now() - Duration::hours(1),
             worker_id: "dead-worker".to_string(),
@@ -702,7 +705,7 @@ mod tests {
         let server = BackgroundJobServer::new(config, storage.clone(), registry);
 
         // Enqueue a test job
-        let job = crate::core::Job::new("test_method", vec!["arg1".to_string()]);
+        let job = crate::core::Job::new("test_method", serde_json::json!(["arg1".to_string()]));
         storage.enqueue(&job).await.unwrap();
 
         // Start server

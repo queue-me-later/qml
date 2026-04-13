@@ -14,7 +14,7 @@ async fn test_storage_factory_memory() {
     let storage = StorageInstance::from_config(config).await.unwrap();
 
     // Test basic operations
-    let job = Job::new("test_job", vec!["arg1".to_string()]);
+    let job = Job::new("test_job", serde_json::json!(["arg1".to_string()]));
     assert!(storage.enqueue(&job).await.is_ok());
 
     let retrieved = storage.get(&job.id).await.unwrap();
@@ -28,7 +28,9 @@ async fn test_storage_factory_memory() {
 #[cfg(feature = "redis")]
 async fn test_storage_factory_redis() {
     // Set environment variable for the test
-    std::env::set_var("REDIS_URL", "redis://127.0.0.1:6379");
+    unsafe {
+        std::env::set_var("REDIS_URL", "redis://127.0.0.1:6379");
+    }
 
     let config = StorageConfig::Redis(
         RedisConfig::new()
@@ -41,7 +43,7 @@ async fn test_storage_factory_redis() {
     match StorageInstance::from_config(config).await {
         Ok(storage) => {
             // Test basic operations
-            let job = Job::new("test_job", vec!["arg1".to_string()]);
+            let job = Job::new("test_job", serde_json::json!(["arg1".to_string()]));
             assert!(storage.enqueue(&job).await.is_ok());
 
             let retrieved = storage.get(&job.id).await.unwrap();
@@ -57,7 +59,9 @@ async fn test_storage_factory_redis() {
     }
 
     // Clean up environment variable
-    std::env::remove_var("REDIS_URL");
+    unsafe {
+        std::env::remove_var("REDIS_URL");
+    }
 }
 
 /// Test storage polymorphism - same interface for all storage types
@@ -75,9 +79,12 @@ async fn test_storage_polymorphism() {
 /// Test a storage interface regardless of implementation
 async fn test_storage_interface(storage: &StorageInstance) {
     // Create test jobs with different states
-    let mut job1 = Job::new("email_job", vec!["user@test.com".to_string()]);
-    let mut job2 = Job::new("report_job", vec!["monthly".to_string()]);
-    let mut job3 = Job::new("cleanup_job", vec!["temp_files".to_string()]);
+    let mut job1 = Job::new(
+        "email_job",
+        serde_json::json!(["user@test.com".to_string()]),
+    );
+    let mut job2 = Job::new("report_job", serde_json::json!(["monthly".to_string()]));
+    let mut job3 = Job::new("cleanup_job", serde_json::json!(["temp_files".to_string()]));
 
     // Set different states and priorities
     job1.priority = 10;
@@ -143,7 +150,10 @@ async fn test_concurrent_storage_access() {
         };
 
         let handle = tokio::spawn(async move {
-            let job = Job::new(&format!("concurrent_job_{}", i), vec![format!("arg_{}", i)]);
+            let job = Job::new(
+                format!("concurrent_job_{}", i),
+                serde_json::json!({ "arg": format!("arg_{}", i) }),
+            );
 
             // Each task: enqueue, get, update, delete
             storage_clone.enqueue(&job).await.unwrap();
@@ -152,7 +162,7 @@ async fn test_concurrent_storage_access() {
             assert!(retrieved.is_some());
 
             let mut updated_job = job.clone();
-            updated_job.state = JobState::processing(&format!("worker_{}", i), "test_server");
+            updated_job.state = JobState::processing(format!("worker_{}", i), "test_server");
             storage_clone.update(&updated_job).await.unwrap();
 
             storage_clone.delete(&job.id).await.unwrap();
@@ -189,13 +199,19 @@ async fn test_config_serialization_roundtrip() {
         (StorageConfig::Postgres(_), _) | (_, StorageConfig::Postgres(_)) => {
             panic!("Unexpected postgres config in memory config test");
         }
+        #[cfg(feature = "redis")]
+        (StorageConfig::Redis(_), _) | (_, StorageConfig::Redis(_)) => {
+            panic!("Unexpected redis config in memory config test");
+        }
     }
 
     // Test Redis config
     #[cfg(feature = "redis")]
     {
         // Set environment variable for the test
-        std::env::set_var("REDIS_URL", "redis://test:6379");
+        unsafe {
+            std::env::set_var("REDIS_URL", "redis://test:6379");
+        }
 
         let redis_config = StorageConfig::Redis(
             RedisConfig::new()
@@ -217,7 +233,9 @@ async fn test_config_serialization_roundtrip() {
         }
 
         // Clean up environment variable
-        std::env::remove_var("REDIS_URL");
+        unsafe {
+            std::env::remove_var("REDIS_URL");
+        }
     }
 }
 
@@ -227,7 +245,7 @@ async fn test_storage_error_handling() {
     let storage = StorageInstance::memory();
 
     // Test updating non-existent job
-    let job = Job::new("nonexistent", vec!["test".to_string()]);
+    let job = Job::new("nonexistent", serde_json::json!(["test".to_string()]));
     let result = storage.update(&job).await;
     assert!(result.is_err());
 
@@ -246,9 +264,9 @@ async fn test_memory_storage_capacity() {
     let config = MemoryConfig::new().with_max_jobs(2);
     let storage = StorageInstance::memory_with_config(config);
 
-    let job1 = Job::new("job1", vec!["arg1".to_string()]);
-    let job2 = Job::new("job2", vec!["arg2".to_string()]);
-    let job3 = Job::new("job3", vec!["arg3".to_string()]);
+    let job1 = Job::new("job1", serde_json::json!(["arg1".to_string()]));
+    let job2 = Job::new("job2", serde_json::json!(["arg2".to_string()]));
+    let job3 = Job::new("job3", serde_json::json!(["arg3".to_string()]));
 
     // First two jobs should succeed
     assert!(storage.enqueue(&job1).await.is_ok());
@@ -271,7 +289,10 @@ async fn test_storage_pagination() {
     // Create multiple jobs
     let mut jobs = vec![];
     for i in 0..10 {
-        let job = Job::new(&format!("job_{}", i), vec![format!("arg_{}", i)]);
+        let job = Job::new(
+            format!("job_{}", i),
+            serde_json::json!({ "arg": format!("arg_{}", i) }),
+        );
         storage.enqueue(&job).await.unwrap();
         jobs.push(job);
     }

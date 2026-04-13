@@ -46,15 +46,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create sample jobs
     println!("📝 Creating sample jobs...");
 
-    let job1 = Job::new("send_email", vec!["user@example.com".to_string()]);
+    let job1 = Job::new(
+        "send_email",
+        serde_json::json!(["user@example.com".to_string()]),
+    );
     let job2 = Job::with_config(
         "process_payment",
-        vec!["order-123".to_string(), "99.99".to_string()],
+        serde_json::json!(["order-123".to_string(), "99.99".to_string()]),
         "payments",
         5,
         3,
     );
-    let mut job3 = Job::new("generate_report", vec!["monthly".to_string()]);
+    let mut job3 = Job::new(
+        "generate_report",
+        serde_json::json!(["monthly".to_string()]),
+    );
     job3.queue = "reports".to_string();
 
     // Store jobs
@@ -65,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Created 3 jobs");
 
     // Create a scheduled job
-    let mut scheduled_job = Job::new("cleanup_task", vec![]);
+    let mut scheduled_job = Job::new("cleanup_task", serde_json::Value::Null);
     scheduled_job.state = JobState::scheduled(
         chrono::Utc::now() + chrono::Duration::minutes(30),
         "Daily cleanup".to_string(),

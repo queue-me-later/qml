@@ -13,6 +13,7 @@
 
 use chrono::{Duration, Utc};
 use qml_rs::{Job, JobState, QmlError};
+use serde_json::json;
 
 fn main() -> Result<(), QmlError> {
     println!("🚀 QML Rust - Basic Job Example");
@@ -20,10 +21,10 @@ fn main() -> Result<(), QmlError> {
 
     // 1. Create a simple job
     println!("1. Creating a simple job...");
-    let job = Job::new("process_email", vec!["user@example.com".to_string()]);
+    let job = Job::new("process_email", json!({ "to": "user@example.com" }));
     println!("   Job ID: {}", job.id);
     println!("   Method: {}", job.method);
-    println!("   Arguments: {:?}", job.arguments);
+    println!("   Payload: {}", job.payload);
     println!("   Queue: {}", job.queue);
     println!("   State: {}", job.state.name());
     println!();
@@ -32,11 +33,11 @@ fn main() -> Result<(), QmlError> {
     println!("2. Creating a job with custom configuration...");
     let payment_job = Job::with_config(
         "process_payment",
-        vec![
-            "order_12345".to_string(),
-            "99.99".to_string(),
-            "USD".to_string(),
-        ],
+        json!({
+            "order_id": "order_12345",
+            "amount": 99.99,
+            "currency": "USD",
+        }),
         "payments",
         10, // High priority
         5,  // Max retries
@@ -52,7 +53,7 @@ fn main() -> Result<(), QmlError> {
     println!("3. Adding metadata and properties...");
     let mut report_job = Job::new(
         "generate_report",
-        vec!["2024".to_string(), "Q1".to_string()],
+        json!({ "year": "2024", "quarter": "Q1" }),
     );
     report_job.add_metadata("user_id", "123");
     report_job.add_metadata("department", "finance");
@@ -80,7 +81,7 @@ fn main() -> Result<(), QmlError> {
 
     // 5. Demonstrate state transitions
     println!("5. Demonstrating state transitions...");
-    let mut workflow_job = Job::new("data_migration", vec!["table_users".to_string()]);
+    let mut workflow_job = Job::new("data_migration", json!({ "table": "users" }));
     println!("   Initial state: {}", workflow_job.state.name());
 
     // Start processing
@@ -110,7 +111,7 @@ fn main() -> Result<(), QmlError> {
 
     // 6. Demonstrate failure and retry workflow
     println!("6. Demonstrating failure and retry workflow...");
-    let mut retry_job = Job::new("unreliable_task", vec!["attempt_1".to_string()]);
+    let mut retry_job = Job::new("unreliable_task", json!({ "attempt": 1 }));
     println!("   Initial state: {}", retry_job.state.name());
 
     // Start processing
@@ -139,7 +140,7 @@ fn main() -> Result<(), QmlError> {
 
     // 7. Job cloning for retry scenarios
     println!("7. Demonstrating job cloning...");
-    let original_job = Job::new("backup_database", vec!["production".to_string()]);
+    let original_job = Job::new("backup_database", json!({ "env": "production" }));
     println!("   Original job ID: {}", original_job.id);
 
     let cloned_job = original_job.clone_with_new_id();
@@ -153,7 +154,7 @@ fn main() -> Result<(), QmlError> {
 
     // 8. Job information methods
     println!("8. Job information and utilities...");
-    let info_job = Job::new("send_newsletter", vec!["weekly".to_string()]);
+    let info_job = Job::new("send_newsletter", json!({ "cadence": "weekly" }));
     println!("   Job age: {} seconds", info_job.age_seconds());
     println!("   Is timed out: {}", info_job.is_timed_out());
 
@@ -171,14 +172,14 @@ fn main() -> Result<(), QmlError> {
     println!("9. Creating a complex job with all features...");
     let mut complex_job = Job::with_config(
         "process_order_pipeline",
-        vec![
-            "order_id:12345".to_string(),
-            "customer_id:67890".to_string(),
-            "total:299.99".to_string(),
-        ],
+        json!({
+            "order_id": "12345",
+            "customer_id": "67890",
+            "total": 299.99,
+        }),
         "order_processing",
-        15, // High priority
-        3,  // 3 retries
+        15,
+        3,
     );
 
     complex_job.add_metadata("correlation_id", "corr_abc123");

@@ -380,10 +380,10 @@ impl Storage for RedisStorage {
                 // Double-check availability (in case of race conditions)
                 if Self::is_job_available(&job) {
                     jobs.push(job);
-                    if let Some(limit) = limit {
-                        if jobs.len() >= limit {
-                            break;
-                        }
+                    if let Some(limit) = limit
+                        && jobs.len() >= limit
+                    {
+                        break;
                     }
                 }
             }
@@ -406,12 +406,11 @@ impl Storage for RedisStorage {
 
         let mut due = Vec::new();
         for job_id in job_ids {
-            if let Some(job) = self.get(&job_id).await? {
-                if let JobState::Scheduled { enqueue_at, .. } = &job.state {
-                    if *enqueue_at <= now {
-                        due.push(job);
-                    }
-                }
+            if let Some(job) = self.get(&job_id).await?
+                && let JobState::Scheduled { enqueue_at, .. } = &job.state
+                && *enqueue_at <= now
+            {
+                due.push(job);
             }
         }
 
@@ -436,12 +435,11 @@ impl Storage for RedisStorage {
 
         let mut due = Vec::new();
         for job_id in job_ids {
-            if let Some(job) = self.get(&job_id).await? {
-                if let JobState::AwaitingRetry { retry_at, .. } = &job.state {
-                    if *retry_at <= now {
-                        due.push(job);
-                    }
-                }
+            if let Some(job) = self.get(&job_id).await?
+                && let JobState::AwaitingRetry { retry_at, .. } = &job.state
+                && *retry_at <= now
+            {
+                due.push(job);
             }
         }
 
@@ -678,14 +676,11 @@ mod tests {
 
     async fn create_test_storage() -> Option<RedisStorage> {
         // Try to create a test storage, return None if Redis is not available
-        match RedisStorage::with_config(test_redis_config()).await {
-            Ok(storage) => Some(storage),
-            Err(_) => None, // Redis not available, skip tests
-        }
+        RedisStorage::with_config(test_redis_config()).await.ok()
     }
 
     fn create_test_job() -> Job {
-        Job::new("test_job", vec!["test_arg".to_string()])
+        Job::new("test_job", serde_json::json!(["test_arg".to_string()]))
     }
 
     #[tokio::test]

@@ -145,11 +145,11 @@ impl WebSocketManager {
             // Handle broadcast messages
             _ = async {
                 while let Ok(msg) = receiver.recv().await {
-                    if let Ok(msg_str) = serde_json::to_string(&msg) {
-                        if sender.send(Message::Text(msg_str.into())).await.is_err() {
-                            tracing::info!("Failed to send message to client {}, removing connection", client_id);
-                            break;
-                        }
+                    if let Ok(msg_str) = serde_json::to_string(&msg)
+                        && sender.send(Message::Text(msg_str.into())).await.is_err()
+                    {
+                        tracing::info!("Failed to send message to client {}, removing connection", client_id);
+                        break;
                     }
                 }
             } => {}

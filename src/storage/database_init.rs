@@ -3,9 +3,9 @@
 //! This module provides high-level utilities for initializing database
 //! connections with intelligent migration handling and error recovery.
 
+use crate::storage::error::StorageError;
 #[cfg(feature = "postgres")]
 use crate::storage::{PostgresConfig, PostgresStorage};
-use crate::storage::error::StorageError;
 #[cfg(feature = "postgres")]
 use std::time::Duration;
 
@@ -45,7 +45,8 @@ impl DatabaseInitializer {
 
     /// Configure connection pool settings
     pub fn with_pool_config(mut self, max_connections: u32, min_connections: u32) -> Self {
-        self.config = self.config
+        self.config = self
+            .config
             .with_max_connections(max_connections)
             .with_min_connections(min_connections);
         self
@@ -69,22 +70,26 @@ impl DatabaseInitializer {
         let mut last_error = None;
 
         for attempt in 1..=self.retry_attempts {
-            tracing::info!("Database initialization attempt {} of {}", attempt, self.retry_attempts);
+            tracing::info!(
+                "Database initialization attempt {} of {}",
+                attempt,
+                self.retry_attempts
+            );
 
             match self.try_initialize().await {
                 Ok(storage) => {
                     tracing::info!("Database initialized successfully on attempt {}", attempt);
-                    
+
                     if self.health_check_enabled {
                         self.perform_health_check(&storage).await?;
                     }
-                    
+
                     return Ok(storage);
                 }
                 Err(e) => {
                     tracing::warn!("Initialization attempt {} failed: {}", attempt, e);
                     last_error = Some(e);
-                    
+
                     if attempt < self.retry_attempts {
                         tracing::info!("Retrying in {:?}...", self.retry_delay);
                         tokio::time::sleep(self.retry_delay).await;
@@ -104,7 +109,10 @@ impl DatabaseInitializer {
     }
 
     /// Perform post-initialization health checks
-    async fn perform_health_check(&self, storage: &PostgresStorage) -> Result<(), DatabaseInitError> {
+    async fn perform_health_check(
+        &self,
+        storage: &PostgresStorage,
+    ) -> Result<(), DatabaseInitError> {
         tracing::debug!("Performing database health check...");
 
         // Check schema existence
@@ -114,13 +122,14 @@ impl DatabaseInitializer {
             }
             Ok(false) => {
                 return Err(DatabaseInitError::HealthCheck(
-                    "Schema does not exist after initialization".to_string()
+                    "Schema does not exist after initialization".to_string(),
                 ));
             }
             Err(e) => {
-                return Err(DatabaseInitError::HealthCheck(
-                    format!("Schema check failed: {}", e)
-                ));
+                return Err(DatabaseInitError::HealthCheck(format!(
+                    "Schema check failed: {}",
+                    e
+                )));
             }
         }
 
@@ -130,11 +139,10 @@ impl DatabaseInitializer {
                 tracing::debug!("Connectivity health check passed");
                 Ok(())
             }
-            Err(e) => {
-                Err(DatabaseInitError::HealthCheck(
-                    format!("Connectivity check failed: {}", e)
-                ))
-            }
+            Err(e) => Err(DatabaseInitError::HealthCheck(format!(
+                "Connectivity check failed: {}",
+                e
+            ))),
         }
     }
 }
@@ -151,13 +159,13 @@ impl Default for DatabaseInitializer {
 pub enum DatabaseInitError {
     #[error("Storage initialization failed: {0}")]
     StorageError(#[from] StorageError),
-    
+
     #[error("Health check failed: {0}")]
     HealthCheck(String),
-    
+
     #[error("Configuration error: {0}")]
     Configuration(String),
-    
+
     #[error("Unknown initialization error")]
     Unknown,
 }

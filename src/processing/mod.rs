@@ -4,40 +4,34 @@
 //! worker management, and background job processing.
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use crate::core::Job;
-use crate::error::Result;
+use crate::error::{QmlError, Result};
 
-pub mod activator;
 pub mod processor;
 pub mod retry;
 pub mod scheduler;
 pub mod server;
 pub mod worker;
 
-pub use activator::JobActivator;
 pub use processor::JobProcessor;
 pub use retry::{RetryPolicy, RetryStrategy};
 pub use scheduler::JobScheduler;
 pub use server::{BackgroundJobServer, ServerConfig};
 pub use worker::{WorkerConfig, WorkerContext, WorkerResult};
 
-/// Trait for executing jobs
+/// Untyped worker trait — receives the raw [`Job`] and its JSON payload.
 ///
-/// Implementations of this trait define how specific job types are executed.
-/// The worker receives the job and its arguments, and returns a result.
+/// Most users should prefer [`TypedWorker`], which deserializes the payload
+/// into a strongly-typed argument struct before dispatch. Implement `Worker`
+/// directly only when you need the full job metadata or when the payload
+/// shape is dynamic.
 #[async_trait]
 pub trait Worker: Send + Sync {
-    /// Execute a job with the given arguments
-    ///
-    /// # Arguments
-    /// * `job` - The job to execute
-    /// * `context` - Worker context with execution information
-    ///
-    /// # Returns
-    /// * `Ok(WorkerResult)` if the job was executed successfully
-    /// * `Err(QmlError)` if there was an error executing the job
+    /// Execute a job.
     async fn execute(&self, job: &Job, context: &WorkerContext) -> Result<WorkerResult>;
 
     /// Get the method name this worker handles
@@ -46,6 +40,87 @@ pub trait Worker: Send + Sync {
     /// Check if this worker can handle the given job method
     fn can_handle(&self, method: &str) -> bool {
         self.method_name() == method
+    }
+}
+
+/// Typed worker trait — receives a deserialized `Args` value instead of the
+/// raw JSON payload.
+///
+/// ```no_run
+/// use async_trait::async_trait;
+/// use qml_rs::{TypedWorker, WorkerContext, WorkerResult, Result};
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Serialize, Deserialize)]
+/// struct SendEmailArgs { to: String, subject: String }
+///
+/// struct SendEmailWorker;
+///
+/// #[async_trait]
+/// impl TypedWorker for SendEmailWorker {
+///     type Args = SendEmailArgs;
+///
+///     async fn execute(&self, args: Self::Args, _ctx: &WorkerContext) -> Result<WorkerResult> {
+///         println!("sending {} to {}", args.subject, args.to);
+///         Ok(WorkerResult::success(None, 0))
+///     }
+///
+///     fn method_name(&self) -> &str { "send_email" }
+/// }
+/// ```
+///
+/// Register a `TypedWorker` with [`WorkerRegistry::register_typed`], which
+/// wraps it in a [`TypedWorkerAdapter`] and stores it as a regular
+/// [`Worker`].
+#[async_trait]
+pub trait TypedWorker: Send + Sync {
+    /// Strongly-typed argument payload. Deserialized from `job.payload`
+    /// before [`TypedWorker::execute`] is invoked.
+    type Args: DeserializeOwned + Send + Sync;
+
+    /// Execute a job with its deserialized arguments.
+    async fn execute(&self, args: Self::Args, context: &WorkerContext) -> Result<WorkerResult>;
+
+    /// Get the method name this worker handles.
+    fn method_name(&self) -> &str;
+}
+
+/// Adapter that wraps a [`TypedWorker`] and implements the untyped
+/// [`Worker`] trait, deserializing `job.payload` into `W::Args` before
+/// dispatching.
+pub struct TypedWorkerAdapter<W: TypedWorker> {
+    inner: W,
+    _args: PhantomData<fn() -> W::Args>,
+}
+
+impl<W: TypedWorker> TypedWorkerAdapter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            _args: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<W> Worker for TypedWorkerAdapter<W>
+where
+    W: TypedWorker + 'static,
+{
+    async fn execute(&self, job: &Job, context: &WorkerContext) -> Result<WorkerResult> {
+        let args: W::Args =
+            serde_json::from_value(job.payload.clone()).map_err(|e| QmlError::WorkerError {
+                message: format!(
+                    "Failed to deserialize typed payload for method {}: {}",
+                    self.inner.method_name(),
+                    e
+                ),
+            })?;
+        self.inner.execute(args, context).await
+    }
+
+    fn method_name(&self) -> &str {
+        self.inner.method_name()
     }
 }
 
@@ -73,6 +148,17 @@ impl WorkerRegistry {
     {
         let method_name = worker.method_name().to_string();
         self.workers.insert(method_name, Box::new(worker));
+    }
+
+    /// Register a [`TypedWorker`] for a specific method.
+    ///
+    /// Wraps the worker in a [`TypedWorkerAdapter`] that deserializes
+    /// `job.payload` into `W::Args` before dispatching.
+    pub fn register_typed<W>(&mut self, worker: W)
+    where
+        W: TypedWorker + 'static,
+    {
+        self.register(TypedWorkerAdapter::new(worker));
     }
 
     /// Get a worker for the given method name

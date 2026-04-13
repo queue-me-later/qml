@@ -23,7 +23,7 @@ pub use config::PostgresConfig;
 pub use config::RedisConfig;
 pub use config::{MemoryConfig, StorageConfig};
 #[cfg(feature = "postgres")]
-pub use database_init::{DatabaseInitializer, DatabaseInitError};
+pub use database_init::{DatabaseInitError, DatabaseInitializer};
 pub use error::StorageError;
 pub use memory::MemoryStorage;
 #[cfg(feature = "postgres")]
@@ -74,7 +74,7 @@ pub use redis::RedisStorage;
 /// let storage = MemoryStorage::new();
 ///
 /// // Create and store a job
-/// let job = Job::new("send_email", vec!["user@example.com".to_string()]);
+/// let job = Job::new("send_email", serde_json::json!(["user@example.com".to_string()]));
 /// storage.enqueue(&job).await.unwrap();
 ///
 /// // Retrieve the job
@@ -101,7 +101,7 @@ pub use redis::RedisStorage;
 ///
 /// // Enqueue some jobs
 /// for i in 0..5 {
-///     let job = Job::new("process_item", vec![i.to_string()]);
+///     let job = Job::new("process_item", serde_json::json!([i.to_string()]));
 ///     storage.enqueue(&job).await.unwrap();
 /// }
 ///
@@ -159,8 +159,8 @@ pub use redis::RedisStorage;
 /// let storage = MemoryStorage::new();
 ///
 /// // Create jobs in different states
-/// let mut job1 = Job::new("task1", vec![]);
-/// let mut job2 = Job::new("task2", vec![]);
+/// let mut job1 = Job::new("task1", serde_json::Value::Null);
+/// let mut job2 = Job::new("task2", serde_json::Value::Null);
 /// job2.set_state(JobState::processing("worker-1", "server-1")).unwrap();
 ///
 /// storage.enqueue(&job1).await.unwrap();
@@ -209,7 +209,7 @@ pub trait Storage: Send + Sync {
     ///
     /// let job = Job::with_config(
     ///     "send_notification",
-    ///     vec!["user123".to_string()],
+    ///     serde_json::json!({ "user_id": "user123" }),
     ///     "notifications", // queue
     ///     5,              // priority
     ///     3               // max_retries
@@ -240,7 +240,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let job = Job::new("process_data", vec!["file.csv".to_string()]);
+    /// let job = Job::new("process_data", serde_json::json!(["file.csv".to_string()]));
     ///
     /// storage.enqueue(&job).await.unwrap();
     ///
@@ -273,7 +273,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let mut job = Job::new("process_order", vec!["order123".to_string()]);
+    /// let mut job = Job::new("process_order", serde_json::json!(["order123".to_string()]));
     ///
     /// storage.enqueue(&job).await.unwrap();
     ///
@@ -307,7 +307,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let job = Job::new("cleanup_task", vec![]);
+    /// let job = Job::new("cleanup_task", serde_json::Value::Null);
     ///
     /// storage.enqueue(&job).await.unwrap();
     ///
@@ -345,7 +345,7 @@ pub trait Storage: Send + Sync {
     ///
     /// // Create several jobs
     /// for i in 0..10 {
-    ///     let job = Job::new("task", vec![i.to_string()]);
+    ///     let job = Job::new("task", serde_json::json!([i.to_string()]));
     ///     storage.enqueue(&job).await.unwrap();
     /// }
     ///
@@ -386,10 +386,10 @@ pub trait Storage: Send + Sync {
     /// let storage = MemoryStorage::new();
     ///
     /// // Create jobs in different states
-    /// let mut job1 = Job::new("task1", vec![]);
+    /// let mut job1 = Job::new("task1", serde_json::Value::Null);
     /// storage.enqueue(&job1).await.unwrap();
     ///
-    /// let mut job2 = Job::new("task2", vec![]);
+    /// let mut job2 = Job::new("task2", serde_json::Value::Null);
     /// job2.set_state(JobState::processing("worker-1", "server-1")).unwrap();
     /// storage.update(&job2).await.unwrap();
     ///
@@ -426,7 +426,7 @@ pub trait Storage: Send + Sync {
     ///
     /// // Enqueue several jobs
     /// for i in 0..5 {
-    ///     let job = Job::new("process_item", vec![i.to_string()]);
+    ///     let job = Job::new("process_item", serde_json::json!([i.to_string()]));
     ///     storage.enqueue(&job).await.unwrap();
     /// }
     ///
@@ -513,7 +513,7 @@ pub trait Storage: Send + Sync {
     /// for i in 0..3 {
     ///     let job = Job::with_config(
     ///         "process_item",
-    ///         vec![i.to_string()],
+    ///         serde_json::json!({ "index": i }),
     ///         if i == 0 { "critical" } else { "normal" }, // different queues
     ///         i as i32,
     ///         3
@@ -566,7 +566,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let job = Job::new("exclusive_task", vec![]);
+    /// let job = Job::new("exclusive_task", serde_json::Value::Null);
     /// storage.enqueue(&job).await.unwrap();
     ///
     /// // Worker 1 tries to acquire lock
@@ -612,7 +612,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let job = Job::new("task_with_lock", vec![]);
+    /// let job = Job::new("task_with_lock", serde_json::Value::Null);
     /// storage.enqueue(&job).await.unwrap();
     ///
     /// // Acquire lock
@@ -655,7 +655,7 @@ pub trait Storage: Send + Sync {
     ///
     /// // Enqueue batch of jobs
     /// for i in 0..10 {
-    ///     let job = Job::new("batch_process", vec![i.to_string()]);
+    ///     let job = Job::new("batch_process", serde_json::json!({ "i": i }));
     ///     storage.enqueue(&job).await.unwrap();
     /// }
     ///
@@ -664,8 +664,7 @@ pub trait Storage: Send + Sync {
     /// println!("Worker-1 got {} jobs for batch processing", jobs.len());
     ///
     /// for job in jobs {
-    ///     println!("Processing job {} with argument: {}", job.id, job.arguments[0]);
-    ///     // All jobs are now locked and marked as processing
+    ///     println!("Processing job {} with payload: {}", job.id, job.payload);
     /// }
     /// # });
     /// ```

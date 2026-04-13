@@ -21,7 +21,10 @@ async fn test_qml_integration_in_axum_style() {
     println!("✅ Storage instance created successfully");
 
     // 3. Test job creation and management
-    let job = Job::new("process_user_data", vec!["user123".to_string()]);
+    let job = Job::new(
+        "process_user_data",
+        serde_json::json!(["user123".to_string()]),
+    );
     let job_id = job.id.to_string();
 
     // 4. Test async operations (typical in Axum handlers)
@@ -55,7 +58,10 @@ async fn test_axum_integration_patterns() {
     };
 
     // Simulate what would happen in an Axum handler
-    let job = Job::new("send_notification", vec!["urgent".to_string()]);
+    let job = Job::new(
+        "send_notification",
+        serde_json::json!(["urgent".to_string()]),
+    );
     let job_id = job.id.to_string();
 
     // This is exactly how you'd use it in an Axum handler

@@ -11,12 +11,37 @@ use tracing::{debug, error, info, warn};
 use super::{
     WorkerConfig, WorkerRegistry, WorkerResult,
     cleanup::{DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL},
+    middleware::{self, JobMiddleware, TracingMiddleware},
     retry::RetryPolicy,
     worker::WorkerContext,
 };
 use crate::core::{Job, JobState};
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
+
+/// Default middleware stack installed on every `JobProcessor` — just the
+/// built-in tracing span wrapper. Callers can replace this via
+/// [`JobProcessor::with_middleware`].
+fn default_middleware() -> Vec<Arc<dyn JobMiddleware>> {
+    vec![Arc::new(TracingMiddleware)]
+}
+
+/// Callback invoked after every persisted job state transition driven by
+/// the processor. Receives the job (with its new state already applied),
+/// the previous state, and the new state.
+///
+/// Held as an `Arc<dyn Fn…>` so one hook can be cloned across every worker
+/// thread without additional allocation. The callback runs synchronously
+/// inside `process_job`; keep it non-blocking — offload anything
+/// expensive to a channel or a spawned task.
+///
+/// Fires exactly once per persisted transition, *after* the in-memory
+/// `Job` has its new state and *before* `storage.update(...)`. The
+/// intermediate `Failed` step the state machine forces between
+/// `Processing` and `AwaitingRetry` is **not** observed — the hook sees
+/// the logical transition from the pre-retry state directly to
+/// `AwaitingRetry`, matching what storage ends up holding.
+pub type StateChangeHook = Arc<dyn Fn(&Job, &JobState, &JobState) + Send + Sync>;
 
 /// Job processor that executes jobs and manages their lifecycle
 pub struct JobProcessor {
@@ -34,6 +59,17 @@ pub struct JobProcessor {
     /// TTL stamped onto `expires_at` when a job transitions to a permanent
     /// `Failed` state (i.e. retries exhausted).
     failed_ttl: Duration,
+    /// Middleware stack that wraps `worker.execute(&job, &ctx)`. Runs in
+    /// registration order — the first entry is the outermost layer. A
+    /// built-in [`TracingMiddleware`] is prepended in [`JobProcessor::new`]
+    /// so every execution ships with a structured span; install your own
+    /// stack via [`JobProcessor::with_middleware`] to opt out.
+    middleware: Vec<Arc<dyn JobMiddleware>>,
+    /// Optional observer fired after every persisted state transition.
+    /// See [`StateChangeHook`] for semantics. `None` by default so
+    /// users who don't need it don't pay for a branch check on every
+    /// transition of every job.
+    on_state_change: Option<StateChangeHook>,
 }
 
 impl JobProcessor {
@@ -51,6 +87,8 @@ impl JobProcessor {
             cancel_token: CancellationToken::new(),
             succeeded_ttl: DEFAULT_SUCCEEDED_TTL,
             failed_ttl: DEFAULT_FAILED_TTL,
+            middleware: default_middleware(),
+            on_state_change: None,
         }
     }
 
@@ -69,6 +107,8 @@ impl JobProcessor {
             cancel_token: CancellationToken::new(),
             succeeded_ttl: DEFAULT_SUCCEEDED_TTL,
             failed_ttl: DEFAULT_FAILED_TTL,
+            middleware: default_middleware(),
+            on_state_change: None,
         }
     }
 
@@ -88,6 +128,46 @@ impl JobProcessor {
         self.succeeded_ttl = succeeded_ttl;
         self.failed_ttl = failed_ttl;
         self
+    }
+
+    /// Replace the middleware stack that wraps `worker.execute`. The
+    /// processor's built-in [`TracingMiddleware`] is dropped when you call
+    /// this — pass it in yourself (usually as the first entry) if you
+    /// still want structured spans around every job.
+    ///
+    /// Middleware runs in registration order: the first entry is the
+    /// outermost layer, the last is closest to the worker.
+    pub fn with_middleware(mut self, middleware: Vec<Arc<dyn JobMiddleware>>) -> Self {
+        self.middleware = middleware;
+        self
+    }
+
+    /// Install an observer fired after every persisted state transition.
+    /// See [`StateChangeHook`] for semantics.
+    pub fn with_state_change_hook(mut self, hook: StateChangeHook) -> Self {
+        self.on_state_change = Some(hook);
+        self
+    }
+
+    /// Apply a state transition: record the previous state, call
+    /// [`Job::set_state`] (which validates the transition), then — on
+    /// success — invoke the state-change hook. Storage is **not** touched
+    /// here; callers update storage themselves so the hook always fires
+    /// on the same transitions that end up persisted.
+    fn apply_state_change(&self, job: &mut Job, new_state: JobState) -> Result<()> {
+        let prev_state = job.state.clone();
+        job.set_state(new_state)?;
+        self.fire_state_change_hook(job, &prev_state);
+        Ok(())
+    }
+
+    /// Fire the state-change hook with an explicit previous state.
+    /// Factored out so retry path can span a two-step transition as a
+    /// single logical event (see [`JobProcessor::handle_job_retry`]).
+    fn fire_state_change_hook(&self, job: &Job, prev_state: &JobState) {
+        if let Some(hook) = &self.on_state_change {
+            hook(job, prev_state, &job.state);
+        }
     }
 
     /// Get the worker ID for this processor
@@ -129,7 +209,7 @@ impl JobProcessor {
                 &self.worker_config.server_name,
             );
 
-            if let Err(e) = job.set_state(processing_state) {
+            if let Err(e) = self.apply_state_change(&mut job, processing_state) {
                 error!("Failed to set job state to Processing: {}", e);
                 return Err(e);
             }
@@ -150,11 +230,14 @@ impl JobProcessor {
         }
         .with_cancel(self.cancel_token.clone());
 
-        // Execute the job
+        // Execute the job through the middleware stack. The terminal
+        // `worker.execute(&job, &context)` runs once every layer in
+        // `self.middleware` has called `next.run(...)`. An empty stack
+        // calls the worker directly.
         let start_time = Utc::now();
         let execution_result = match tokio::time::timeout(
             self.worker_config.job_timeout.to_std().unwrap(),
-            worker.execute(&job, &context),
+            middleware::run_stack(&self.middleware, worker, &job, &context),
         )
         .await
         {
@@ -217,7 +300,7 @@ impl JobProcessor {
 
         let succeeded_state = JobState::succeeded(duration_ms, result);
 
-        if let Err(e) = job.set_state(succeeded_state) {
+        if let Err(e) = self.apply_state_change(job, succeeded_state) {
             error!("Failed to set job state to Succeeded: {}", e);
             return Err(e);
         }
@@ -259,7 +342,14 @@ impl JobProcessor {
             return self.fail_job_permanently(job, error, None).await;
         }
 
-        // First transition to Failed state
+        // Save the pre-retry state for the state-change hook. The state
+        // machine forces a two-step transition (Processing → Failed →
+        // AwaitingRetry), but the intermediate `Failed` is an artifact
+        // that never hits storage — observers should see one logical
+        // transition from whatever we were in directly to AwaitingRetry.
+        let pre_retry_state = job.state.clone();
+
+        // First transition to Failed state (intermediate, not hooked)
         let failed_state = JobState::failed(error.clone(), None);
         if let Err(e) = job.set_state(failed_state) {
             error!("Failed to set job state to Failed: {}", e);
@@ -280,6 +370,10 @@ impl JobProcessor {
             error!("Failed to set job state to AwaitingRetry: {}", e);
             return Err(e);
         }
+
+        // Fire the hook with the saved pre-retry state so observers see
+        // the logical transition, not the intermediate Failed step.
+        self.fire_state_change_hook(job, &pre_retry_state);
 
         // Update in storage
         self.storage.update(job).await?;
@@ -309,7 +403,7 @@ impl JobProcessor {
 
         let failed_state = JobState::failed(error, stack_trace);
 
-        if let Err(e) = job.set_state(failed_state) {
+        if let Err(e) = self.apply_state_change(job, failed_state) {
             error!("Failed to set job state to Failed: {}", e);
             return Err(e);
         }
@@ -611,5 +705,125 @@ mod tests {
         let after_second = storage.get(&job_id).await.unwrap().unwrap();
         assert!(matches!(after_second.state, JobState::Failed { .. }));
         assert_eq!(after_second.attempt, 2);
+    }
+
+    // --- F2: state-change hook tests ---
+
+    use crate::core::JobStateKind;
+    use std::sync::Mutex;
+
+    /// Collect every (prev_kind, new_kind) pair the hook observes for a
+    /// single processor run. Returned as an `Arc` so the hook closure and
+    /// the test body share the same buffer.
+    fn install_recording_hook(
+        processor: JobProcessor,
+    ) -> (JobProcessor, Arc<Mutex<Vec<(JobStateKind, JobStateKind)>>>) {
+        let transitions = Arc::new(Mutex::new(Vec::<(JobStateKind, JobStateKind)>::new()));
+        let captured = transitions.clone();
+        let hook: StateChangeHook = Arc::new(move |_job, prev, new| {
+            captured.lock().unwrap().push((prev.kind(), new.kind()));
+        });
+        (processor.with_state_change_hook(hook), transitions)
+    }
+
+    #[tokio::test]
+    async fn state_change_hook_fires_for_successful_path() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut registry = WorkerRegistry::new();
+        registry.register(TestWorker::new("hook_success", true, false));
+        let registry = Arc::new(registry);
+
+        let config = WorkerConfig::new("hook-worker");
+        let processor = JobProcessor::new(registry, storage.clone(), config);
+        let (processor, transitions) = install_recording_hook(processor);
+
+        let job = Job::new("hook_success", serde_json::Value::Null);
+        storage.enqueue(&job).await.unwrap();
+        processor.process_job(job).await.unwrap();
+
+        let transitions = transitions.lock().unwrap();
+        assert_eq!(
+            *transitions,
+            vec![
+                (JobStateKind::Enqueued, JobStateKind::Processing),
+                (JobStateKind::Processing, JobStateKind::Succeeded),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn state_change_hook_skips_intermediate_failed_in_retry_path() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut registry = WorkerRegistry::new();
+        registry.register(TestWorker::new("hook_retry", false, true));
+        let registry = Arc::new(registry);
+
+        let config = WorkerConfig::new("hook-worker");
+        let retry_policy = RetryPolicy::new(RetryStrategy::fixed(Duration::seconds(1), 3));
+        let processor =
+            JobProcessor::with_retry_policy(registry, storage.clone(), config, retry_policy);
+        let (processor, transitions) = install_recording_hook(processor);
+
+        let job = Job::new("hook_retry", serde_json::Value::Null);
+        storage.enqueue(&job).await.unwrap();
+        processor.process_job(job).await.unwrap();
+
+        // Logical transitions: Enqueued → Processing → AwaitingRetry.
+        // The intermediate Failed the state machine forces between
+        // Processing and AwaitingRetry must NOT appear in the stream.
+        let transitions = transitions.lock().unwrap();
+        assert_eq!(
+            *transitions,
+            vec![
+                (JobStateKind::Enqueued, JobStateKind::Processing),
+                (JobStateKind::Processing, JobStateKind::AwaitingRetry),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn state_change_hook_fires_for_permanent_failure() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut registry = WorkerRegistry::new();
+        registry.register(TestWorker::new("hook_fail", false, false));
+        let registry = Arc::new(registry);
+
+        let config = WorkerConfig::new("hook-worker");
+        let processor = JobProcessor::new(registry, storage.clone(), config);
+        let (processor, transitions) = install_recording_hook(processor);
+
+        let job = Job::new("hook_fail", serde_json::Value::Null);
+        storage.enqueue(&job).await.unwrap();
+        processor.process_job(job).await.unwrap();
+
+        let transitions = transitions.lock().unwrap();
+        assert_eq!(
+            *transitions,
+            vec![
+                (JobStateKind::Enqueued, JobStateKind::Processing),
+                (JobStateKind::Processing, JobStateKind::Failed),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn state_change_hook_is_opt_in_default_is_no_op() {
+        // No hook installed: processor must complete without panicking
+        // and without any observable side effect beyond normal processing.
+        let storage = Arc::new(MemoryStorage::new());
+        let mut registry = WorkerRegistry::new();
+        registry.register(TestWorker::new("no_hook", true, false));
+        let registry = Arc::new(registry);
+
+        let config = WorkerConfig::new("hook-worker");
+        let processor = JobProcessor::new(registry, storage.clone(), config);
+
+        let job = Job::new("no_hook", serde_json::Value::Null);
+        let job_id = job.id.clone();
+        storage.enqueue(&job).await.unwrap();
+        processor.process_job(job).await.unwrap();
+
+        let final_job = storage.get(&job_id).await.unwrap().unwrap();
+        assert!(matches!(final_job.state, JobState::Succeeded { .. }));
     }
 }

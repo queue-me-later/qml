@@ -43,6 +43,11 @@ sqlx = { version = "0.8", features = [
     "uuid",
     "json",
 ], optional = true }
+
+# Prometheus metrics (feature = "metrics"). Default features off — we don't
+# need the `push` client, process stats (pulls in libc/procfs), or the
+# protobuf encoder; the text encoder is always compiled.
+prometheus = { version = "0.14", default-features = false, optional = true }
 # Future cron job support
 # cron = { version = "0.12", optional = true }
 
@@ -59,6 +64,10 @@ redis = ["dep:redis"]
 # Built-in HTTP dashboard (axum + tower + WebSocket UI). Off by default so
 # headless workers don't pay the compile cost of pulling in axum/tower.
 dashboard = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
+# Prometheus metrics: provides a `PrometheusMetrics` registry + a
+# `PrometheusMiddleware` for the F1 middleware stack, plus a `/metrics`
+# route on the dashboard when combined with the `dashboard` feature.
+metrics = ["dep:prometheus"]
 # Future features for later phases
 # cron-jobs = ["cron"]
 
@@ -78,6 +87,15 @@ required-features = ["dashboard"]
 [[example]]
 name = "processing_demo"
 path = "examples/processing_demo.rs"
+
+[[example]]
+name = "middleware_metrics"
+path = "examples/middleware_metrics.rs"
+
+[[example]]
+name = "metrics_demo"
+path = "examples/metrics_demo.rs"
+required-features = ["metrics"]
 
 [[example]]
 name = "postgres_simple"

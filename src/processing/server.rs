@@ -15,7 +15,8 @@ use super::{
     RetryPolicy, WorkerRegistry,
     cleanup::{CleanupWorker, DEFAULT_CLEANUP_INTERVAL, DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL},
     heartbeat::{DEFAULT_DEAD_SERVER_TIMEOUT, DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWorker},
-    processor::JobProcessor,
+    middleware::{JobMiddleware, TracingMiddleware},
+    processor::{JobProcessor, StateChangeHook},
     recurring::RecurringJobPoller,
     scheduler::JobScheduler,
     worker::WorkerConfig,
@@ -237,6 +238,20 @@ pub struct BackgroundJobServer {
     storage: Arc<dyn Storage>,
     worker_registry: Arc<WorkerRegistry>,
     retry_policy: RetryPolicy,
+    /// Middleware stack layered around every `worker.execute(&job, &ctx)`
+    /// call. Runs in registration order; the built-in
+    /// [`TracingMiddleware`] is installed by default so every execution
+    /// ships with a structured span. Replace via
+    /// [`BackgroundJobServer::with_middleware`] — the new stack replaces
+    /// the built-in entirely, so re-add `TracingMiddleware` if you still
+    /// want spans.
+    middleware: Vec<Arc<dyn JobMiddleware>>,
+    /// Optional observer fired after every persisted state transition.
+    /// Cloned into every per-worker [`JobProcessor`] on `start()`. Lives
+    /// on the server (not [`ServerConfig`]) because `Arc<dyn Fn…>` can't
+    /// participate in `Serialize`/`Deserialize` — same reasoning as the
+    /// middleware field.
+    on_state_change: Option<StateChangeHook>,
     is_running: Arc<tokio::sync::RwLock<bool>>,
     /// Parent cancellation token for the running instance. Cancelling it
     /// tells every worker loop (and the scheduler loop) to drain cleanly.
@@ -263,11 +278,42 @@ impl BackgroundJobServer {
             storage,
             worker_registry,
             retry_policy: RetryPolicy::default(),
+            middleware: vec![Arc::new(TracingMiddleware)],
+            on_state_change: None,
             is_running: Arc::new(tokio::sync::RwLock::new(false)),
             shutdown_token: Arc::new(tokio::sync::Mutex::new(CancellationToken::new())),
             worker_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             server_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Replace the middleware stack that wraps `worker.execute` in every
+    /// worker thread. Runs in registration order — the first entry is the
+    /// outermost layer.
+    ///
+    /// The default stack is `[TracingMiddleware]`; calling this replaces
+    /// it entirely. Re-add [`TracingMiddleware`] yourself if you still
+    /// want structured spans around every execution.
+    ///
+    /// Must be called before [`BackgroundJobServer::start`] — changes made
+    /// after a running server has spawned its worker threads won't affect
+    /// already-started processors.
+    pub fn with_middleware(mut self, middleware: Vec<Arc<dyn JobMiddleware>>) -> Self {
+        self.middleware = middleware;
+        self
+    }
+
+    /// Install a state-change hook fired after every persisted job state
+    /// transition driven by the processor. See [`StateChangeHook`] for
+    /// semantics — the hook runs synchronously inside `process_job`, so
+    /// keep it non-blocking.
+    ///
+    /// The hook is cloned into every per-worker [`JobProcessor`] when
+    /// [`BackgroundJobServer::start`] spawns workers, so callers must
+    /// install it before `start()`.
+    pub fn with_state_change_hook(mut self, hook: StateChangeHook) -> Self {
+        self.on_state_change = Some(hook);
+        self
     }
 
     /// Create a new background job server with custom retry policy
@@ -556,14 +602,19 @@ impl BackgroundJobServer {
             // timeout) don't affect siblings.
             let worker_cancel = shutdown_token.child_token();
 
-            let processor = JobProcessor::with_retry_policy(
+            let mut processor = JobProcessor::with_retry_policy(
                 self.worker_registry.clone(),
                 self.storage.clone(),
                 worker_config,
                 self.retry_policy.clone(),
             )
             .with_cancellation(worker_cancel.clone())
-            .with_ttls(self.config.succeeded_ttl, self.config.failed_ttl);
+            .with_ttls(self.config.succeeded_ttl, self.config.failed_ttl)
+            .with_middleware(self.middleware.clone());
+
+            if let Some(hook) = &self.on_state_change {
+                processor = processor.with_state_change_hook(hook.clone());
+            }
 
             let storage_clone = self.storage.clone();
             let config_clone = self.config.clone();

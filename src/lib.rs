@@ -437,10 +437,13 @@ pub use dashboard::{
 };
 pub use error::{QmlError, Result};
 pub use processing::{
-    BackgroundJobServer, CleanupWorker, JobProcessor, JobScheduler, RecurringJobPoller,
-    RetryPolicy, RetryStrategy, ServerConfig, TypedWorker, TypedWorkerAdapter, Worker,
-    WorkerConfig, WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, CleanupWorker, JobMiddleware, JobProcessor, JobScheduler, Next,
+    RecurringJobPoller, RetryPolicy, RetryStrategy, ServerConfig, StateChangeHook,
+    TracingMiddleware, TypedWorker, TypedWorkerAdapter, Worker, WorkerConfig, WorkerContext,
+    WorkerRegistry, WorkerResult,
 };
+#[cfg(feature = "metrics")]
+pub use processing::{PrometheusMetrics, PrometheusMiddleware};
 pub use storage::{MemoryStorage, Storage, StorageConfig, StorageError, StorageInstance};
 
 #[cfg(feature = "redis")]

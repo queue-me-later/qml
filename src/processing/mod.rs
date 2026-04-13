@@ -13,6 +13,9 @@ use crate::error::{QmlError, Result};
 
 pub mod cleanup;
 pub mod heartbeat;
+#[cfg(feature = "metrics")]
+pub mod metrics;
+pub mod middleware;
 pub mod processor;
 pub mod recurring;
 pub mod retry;
@@ -24,7 +27,10 @@ pub use cleanup::{
     CleanupWorker, DEFAULT_CLEANUP_INTERVAL, DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL,
 };
 pub use heartbeat::{DEFAULT_DEAD_SERVER_TIMEOUT, DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWorker};
-pub use processor::JobProcessor;
+#[cfg(feature = "metrics")]
+pub use metrics::{DEFAULT_JOB_DURATION_BUCKETS, PrometheusMetrics, PrometheusMiddleware};
+pub use middleware::{JobMiddleware, Next, TracingMiddleware};
+pub use processor::{JobProcessor, StateChangeHook};
 pub use recurring::{DEFAULT_RECURRING_BATCH_SIZE, RecurringJobPoller};
 pub use retry::{RetryPolicy, RetryStrategy};
 pub use scheduler::JobScheduler;

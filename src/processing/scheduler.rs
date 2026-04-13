@@ -4,6 +4,7 @@
 //! future execution and managing recurring job patterns.
 
 use chrono::{DateTime, Duration, Utc};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -11,7 +12,7 @@ use tracing::{debug, error, info};
 
 use crate::core::{Job, JobState};
 use crate::error::{QmlError, Result};
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageError};
 
 /// Maximum number of due jobs to drain per scheduler tick. Bounds the amount
 /// of work a single tick can enqueue if a large backlog has accumulated.
@@ -76,54 +77,50 @@ impl JobScheduler {
                 _ = interval.tick() => {}
             }
 
-            if let Err(e) = self.process_scheduled_jobs().await {
+            if let Err(e) = self
+                .process_due_jobs("scheduled", |storage, now, limit| async move {
+                    storage.fetch_due_scheduled_jobs(now, limit).await
+                })
+                .await
+            {
                 error!("Error processing scheduled jobs: {}", e);
             }
 
-            if let Err(e) = self.process_retry_jobs().await {
+            if let Err(e) = self
+                .process_due_jobs("retry", |storage, now, limit| async move {
+                    storage.fetch_due_retry_jobs(now, limit).await
+                })
+                .await
+            {
                 error!("Error processing retry jobs: {}", e);
             }
         }
     }
 
-    /// Process jobs that are scheduled for execution
-    async fn process_scheduled_jobs(&self) -> Result<()> {
-        debug!("Checking for scheduled jobs ready for execution");
+    /// Drain a single category of due jobs into the `Enqueued` state. `fetch`
+    /// selects whether we pull from the scheduled or retry index; the rest of
+    /// the pipeline is identical.
+    async fn process_due_jobs<F, Fut>(&self, kind: &str, fetch: F) -> Result<()>
+    where
+        F: FnOnce(Arc<dyn Storage>, DateTime<Utc>, usize) -> Fut,
+        Fut: Future<Output = std::result::Result<Vec<Job>, StorageError>>,
+    {
+        debug!("Checking for {} jobs ready for execution", kind);
 
         let now = Utc::now();
-        let ready_jobs = self
-            .storage
-            .fetch_due_scheduled_jobs(now, self.batch_size)
+        let ready_jobs = fetch(self.storage.clone(), now, self.batch_size)
             .await
             .map_err(|e| QmlError::StorageError {
-                message: format!("Failed to fetch due scheduled jobs: {}", e),
+                message: format!("Failed to fetch due {} jobs: {}", kind, e),
             })?;
 
         debug!(
-            "Found {} scheduled jobs ready for execution",
-            ready_jobs.len()
+            "Found {} {} jobs ready for execution",
+            ready_jobs.len(),
+            kind
         );
 
-        self.enqueue_due_jobs(ready_jobs, "scheduled").await;
-        Ok(())
-    }
-
-    /// Process jobs that are awaiting retry
-    async fn process_retry_jobs(&self) -> Result<()> {
-        debug!("Checking for jobs ready for retry");
-
-        let now = Utc::now();
-        let ready_jobs = self
-            .storage
-            .fetch_due_retry_jobs(now, self.batch_size)
-            .await
-            .map_err(|e| QmlError::StorageError {
-                message: format!("Failed to fetch due retry jobs: {}", e),
-            })?;
-
-        debug!("Found {} retry jobs ready for execution", ready_jobs.len());
-
-        self.enqueue_due_jobs(ready_jobs, "retry").await;
+        self.enqueue_due_jobs(ready_jobs, kind).await;
         Ok(())
     }
 
@@ -186,7 +183,7 @@ impl JobScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryStorage;
+    use crate::storage::{MemoryStorage, MonitoringApi};
 
     #[tokio::test]
     async fn test_schedule_job() {
@@ -223,7 +220,12 @@ mod tests {
             .unwrap();
 
         // Process scheduled jobs
-        scheduler.process_scheduled_jobs().await.unwrap();
+        scheduler
+            .process_due_jobs("scheduled", |storage, now, limit| async move {
+                storage.fetch_due_scheduled_jobs(now, limit).await
+            })
+            .await
+            .unwrap();
 
         // Check that the job is now enqueued
         let updated_job = storage.get(&job_id).await.unwrap().unwrap();
@@ -276,7 +278,12 @@ mod tests {
 
         // Running the scheduler must transition exactly those 10 jobs.
         let scheduler = JobScheduler::new(storage.clone());
-        scheduler.process_scheduled_jobs().await.unwrap();
+        scheduler
+            .process_due_jobs("scheduled", |storage, now, limit| async move {
+                storage.fetch_due_scheduled_jobs(now, limit).await
+            })
+            .await
+            .unwrap();
 
         for id in &due_ids {
             let job = storage.get(id).await.unwrap().unwrap();

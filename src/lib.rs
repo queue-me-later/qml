@@ -113,7 +113,11 @@
 //! ## 📊 **Dashboard & Monitoring**
 //!
 //! ### Real-time Web Dashboard
-//! ```rust
+//!
+//! Requires the `dashboard` cargo feature (off by default):
+//! `qml-rs = { version = "…", features = ["dashboard"] }`.
+//!
+//! ```ignore
 //! use qml_rs::{DashboardServer, MemoryStorage};
 //! use std::sync::Arc;
 //!
@@ -122,7 +126,7 @@
 //! let dashboard = DashboardServer::new(storage, Default::default());
 //!
 //! // Start dashboard on http://localhost:8080
-//! // dashboard.start("0.0.0.0:8080").await?;
+//! // dashboard.start().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -418,6 +422,7 @@
 //! [examples]:
 
 pub mod core;
+#[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod error;
 pub mod processing;
@@ -425,6 +430,7 @@ pub mod storage;
 
 // Re-export main types for convenience
 pub use core::{Job, JobState, JobStateKind, RecurringJob};
+#[cfg(feature = "dashboard")]
 pub use dashboard::{
     DashboardAuth, DashboardConfig, DashboardServer, DashboardService, JobStatistics,
     QueueStatistics,

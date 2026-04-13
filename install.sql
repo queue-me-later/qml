@@ -104,6 +104,51 @@ COMMENT ON TABLE qml.qml_recurring_jobs IS
     'Cron-scheduled job templates materialized into qml_jobs by the RecurringJobPoller';
 
 -- =========================================================================
+-- SERVER HEARTBEATS (D1)
+-- =========================================================================
+
+-- Live server registry. Every BackgroundJobServer with heartbeats enabled
+-- inserts one row and bumps `last_heartbeat` on a fixed interval. Peers
+-- scan for rows whose `last_heartbeat` is older than the dead-server
+-- timeout and reclaim their in-flight Processing jobs.
+CREATE TABLE IF NOT EXISTS qml.qml_servers (
+    server_id TEXT PRIMARY KEY,
+    server_name TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    worker_count INTEGER NOT NULL DEFAULT 0,
+    queues TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]
+);
+
+CREATE INDEX IF NOT EXISTS idx_qml_servers_last_heartbeat
+    ON qml.qml_servers(last_heartbeat);
+
+COMMENT ON TABLE qml.qml_servers IS
+    'Live server registry: running BackgroundJobServers register here and bump last_heartbeat periodically so peers can reclaim jobs from crashed servers';
+
+-- =========================================================================
+-- GENERIC NAMED LOCKS (D2)
+-- =========================================================================
+
+-- Generic named distributed locks, keyed by a user-provided `resource`
+-- string. Separate from the per-job locks on qml_jobs — those stay on
+-- the job row so fetch-and-lock remains a single UPDATE RETURNING.
+-- This table exists for user-facing "don't run two instances of X"
+-- semantics (e.g. at-most-one recurring report).
+CREATE TABLE IF NOT EXISTS qml.qml_locks (
+    resource TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_qml_locks_expires_at
+    ON qml.qml_locks(expires_at);
+
+COMMENT ON TABLE qml.qml_locks IS
+    'Generic named distributed locks acquired via Storage::try_acquire_lock. Re-entrant for the same owner; takeover is allowed once expires_at is in the past.';
+
+-- =========================================================================
 -- TRIGGERS AND FUNCTIONS
 -- =========================================================================
 
@@ -242,7 +287,7 @@ DO $$
 BEGIN
     RAISE NOTICE 'QML PostgreSQL schema installation completed successfully';
     RAISE NOTICE 'Schema: qml';
-    RAISE NOTICE 'Tables: qml_jobs';
+    RAISE NOTICE 'Tables: qml_jobs, qml_recurring_jobs, qml_servers, qml_locks';
     RAISE NOTICE 'Functions: acquire_job_lock, release_job_lock, cleanup_expired_locks';
     RAISE NOTICE 'Triggers: automatic updated_at timestamp';
     RAISE NOTICE 'Ready for production job processing with distributed locking support';

@@ -14,12 +14,13 @@ use tracing::{debug, error, info, warn};
 use super::{
     RetryPolicy, WorkerRegistry,
     cleanup::{CleanupWorker, DEFAULT_CLEANUP_INTERVAL, DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL},
+    heartbeat::{DEFAULT_DEAD_SERVER_TIMEOUT, DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWorker},
     processor::JobProcessor,
     recurring::RecurringJobPoller,
     scheduler::JobScheduler,
     worker::WorkerConfig,
 };
-use crate::core::RecurringJob;
+use crate::core::{RecurringJob, ServerInfo};
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
 
@@ -70,6 +71,24 @@ pub struct ServerConfig {
     pub succeeded_ttl: Duration,
     /// TTL stamped onto permanently-failed jobs. Defaults to 7 days.
     pub failed_ttl: Duration,
+    /// Enable the server heartbeat + dead-peer reclaim worker (D1).
+    ///
+    /// When enabled, this server registers itself in the storage-level
+    /// server registry, bumps its `last_heartbeat` on every
+    /// `heartbeat_interval`, and periodically scans for peers whose
+    /// heartbeat has gone stale. Dead peers' in-flight `Processing` jobs
+    /// are actively reclaimed back to `Enqueued`.
+    ///
+    /// Disabled by default so single-server deployments don't pay for an
+    /// unused registry.
+    pub enable_heartbeat: bool,
+    /// How often to bump this server's `last_heartbeat` row. Defaults to
+    /// 10 seconds.
+    pub heartbeat_interval: Duration,
+    /// A peer is treated as dead once its `last_heartbeat` is older than
+    /// this threshold. Defaults to 60 seconds — should comfortably exceed
+    /// `heartbeat_interval` so brief slowdowns don't trigger reclaim.
+    pub dead_server_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -92,6 +111,9 @@ impl Default for ServerConfig {
             cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
             succeeded_ttl: DEFAULT_SUCCEEDED_TTL,
             failed_ttl: DEFAULT_FAILED_TTL,
+            enable_heartbeat: false,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            dead_server_timeout: DEFAULT_DEAD_SERVER_TIMEOUT,
         }
     }
 }
@@ -189,6 +211,24 @@ impl ServerConfig {
         self.failed_ttl = ttl;
         self
     }
+
+    /// Enable or disable the heartbeat + dead-peer reclaim worker.
+    pub fn enable_heartbeat(mut self, enable: bool) -> Self {
+        self.enable_heartbeat = enable;
+        self
+    }
+
+    /// Set the heartbeat bump interval.
+    pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Set the peer-dead staleness threshold.
+    pub fn dead_server_timeout(mut self, timeout: Duration) -> Self {
+        self.dead_server_timeout = timeout;
+        self
+    }
 }
 
 /// Background job server that manages job processing
@@ -204,6 +244,11 @@ pub struct BackgroundJobServer {
     /// from an uncancelled state.
     shutdown_token: Arc<tokio::sync::Mutex<CancellationToken>>,
     worker_handles: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
+    /// Unique id this server registered under when heartbeats are enabled.
+    /// Populated on `start()` (`{server_name}#{uuid}`) and consumed by
+    /// `stop()` to deregister the row. `None` when heartbeats are off or
+    /// between start cycles.
+    server_id: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl BackgroundJobServer {
@@ -221,6 +266,7 @@ impl BackgroundJobServer {
             is_running: Arc::new(tokio::sync::RwLock::new(false)),
             shutdown_token: Arc::new(tokio::sync::Mutex::new(CancellationToken::new())),
             worker_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            server_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -267,6 +313,32 @@ impl BackgroundJobServer {
         let shutdown_token = CancellationToken::new();
         *self.shutdown_token.lock().await = shutdown_token.clone();
 
+        // Derive a unique `server_id` when heartbeats are enabled. This id
+        // is what gets stamped into `JobState::Processing::server_name`
+        // (via `WorkerConfig::server_name`), and it's what peer reclaim
+        // matches on. Without the UUID suffix, two running instances
+        // sharing a `server_name` would reclaim each other's work.
+        let server_identity = if self.config.enable_heartbeat {
+            let id = format!("{}#{}", self.config.server_name, uuid::Uuid::new_v4());
+            let info = ServerInfo::new(
+                id.clone(),
+                &self.config.server_name,
+                self.config.worker_count as u32,
+                self.config.queues.clone(),
+            );
+            self.storage
+                .register_server(&info)
+                .await
+                .map_err(|e| QmlError::StorageError {
+                    message: format!("Failed to register server heartbeat: {}", e),
+                })?;
+            *self.server_id.lock().await = Some(id.clone());
+            Some(id)
+        } else {
+            *self.server_id.lock().await = None;
+            None
+        };
+
         *is_running = true;
         drop(is_running);
 
@@ -312,8 +384,33 @@ impl BackgroundJobServer {
             self.worker_handles.lock().await.push(handle);
         }
 
-        // Start worker threads
-        self.start_workers(shutdown_token).await?;
+        // Start heartbeat worker if enabled. Must come after the registry
+        // row is inserted by `register_server` above so the first bump
+        // finds a row.
+        if let Some(ref id) = server_identity {
+            let heartbeat = HeartbeatWorker::new(
+                self.storage.clone(),
+                id.clone(),
+                self.config.heartbeat_interval,
+                self.config.dead_server_timeout,
+            );
+            let cancel = shutdown_token.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = heartbeat.run_until_cancelled(cancel).await {
+                    error!("Heartbeat worker error: {}", e);
+                }
+            });
+            self.worker_handles.lock().await.push(handle);
+        }
+
+        // Start worker threads. When heartbeats are on, the unique
+        // `server_identity` is what gets stamped into
+        // `JobState::Processing::server_name`; otherwise fall back to the
+        // configured `server_name`.
+        let stamped_name = server_identity
+            .clone()
+            .unwrap_or_else(|| self.config.server_name.clone());
+        self.start_workers(shutdown_token, stamped_name).await?;
 
         info!("Background job server started successfully");
         Ok(())
@@ -340,6 +437,15 @@ impl BackgroundJobServer {
         self.shutdown_token.lock().await.cancel();
         *is_running = false;
         drop(is_running);
+
+        // Deregister our heartbeat row (if any) before waiting on tasks,
+        // so a peer scanning during our shutdown grace window doesn't
+        // briefly see us as alive with no running loop.
+        if let Some(id) = self.server_id.lock().await.take()
+            && let Err(e) = self.storage.deregister_server(&id).await
+        {
+            warn!("Failed to deregister server '{}' on stop: {}", id, e);
+        }
 
         let handles = {
             let mut guard = self.worker_handles.lock().await;
@@ -423,14 +529,24 @@ impl BackgroundJobServer {
             })
     }
 
-    /// Start worker threads
-    async fn start_workers(&self, shutdown_token: CancellationToken) -> Result<()> {
+    /// Start worker threads.
+    ///
+    /// `stamped_server_name` is what each worker writes into
+    /// [`JobState::Processing::server_name`](crate::core::JobState::Processing)
+    /// when it claims a job. When heartbeats are enabled it's the unique
+    /// `server_id` (`{server_name}#{uuid}`); otherwise it's the configured
+    /// `server_name`.
+    async fn start_workers(
+        &self,
+        shutdown_token: CancellationToken,
+        stamped_server_name: String,
+    ) -> Result<()> {
         let mut handles = self.worker_handles.lock().await;
 
         for worker_id in 0..self.config.worker_count {
             let worker_config =
                 WorkerConfig::new(format!("{}:worker:{}", self.config.server_name, worker_id))
-                    .server_name(&self.config.server_name)
+                    .server_name(&stamped_server_name)
                     .queues(self.config.queues.clone())
                     .job_timeout(self.config.job_timeout)
                     .polling_interval(self.config.polling_interval);

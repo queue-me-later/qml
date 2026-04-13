@@ -12,6 +12,7 @@ use crate::core::Job;
 use crate::error::{QmlError, Result};
 
 pub mod cleanup;
+pub mod heartbeat;
 pub mod processor;
 pub mod recurring;
 pub mod retry;
@@ -22,6 +23,7 @@ pub mod worker;
 pub use cleanup::{
     CleanupWorker, DEFAULT_CLEANUP_INTERVAL, DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL,
 };
+pub use heartbeat::{DEFAULT_DEAD_SERVER_TIMEOUT, DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWorker};
 pub use processor::JobProcessor;
 pub use recurring::{DEFAULT_RECURRING_BATCH_SIZE, RecurringJobPoller};
 pub use retry::{RetryPolicy, RetryStrategy};

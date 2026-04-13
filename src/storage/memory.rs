@@ -4,13 +4,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{MemoryConfig, Storage, StorageError};
-use crate::core::{Job, JobState, JobStateKind, RecurringJob};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Job lock information for MemoryStorage
 #[derive(Debug, Clone)]
 struct JobLock {
     worker_id: String,
     expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Generic named-lock entry used by `try_acquire_lock` / `release_lock`.
+#[derive(Debug, Clone)]
+struct NamedLock {
+    owner: String,
+    expires_at: DateTime<Utc>,
 }
 
 /// In-memory storage implementation for jobs
@@ -23,6 +30,8 @@ pub struct MemoryStorage {
     jobs: RwLock<HashMap<String, Job>>,
     locks: Arc<Mutex<HashMap<String, JobLock>>>,
     recurring: RwLock<HashMap<String, RecurringJob>>,
+    servers: RwLock<HashMap<String, ServerInfo>>,
+    named_locks: RwLock<HashMap<String, NamedLock>>,
     config: MemoryConfig,
 }
 
@@ -38,6 +47,8 @@ impl MemoryStorage {
             jobs: RwLock::new(HashMap::new()),
             locks: Arc::new(Mutex::new(HashMap::new())),
             recurring: RwLock::new(HashMap::new()),
+            servers: RwLock::new(HashMap::new()),
+            named_locks: RwLock::new(HashMap::new()),
             config,
         }
     }
@@ -440,6 +451,112 @@ impl Storage for MemoryStorage {
         });
         Ok(before - jobs.len())
     }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        let mut servers = self.servers.write().unwrap();
+        servers.insert(info.server_id.clone(), info.clone());
+        Ok(())
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let mut servers = self.servers.write().unwrap();
+        match servers.get_mut(server_id) {
+            Some(info) => {
+                info.last_heartbeat = now;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        let mut servers = self.servers.write().unwrap();
+        Ok(servers.remove(server_id).is_some())
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        let servers = self.servers.read().unwrap();
+        Ok(servers
+            .values()
+            .filter(|s| s.last_heartbeat < stale_before)
+            .cloned()
+            .collect())
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let mut locks = self.locks.lock().unwrap();
+
+        let mut reclaimed = 0;
+        for job in jobs.values_mut() {
+            let matches = matches!(
+                &job.state,
+                JobState::Processing { server_name, .. } if server_name == server_id
+            );
+            if !matches {
+                continue;
+            }
+
+            // Drop any lingering lock so fetch_and_lock_job can re-pick
+            // the job, then bypass `set_state` — `Processing → Enqueued`
+            // isn't in the user-facing allowlist, but peer reclaim is the
+            // same kind of out-of-band transition as S3's stale sweep.
+            locks.remove(&job.id);
+            job.state = JobState::enqueued(&job.queue);
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        let now = Utc::now();
+        let new_expires_at = now
+            + chrono::Duration::from_std(ttl).map_err(|e| {
+                StorageError::operation_failed("try_acquire_lock", format!("invalid ttl: {}", e))
+            })?;
+
+        let mut locks = self.named_locks.write().unwrap();
+        match locks.get(resource) {
+            Some(existing) if existing.expires_at > now && existing.owner != owner => {
+                // Held by someone else and still live.
+                Ok(false)
+            }
+            _ => {
+                // Free, expired, or same owner re-entrant — (re)acquire.
+                locks.insert(
+                    resource.to_string(),
+                    NamedLock {
+                        owner: owner.to_string(),
+                        expires_at: new_expires_at,
+                    },
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        let mut locks = self.named_locks.write().unwrap();
+        match locks.get(resource) {
+            Some(existing) if existing.owner == owner => {
+                locks.remove(resource);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 impl MemoryStorage {
@@ -773,5 +890,106 @@ mod tests {
             result.unwrap_err(),
             StorageError::JobNotFound { .. }
         ));
+    }
+
+    // ---- D2 generic distributed lock tests ---------------------------
+
+    #[tokio::test]
+    async fn try_acquire_lock_free_resource_succeeds() {
+        let storage = MemoryStorage::new();
+        let acquired = storage
+            .try_acquire_lock("report", "owner-a", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(acquired);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_lock_blocks_other_owner_until_expiry() {
+        let storage = MemoryStorage::new();
+        let ttl = std::time::Duration::from_millis(100);
+
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-a", ttl)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap(),
+            "second owner must be rejected while the lock is live"
+        );
+
+        // Wait past the TTL and retry — owner-b should now take over.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap(),
+            "expired lock must be takeable by a new owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_lock_is_reentrant_for_same_owner() {
+        let storage = MemoryStorage::new();
+        let ttl = std::time::Duration::from_secs(60);
+
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-a", ttl)
+                .await
+                .unwrap()
+        );
+        // Same owner re-acquires: allowed, refreshes TTL.
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-a", ttl)
+                .await
+                .unwrap(),
+            "same owner must be able to re-acquire (extend) a live lock"
+        );
+        // Another owner still blocked.
+        assert!(
+            !storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_lock_rejects_non_owner_and_releases_owner() {
+        let storage = MemoryStorage::new();
+        let ttl = std::time::Duration::from_secs(60);
+
+        storage
+            .try_acquire_lock("report", "owner-a", ttl)
+            .await
+            .unwrap();
+
+        // Non-owner release fails and leaves the lock held.
+        assert!(!storage.release_lock("report", "owner-b").await.unwrap());
+        assert!(
+            !storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap()
+        );
+
+        // Owner release succeeds and frees the lock.
+        assert!(storage.release_lock("report", "owner-a").await.unwrap());
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap()
+        );
+        // Double-release returns false.
+        assert!(!storage.release_lock("report", "owner-a").await.unwrap());
     }
 }

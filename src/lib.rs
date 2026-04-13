@@ -429,7 +429,7 @@ pub mod processing;
 pub mod storage;
 
 // Re-export main types for convenience
-pub use core::{Job, JobState, JobStateKind, RecurringJob};
+pub use core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 #[cfg(feature = "dashboard")]
 pub use dashboard::{
     DashboardAuth, DashboardConfig, DashboardServer, DashboardService, JobStatistics,

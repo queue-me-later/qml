@@ -8,7 +8,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use super::{PostgresConfig, Storage, StorageError};
-use crate::core::{Job, JobState, JobStateKind, RecurringJob};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Default name of the jobs table. `PostgresConfig::table_name` defaults to
 /// this and can be overridden, but the recurring-jobs table is not
@@ -22,7 +22,12 @@ const JOBS_TABLE_NAME: &str = "qml_jobs";
 /// Keeping this list here (instead of probing `install.sql` at runtime)
 /// keeps the check O(1) per table and visible in code review when a table
 /// is added.
-const CURRENT_SCHEMA_TABLES: &[&str] = &[JOBS_TABLE_NAME, "qml_recurring_jobs"];
+const CURRENT_SCHEMA_TABLES: &[&str] = &[
+    JOBS_TABLE_NAME,
+    "qml_recurring_jobs",
+    "qml_servers",
+    "qml_locks",
+];
 
 /// PostgreSQL storage implementation for jobs
 ///
@@ -496,6 +501,41 @@ impl PostgresStorage {
     /// config knob for it yet because there's only one copy per install.
     fn recurring_table_name(&self) -> String {
         format!("{}.qml_recurring_jobs", self.config.schema_name)
+    }
+
+    /// Fully-qualified name of the server-registry table used by the
+    /// heartbeat/dead-server machinery (D1).
+    fn servers_table_name(&self) -> String {
+        format!("{}.qml_servers", self.config.schema_name)
+    }
+
+    /// Fully-qualified name of the generic distributed-lock table (D2).
+    fn locks_table_name(&self) -> String {
+        format!("{}.qml_locks", self.config.schema_name)
+    }
+
+    /// Materialize a row from `qml_servers` into a [`ServerInfo`].
+    fn row_to_server_info(row: &sqlx::postgres::PgRow) -> Result<ServerInfo, StorageError> {
+        let err = |field: &str, e: sqlx::Error| StorageError::DeserializationError {
+            message: format!("Failed to get {}: {}", field, e),
+        };
+        let worker_count: i32 = row
+            .try_get("worker_count")
+            .map_err(|e| err("worker_count", e))?;
+        Ok(ServerInfo {
+            server_id: row.try_get("server_id").map_err(|e| err("server_id", e))?,
+            server_name: row
+                .try_get("server_name")
+                .map_err(|e| err("server_name", e))?,
+            started_at: row
+                .try_get("started_at")
+                .map_err(|e| err("started_at", e))?,
+            last_heartbeat: row
+                .try_get("last_heartbeat")
+                .map_err(|e| err("last_heartbeat", e))?,
+            worker_count: worker_count.max(0) as u32,
+            queues: row.try_get("queues").map_err(|e| err("queues", e))?,
+        })
     }
 
     /// Materialize a row from `qml_recurring_jobs` into a [`RecurringJob`].
@@ -1211,6 +1251,181 @@ impl Storage for PostgresStorage {
                 message: format!("Failed to delete expired jobs: {}", e),
             })?;
         Ok(result.rows_affected() as usize)
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        let query = format!(
+            r#"
+            INSERT INTO {table} (
+                server_id, server_name, started_at, last_heartbeat, worker_count, queues
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (server_id) DO UPDATE SET
+                server_name = EXCLUDED.server_name,
+                started_at = EXCLUDED.started_at,
+                last_heartbeat = EXCLUDED.last_heartbeat,
+                worker_count = EXCLUDED.worker_count,
+                queues = EXCLUDED.queues
+            "#,
+            table = self.servers_table_name()
+        );
+        sqlx::query(&query)
+            .bind(&info.server_id)
+            .bind(&info.server_name)
+            .bind(info.started_at)
+            .bind(info.last_heartbeat)
+            .bind(info.worker_count as i32)
+            .bind(&info.queues)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to register server: {}", e),
+            })?;
+        Ok(())
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "UPDATE {} SET last_heartbeat = $2 WHERE server_id = $1",
+            self.servers_table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(server_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to heartbeat server: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        let query = format!(
+            "DELETE FROM {} WHERE server_id = $1",
+            self.servers_table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(server_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to deregister server: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT server_id, server_name, started_at, last_heartbeat, worker_count, queues
+            FROM {}
+            WHERE last_heartbeat < $1
+            "#,
+            self.servers_table_name()
+        );
+        let rows = sqlx::query(&query)
+            .bind(stale_before)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to list dead servers: {}", e),
+            })?;
+        rows.iter().map(Self::row_to_server_info).collect()
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        // Same shape as requeue_stranded_jobs but filtered on
+        // `state_data->>'server_name' = $1` instead of a staleness cutoff.
+        // Matches every Processing job attributed to this dead peer and
+        // flips it back to Enqueued so it can be re-picked by any live
+        // worker.
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET state_name = 'enqueued',
+                state_data = jsonb_build_object(
+                    'enqueued_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                    'queue', queue_name
+                ),
+                locked_by = NULL,
+                locked_at = NULL,
+                lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE state_name = 'processing'
+              AND state_data->>'server_name' = $1
+            "#,
+            table = self.table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(server_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to reclaim jobs from server: {}", e),
+            })?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        // Insert-or-refresh in one round-trip. The `ON CONFLICT DO UPDATE
+        // WHERE` predicate ensures the update only fires when the existing
+        // lock is expired OR already owned by this caller (re-entrant
+        // extend). If the predicate fails, no row is returned and we
+        // know the lock is held live by someone else.
+        let ttl_secs = ttl.as_secs_f64();
+        let locks_table = self.locks_table_name();
+        let query = format!(
+            r#"
+            INSERT INTO {table} (resource, owner, acquired_at, expires_at)
+            VALUES ($1, $2, NOW(), NOW() + make_interval(secs => $3))
+            ON CONFLICT (resource) DO UPDATE
+            SET owner = EXCLUDED.owner,
+                acquired_at = EXCLUDED.acquired_at,
+                expires_at = EXCLUDED.expires_at
+            WHERE {table}.expires_at < NOW() OR {table}.owner = EXCLUDED.owner
+            RETURNING resource
+            "#,
+            table = locks_table
+        );
+        let row: Option<(String,)> = sqlx::query_as(&query)
+            .bind(resource)
+            .bind(owner)
+            .bind(ttl_secs)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to acquire lock: {}", e),
+            })?;
+        Ok(row.is_some())
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        let locks_table = self.locks_table_name();
+        let query = format!(
+            "DELETE FROM {table} WHERE resource = $1 AND owner = $2",
+            table = locks_table
+        );
+        let result = sqlx::query(&query)
+            .bind(resource)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to release lock: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
     }
 }
 

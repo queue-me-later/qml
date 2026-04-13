@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::time::timeout;
 
 use super::{RedisConfig, Storage, StorageError};
-use crate::core::{Job, JobState, JobStateKind, RecurringJob};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Redis storage implementation for jobs
 ///
@@ -101,6 +101,23 @@ impl RedisStorage {
     /// Used as a due-time index so `ZRANGEBYSCORE` can pull only due rows.
     fn recurring_index_key(&self) -> String {
         format!("{}:recurring:index", self.config.key_prefix)
+    }
+
+    /// Key for a single server-registry entry (JSON blob).
+    fn server_key(&self, server_id: &str) -> String {
+        format!("{}:server:{}", self.config.key_prefix, server_id)
+    }
+
+    /// Set of all live server_ids. Used to iterate for dead-server scans.
+    fn servers_index_key(&self) -> String {
+        format!("{}:servers", self.config.key_prefix)
+    }
+
+    /// Redis key for a single generic named-lock entry (D2). The value
+    /// is the owner string; TTL is enforced by Redis PX so expired keys
+    /// disappear automatically.
+    fn named_lock_key(&self, resource: &str) -> String {
+        format!("{}:lock:{}", self.config.key_prefix, resource)
     }
 
     /// Convert job state to a string for indexing
@@ -823,6 +840,175 @@ impl Storage for RedisStorage {
             removed += 1;
         }
         Ok(removed)
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.server_key(&info.server_id);
+        let index = self.servers_index_key();
+        let json = serde_json::to_string(info).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize ServerInfo", Box::new(e))
+        })?;
+        self.with_timeout::<_, ()>(conn.set(&key, json)).await?;
+        self.with_timeout::<_, ()>(conn.sadd(&index, &info.server_id))
+            .await?;
+        Ok(())
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.server_key(server_id);
+        let json: Option<String> = self
+            .with_timeout::<_, Option<String>>(conn.get(&key))
+            .await?;
+        let Some(s) = json else {
+            return Ok(false);
+        };
+        let mut info: ServerInfo = serde_json::from_str(&s).map_err(|e| {
+            StorageError::serialization_with_source("Failed to parse ServerInfo", Box::new(e))
+        })?;
+        info.last_heartbeat = now;
+        let updated = serde_json::to_string(&info).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize ServerInfo", Box::new(e))
+        })?;
+        self.with_timeout::<_, ()>(conn.set(&key, updated)).await?;
+        Ok(true)
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.server_key(server_id);
+        let index = self.servers_index_key();
+        let deleted: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+        let _: i32 = self
+            .with_timeout::<_, i32>(conn.srem(&index, server_id))
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let index = self.servers_index_key();
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.smembers(&index))
+            .await?;
+
+        let mut dead = Vec::new();
+        for id in ids {
+            let key = self.server_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else {
+                // Stale index entry — drop it to keep the set bounded.
+                let _: i32 = self.with_timeout::<_, i32>(conn.srem(&index, &id)).await?;
+                continue;
+            };
+            let info: ServerInfo = match serde_json::from_str(&s) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            if info.last_heartbeat < stale_before {
+                dead.push(info);
+            }
+        }
+        Ok(dead)
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        // Mirror `requeue_stranded_jobs`: walk the processing state set and
+        // transition each job whose `server_name` matches back to Enqueued.
+        // Idempotent — a second call sees no matches and returns 0.
+        let mut conn = self.get_connection().await?;
+        let processing_key = self.state_index_key("processing");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&processing_key)).await?;
+
+        let mut reclaimed = 0;
+        for job_id in job_ids {
+            let Some(mut job) = self.get(&job_id).await? else {
+                continue;
+            };
+            let owned = matches!(
+                &job.state,
+                JobState::Processing { server_name, .. } if server_name == server_id
+            );
+            if !owned {
+                continue;
+            }
+            // Bypass `Job::set_state` — Processing → Enqueued isn't in the
+            // normal allowlist, but peer reclaim is a legitimate out-of-band
+            // transition, same as the stranded-job sweep.
+            job.state = JobState::enqueued(&job.queue);
+            self.update(&job).await?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        // One Lua script to cover all three cases:
+        //   - free (GET returns nil — either never set or PX expired)
+        //   - same owner re-entrant extend (GET == ARGV[1])
+        //   - held by someone else (fail)
+        // Redis auto-expires via PX, so we don't need to stamp our own
+        // expires_at.
+        let ttl_ms = ttl.as_millis() as u64;
+        let script = redis::Script::new(
+            r#"
+            local cur = redis.call('GET', KEYS[1])
+            if cur == false or cur == ARGV[1] then
+                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                return 1
+            else
+                return 0
+            end
+            "#,
+        );
+        let key = self.named_lock_key(resource);
+        let mut conn = self.get_connection().await?;
+        let acquired: i64 = self
+            .with_timeout(
+                script
+                    .key(&key)
+                    .arg(owner)
+                    .arg(ttl_ms)
+                    .invoke_async(&mut conn),
+            )
+            .await?;
+        Ok(acquired == 1)
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        // Owner-checked DEL via Lua so a stale caller whose lock has
+        // already been taken over by another owner cannot accidentally
+        // release the new holder's lock.
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            else
+                return 0
+            end
+            "#,
+        );
+        let key = self.named_lock_key(resource);
+        let mut conn = self.get_connection().await?;
+        let deleted: i64 = self
+            .with_timeout(script.key(&key).arg(owner).invoke_async(&mut conn))
+            .await?;
+        Ok(deleted == 1)
     }
 }
 

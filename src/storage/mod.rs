@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use crate::core::{Job, JobState, JobStateKind, RecurringJob};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 pub mod config;
 pub mod database_init;
@@ -713,6 +713,84 @@ pub trait Storage: Send + Sync {
     /// flight jobs should never carry an `expires_at`. Returns the number
     /// of rows removed.
     async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
+
+    // ---------------------------------------------------------------------
+    // D1: server heartbeats + dead-server detection
+    // ---------------------------------------------------------------------
+
+    /// Insert or update a live [`ServerInfo`] registration. Called once on
+    /// [`BackgroundJobServer::start`](crate::processing::BackgroundJobServer::start)
+    /// when heartbeats are enabled. Backends should upsert (replace on
+    /// duplicate `server_id`).
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError>;
+
+    /// Bump `last_heartbeat` for a previously-registered `server_id`.
+    /// Returns `Ok(true)` if the row existed and was updated, `Ok(false)`
+    /// if the server was not registered (or had already been reclaimed).
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError>;
+
+    /// Remove a server registration. Called from `stop()` on graceful
+    /// shutdown, and by peers after reclaiming a dead server's jobs.
+    /// Returns `Ok(true)` if a row existed and was deleted.
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError>;
+
+    /// Return every server whose `last_heartbeat < stale_before`. Peers
+    /// call this to find servers that have likely crashed.
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError>;
+
+    /// Re-queue every `Processing` job whose
+    /// [`JobState::Processing::server_name`] matches `server_id`, returning
+    /// the number of jobs moved back to `Enqueued`. Used by the heartbeat
+    /// worker to actively reclaim a dead peer's in-flight work rather than
+    /// waiting for lock-expiry or the next startup sweep.
+    ///
+    /// This is idempotent: a second call after the first reclaim sees zero
+    /// matching `Processing` rows and returns 0.
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError>;
+
+    // -- D2: generic named distributed locks -----------------------------
+
+    /// Try to acquire a named distributed lock.
+    ///
+    /// `resource` is the lock key (arbitrary user-chosen string).
+    /// `owner` identifies the holder (e.g. `server_id`, `worker_id`, or a
+    /// caller-supplied token). `ttl` is how long the lock lives before
+    /// another owner can take it over.
+    ///
+    /// Semantics:
+    /// - If no row exists for `resource`, the lock is created and
+    ///   `Ok(true)` is returned.
+    /// - If a row exists but `expires_at` is in the past, it is taken
+    ///   over (`owner` and `expires_at` overwritten) and `Ok(true)` is
+    ///   returned.
+    /// - If a row exists, is not expired, and is held by the same
+    ///   `owner`, the `expires_at` is refreshed and `Ok(true)` is
+    ///   returned (re-entrant / extend).
+    /// - Otherwise returns `Ok(false)`.
+    ///
+    /// This is a separate mechanism from [`Storage::try_acquire_job_lock`]
+    /// — job locks live on the job row so fetch-and-lock remains a single
+    /// atomic `UPDATE ... RETURNING`. Generic locks exist for user-facing
+    /// "at most one instance of X" semantics (e.g. a recurring report
+    /// that must not overlap with itself).
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError>;
+
+    /// Release a named lock. Only the current `owner` can release.
+    /// Returns `Ok(true)` if a matching row was deleted, `Ok(false)` if
+    /// no row existed or it was owned by someone else.
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError>;
 }
 
 /// Storage instance that can hold any storage implementation
@@ -1105,6 +1183,92 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.delete_expired_jobs(now).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.delete_expired_jobs(now).await,
+        }
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.register_server(info).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.register_server(info).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.register_server(info).await,
+        }
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.heartbeat_server(server_id, now).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.heartbeat_server(server_id, now).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.heartbeat_server(server_id, now).await,
+        }
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.deregister_server(server_id).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.deregister_server(server_id).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.deregister_server(server_id).await,
+        }
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.list_dead_servers(stale_before).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.list_dead_servers(stale_before).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.list_dead_servers(stale_before).await,
+        }
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.reclaim_jobs_from_server(server_id).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.reclaim_jobs_from_server(server_id).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.reclaim_jobs_from_server(server_id).await,
+        }
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => {
+                storage.try_acquire_lock(resource, owner, ttl).await
+            }
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.try_acquire_lock(resource, owner, ttl).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.try_acquire_lock(resource, owner, ttl).await
+            }
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.release_lock(resource, owner).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.release_lock(resource, owner).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.release_lock(resource, owner).await,
         }
     }
 }

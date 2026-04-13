@@ -224,6 +224,17 @@ pub struct Job {
     /// long_job.set_timeout(3600); // 1 hour
     /// ```
     pub timeout_seconds: Option<u64>,
+
+    /// When the job becomes eligible for cleanup, if set.
+    ///
+    /// Stamped by [`JobProcessor`](crate::processing::JobProcessor) on
+    /// final-state transitions using the server's configured
+    /// `succeeded_ttl`/`failed_ttl`. The
+    /// [`CleanupWorker`](crate::processing::CleanupWorker) periodically
+    /// deletes jobs with `expires_at < now`. `None` means the job never
+    /// expires (default for in-flight jobs).
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -259,6 +270,7 @@ impl Job {
             metadata: HashMap::new(),
             job_type: None,
             timeout_seconds: None,
+            expires_at: None,
         }
     }
 
@@ -331,6 +343,7 @@ impl Job {
             metadata: HashMap::new(),
             job_type: None,
             timeout_seconds: None,
+            expires_at: None,
         }
     }
 
@@ -598,6 +611,7 @@ impl Job {
         cloned.id = Uuid::new_v4().to_string();
         cloned.created_at = Utc::now();
         cloned.attempt = 0;
+        cloned.expires_at = None;
         cloned
     }
 }

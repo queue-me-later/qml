@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{MemoryConfig, Storage, StorageError};
-use crate::core::{Job, JobState, JobStateKind};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob};
 
 /// Job lock information for MemoryStorage
 #[derive(Debug, Clone)]
@@ -22,6 +22,7 @@ struct JobLock {
 pub struct MemoryStorage {
     jobs: RwLock<HashMap<String, Job>>,
     locks: Arc<Mutex<HashMap<String, JobLock>>>,
+    recurring: RwLock<HashMap<String, RecurringJob>>,
     config: MemoryConfig,
 }
 
@@ -36,6 +37,7 @@ impl MemoryStorage {
         Self {
             jobs: RwLock::new(HashMap::new()),
             locks: Arc::new(Mutex::new(HashMap::new())),
+            recurring: RwLock::new(HashMap::new()),
             config,
         }
     }
@@ -62,21 +64,6 @@ impl MemoryStorage {
         } else {
             false
         }
-    }
-
-    /// Remove completed jobs if auto-cleanup is enabled
-    fn maybe_cleanup(&self) {
-        if !self.config.auto_cleanup {
-            return;
-        }
-
-        let mut jobs = self.jobs.write().unwrap();
-        jobs.retain(|_, job| {
-            !matches!(
-                job.state,
-                JobState::Succeeded { .. } | JobState::Deleted { .. }
-            )
-        });
     }
 
     /// Filter jobs by state
@@ -133,10 +120,8 @@ impl Storage for MemoryStorage {
             )));
         }
 
-        // Perform cleanup if enabled
-        self.maybe_cleanup();
-
-        // Store the job
+        // Store the job. Expired-job cleanup is handled out-of-band by
+        // `CleanupWorker` via `delete_expired_jobs` — no per-enqueue sweep.
         let mut jobs = self.jobs.write().unwrap();
         jobs.insert(job.id.clone(), job.clone());
 
@@ -398,6 +383,63 @@ impl Storage for MemoryStorage {
 
         Ok(jobs)
     }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        let mut map = self.recurring.write().unwrap();
+        map.insert(job.id.clone(), job.clone());
+        Ok(())
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        let mut map = self.recurring.write().unwrap();
+        Ok(map.remove(id).is_some())
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        let map = self.recurring.read().unwrap();
+        let mut out: Vec<RecurringJob> = map.values().cloned().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        // In-memory "atomic claim": bump `next_run_at` to a sentinel in the
+        // future before returning so a concurrent caller on the same
+        // storage instance won't re-fetch the same row. Two in-memory
+        // MemoryStorage instances are distinct storages anyway, so
+        // distributed coordination is N/A here.
+        let mut map = self.recurring.write().unwrap();
+        let mut due: Vec<RecurringJob> = map
+            .values()
+            .filter(|r| r.enabled && r.next_run_at <= now)
+            .cloned()
+            .collect();
+        due.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at));
+        due.truncate(limit);
+
+        // Park `next_run_at` far in the future so the same row isn't
+        // re-claimed before the caller advances + upserts it.
+        for r in &due {
+            if let Some(stored) = map.get_mut(&r.id) {
+                stored.next_run_at = now + chrono::Duration::days(3650);
+            }
+        }
+        Ok(due)
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let before = jobs.len();
+        jobs.retain(|_, job| match job.expires_at {
+            Some(ts) => ts > now,
+            None => true,
+        });
+        Ok(before - jobs.len())
+    }
 }
 
 impl MemoryStorage {
@@ -576,24 +618,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_storage_auto_cleanup() {
-        let config = MemoryConfig::new().with_max_jobs(3).with_auto_cleanup(true);
-        let storage = MemoryStorage::with_config(config);
+    async fn delete_expired_jobs_removes_only_expired() {
+        let storage = MemoryStorage::new();
 
-        let mut job1 = create_test_job();
-        job1.state = JobState::succeeded(100, None); // Will be cleaned up
+        let mut fresh = create_test_job();
+        fresh.state = JobState::succeeded(100, None);
+        fresh.expires_at = Some(Utc::now() + Duration::hours(1));
+        let fresh_id = fresh.id.clone();
 
-        let mut job2 = create_test_job();
-        job2.state = JobState::enqueued("default"); // Will remain
+        let mut stale = create_test_job();
+        stale.state = JobState::succeeded(100, None);
+        stale.expires_at = Some(Utc::now() - Duration::hours(1));
+        let stale_id = stale.id.clone();
 
-        let job3 = create_test_job(); // New job
+        let untouched = create_test_job();
+        let untouched_id = untouched.id.clone();
 
-        storage.enqueue(&job1).await.unwrap();
-        storage.enqueue(&job2).await.unwrap();
+        storage.enqueue(&fresh).await.unwrap();
+        storage.enqueue(&stale).await.unwrap();
+        storage.enqueue(&untouched).await.unwrap();
 
-        // This should trigger cleanup and succeed
-        assert!(storage.enqueue(&job3).await.is_ok());
-        assert_eq!(storage.len(), 2); // job1 should be cleaned up
+        let removed = storage.delete_expired_jobs(Utc::now()).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(storage.get(&fresh_id).await.unwrap().is_some());
+        assert!(storage.get(&stale_id).await.unwrap().is_none());
+        assert!(storage.get(&untouched_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn recurring_job_upsert_list_remove_roundtrip() {
+        use crate::core::RecurringJob;
+        let storage = MemoryStorage::new();
+
+        let r = RecurringJob::new(
+            "daily",
+            "0 0 9 * * *",
+            "report",
+            serde_json::json!(null),
+            "default",
+        )
+        .unwrap();
+        storage.upsert_recurring_job(&r).await.unwrap();
+
+        let listed = storage.list_recurring_jobs().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "daily");
+
+        assert!(storage.remove_recurring_job("daily").await.unwrap());
+        assert!(storage.list_recurring_jobs().await.unwrap().is_empty());
+        assert!(!storage.remove_recurring_job("daily").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fetch_due_recurring_jobs_returns_only_due_and_parks_next_run() {
+        use crate::core::RecurringJob;
+        let storage = MemoryStorage::new();
+
+        let mut due = RecurringJob::new(
+            "due",
+            "* * * * * *",
+            "tick",
+            serde_json::json!(null),
+            "default",
+        )
+        .unwrap();
+        due.next_run_at = Utc::now() - Duration::seconds(1);
+        storage.upsert_recurring_job(&due).await.unwrap();
+
+        let future = RecurringJob::new(
+            "future",
+            "0 0 0 1 1 * 2100",
+            "tick",
+            serde_json::json!(null),
+            "default",
+        )
+        .unwrap();
+        storage.upsert_recurring_job(&future).await.unwrap();
+
+        let claimed = storage
+            .fetch_due_recurring_jobs(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "due");
+
+        // A second call before the caller advances must not re-claim.
+        let again = storage
+            .fetch_due_recurring_jobs(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert!(again.is_empty());
     }
 
     #[tokio::test]

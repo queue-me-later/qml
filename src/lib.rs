@@ -156,6 +156,68 @@
 //! # });
 //! ```
 //!
+//! ## ⏰ **Recurring Jobs**
+//!
+//! Register cron-scheduled templates with
+//! [`BackgroundJobServer::schedule_recurring`]. The built-in
+//! [`RecurringJobPoller`] wakes periodically, materializes each due template
+//! into a regular [`Job`], and advances its `next_run_at`. Templates
+//! persist in storage, so restarts and multi-server deployments don't lose
+//! schedule state — a claim-and-park discipline across backends ensures no
+//! two servers fire the same tick.
+//!
+//! ```rust
+//! use qml_rs::{BackgroundJobServer, MemoryStorage, ServerConfig, WorkerRegistry};
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let storage = Arc::new(MemoryStorage::new());
+//! let registry = Arc::new(WorkerRegistry::new());
+//! let server = BackgroundJobServer::new(
+//!     ServerConfig::new("srv-1"),
+//!     storage,
+//!     registry,
+//! );
+//!
+//! // Cron expression uses the `cron` crate's 6-field format:
+//! // `sec min hour day-of-month month day-of-week`.
+//! server
+//!     .schedule_recurring(
+//!         "daily-report",
+//!         "0 0 9 * * *",
+//!         "generate_report",
+//!         serde_json::json!({ "kind": "daily" }),
+//!         "default",
+//!     )
+//!     .await?;
+//! // ... later ...
+//! server.remove_recurring("daily-report").await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## 🧹 **Automatic Expiration**
+//!
+//! Final-state jobs (`Succeeded` and permanently-`Failed`) are stamped with
+//! `expires_at` by [`JobProcessor`] on transition. A background
+//! [`CleanupWorker`] sweeps expired rows on a fixed interval so the hot
+//! enqueue path stays O(1). Defaults: `succeeded_ttl = 24h`,
+//! `failed_ttl = 7 days`, sweep every minute — all configurable on
+//! [`ServerConfig`].
+//!
+//! ```rust
+//! use chrono::Duration;
+//! use qml_rs::ServerConfig;
+//!
+//! let config = ServerConfig::new("srv-1")
+//!     .succeeded_ttl(Duration::hours(12))
+//!     .failed_ttl(Duration::days(14))
+//!     .cleanup_interval(Duration::minutes(5));
+//! ```
+//!
+//! Both `enable_recurring` and `enable_cleanup` default to `true`; flip
+//! them off if you want to run the poller or sweep out-of-process.
+//!
 //! ## 🔄 **Job States & Lifecycle**
 //!
 //! Jobs progress through well-defined states:
@@ -362,15 +424,15 @@ pub mod processing;
 pub mod storage;
 
 // Re-export main types for convenience
-pub use core::{Job, JobState, JobStateKind};
+pub use core::{Job, JobState, JobStateKind, RecurringJob};
 pub use dashboard::{
     DashboardConfig, DashboardServer, DashboardService, JobStatistics, QueueStatistics,
 };
 pub use error::{QmlError, Result};
 pub use processing::{
-    BackgroundJobServer, JobProcessor, JobScheduler, RetryPolicy, RetryStrategy, ServerConfig,
-    TypedWorker, TypedWorkerAdapter, Worker, WorkerConfig, WorkerContext, WorkerRegistry,
-    WorkerResult,
+    BackgroundJobServer, CleanupWorker, JobProcessor, JobScheduler, RecurringJobPoller,
+    RetryPolicy, RetryStrategy, ServerConfig, TypedWorker, TypedWorkerAdapter, Worker,
+    WorkerConfig, WorkerContext, WorkerRegistry, WorkerResult,
 };
 pub use storage::{MemoryStorage, Storage, StorageConfig, StorageError, StorageInstance};
 

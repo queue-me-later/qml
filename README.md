@@ -50,6 +50,19 @@ qml-rs = { version = "1.0.0", features = ["postgres"] }
 - `AwaitingRetry` → `Enqueued` (retry logic)
 - `Deleted` (soft deletion with audit trail)
 
+### **Recurring Jobs**
+
+- Cron-scheduled templates via `BackgroundJobServer::schedule_recurring`
+- `RecurringJobPoller` materializes due templates into normal jobs
+- Claim-and-park locking prevents multi-server duplicate firings
+- Templates persist in a dedicated table/keyspace across restarts
+
+### **Automatic Expiration**
+
+- `Succeeded` and permanently-`Failed` jobs are stamped with `expires_at`
+- `CleanupWorker` sweeps expired rows out-of-band (default every minute)
+- Configurable TTLs: `succeeded_ttl` (default 24h), `failed_ttl` (default 7d)
+
 ### **Race Condition Prevention**
 
 - **PostgreSQL**: `SELECT FOR UPDATE SKIP LOCKED` with dedicated lock table
@@ -79,22 +92,32 @@ qml-rs = { version = "1.0.0", features = ["postgres"] }
 
 ```rust
 use qml_rs::{
-    BackgroundJobServer, Job, MemoryStorage, ServerConfig,
-    Worker, WorkerContext, WorkerResult, WorkerRegistry
+    BackgroundJobServer, Job, MemoryStorage, QmlError, ServerConfig, Storage,
+    TypedWorker, WorkerContext, WorkerRegistry, WorkerResult,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-// Define a worker
+#[derive(Serialize, Deserialize)]
+struct EmailArgs {
+    to: String,
+    subject: String,
+}
+
 struct EmailWorker;
 
 #[async_trait]
-impl Worker for EmailWorker {
-    async fn execute(&self, job: &Job, _context: &WorkerContext) -> Result<WorkerResult, qml::QmlError> {
-        let email = &job.arguments[0];
-        println!("Sending email to: {}", email);
-        // Email sending logic here
-        Ok(WorkerResult::success())
+impl TypedWorker for EmailWorker {
+    type Args = EmailArgs;
+
+    async fn execute(
+        &self,
+        args: EmailArgs,
+        _ctx: &WorkerContext,
+    ) -> Result<WorkerResult, QmlError> {
+        println!("sending `{}` to {}", args.subject, args.to);
+        Ok(WorkerResult::success(None, 0))
     }
 
     fn method_name(&self) -> &str {
@@ -104,29 +127,79 @@ impl Worker for EmailWorker {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup storage and worker registry
     let storage = Arc::new(MemoryStorage::new());
-    let mut registry = WorkerRegistry::new();
-    registry.register(Box::new(EmailWorker));
 
-    // Create job and enqueue
-    let job = Job::new("send_email", vec!["user@example.com".to_string()]);
+    let mut registry = WorkerRegistry::new();
+    registry.register_typed(EmailWorker);
+
+    // Enqueue a job with a typed payload.
+    let job = Job::new(
+        "send_email",
+        serde_json::json!({ "to": "user@example.com", "subject": "hi" }),
+    );
     storage.enqueue(&job).await?;
 
-    // Start job server
+    // Start the server. Recurring + cleanup workers are on by default.
     let config = ServerConfig::new("server-1").worker_count(4);
-    let server = BackgroundJobServer::new(storage, Arc::new(registry), config).await?;
-
+    let server = BackgroundJobServer::new(config, storage, Arc::new(registry));
     server.start().await?;
-    println!("Job server running! Check the dashboard at http://localhost:8080");
 
-    // Server runs until stopped
     tokio::signal::ctrl_c().await?;
     server.stop().await?;
-
     Ok(())
 }
 ```
+
+### **Recurring Jobs**
+
+```rust
+use chrono::Duration;
+use qml_rs::{BackgroundJobServer, MemoryStorage, ServerConfig, WorkerRegistry};
+use std::sync::Arc;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let storage = Arc::new(MemoryStorage::new());
+let registry = Arc::new(WorkerRegistry::new()); // register your workers
+
+let config = ServerConfig::new("server-1")
+    .recurring_poll_interval(Duration::seconds(5)); // how often to check for due templates
+let server = BackgroundJobServer::new(config, storage, registry);
+
+// Cron expression is the cron crate's 6-field format: sec min hour day month dow
+server
+    .schedule_recurring(
+        "daily-report",
+        "0 0 9 * * *",
+        "generate_report",
+        serde_json::json!({ "kind": "daily" }),
+        "default",
+    )
+    .await?;
+
+server.start().await?;
+// ...
+server.remove_recurring("daily-report").await?;
+# Ok(())
+# }
+```
+
+Templates are persisted by the storage backend, so `schedule_recurring` survives restarts and is shared between servers that point at the same storage. The poller uses a claim-and-park discipline so two servers running against one backend won't fire the same tick twice.
+
+### **Automatic Expiration**
+
+Final-state jobs (`Succeeded` and permanently-`Failed`) get `expires_at` stamped by `JobProcessor`. A background `CleanupWorker` deletes expired rows on a fixed interval, so the hot enqueue path stays O(1) and the job table stops growing unboundedly.
+
+```rust
+use chrono::Duration;
+use qml_rs::ServerConfig;
+
+let config = ServerConfig::new("server-1")
+    .succeeded_ttl(Duration::hours(24))   // default
+    .failed_ttl(Duration::days(7))        // default
+    .cleanup_interval(Duration::minutes(1)); // default sweep cadence
+```
+
+Both `enable_recurring` and `enable_cleanup` default to `true`; set them to `false` if you want to run the poller/worker out-of-process or disable the feature entirely.
 
 ### **PostgreSQL Setup**
 

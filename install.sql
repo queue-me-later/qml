@@ -77,6 +77,33 @@ CREATE INDEX IF NOT EXISTS idx_qml_jobs_job_type ON qml.qml_jobs(job_type) WHERE
 CREATE INDEX IF NOT EXISTS idx_qml_jobs_job_type ON qml.qml_jobs(job_type) WHERE job_type IS NOT NULL;
 
 -- =========================================================================
+-- RECURRING JOB TEMPLATES (R1)
+-- =========================================================================
+
+-- Recurring job templates. The RecurringJobPoller claims rows whose
+-- `next_run_at <= now()` using FOR UPDATE SKIP LOCKED so two servers
+-- cannot double-fire the same tick.
+CREATE TABLE IF NOT EXISTS qml.qml_recurring_jobs (
+    id TEXT PRIMARY KEY,
+    cron TEXT NOT NULL,
+    method TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT 'null'::jsonb,
+    queue TEXT NOT NULL DEFAULT 'default',
+    next_run_at TIMESTAMPTZ NOT NULL,
+    last_run_at TIMESTAMPTZ DEFAULT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_qml_recurring_next_run_at
+    ON qml.qml_recurring_jobs(next_run_at)
+    WHERE enabled = TRUE;
+
+COMMENT ON TABLE qml.qml_recurring_jobs IS
+    'Cron-scheduled job templates materialized into qml_jobs by the RecurringJobPoller';
+
+-- =========================================================================
 -- TRIGGERS AND FUNCTIONS
 -- =========================================================================
 

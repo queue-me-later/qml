@@ -3,13 +3,16 @@
 //! This module contains the JobProcessor that handles the execution lifecycle
 //! of individual jobs, including state transitions and retry logic.
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    WorkerConfig, WorkerRegistry, WorkerResult, retry::RetryPolicy, worker::WorkerContext,
+    WorkerConfig, WorkerRegistry, WorkerResult,
+    cleanup::{DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL},
+    retry::RetryPolicy,
+    worker::WorkerContext,
 };
 use crate::core::{Job, JobState};
 use crate::error::{QmlError, Result};
@@ -25,6 +28,12 @@ pub struct JobProcessor {
     /// creates. Defaults to a detached token; the server installs a
     /// shutdown-linked child via [`JobProcessor::with_cancellation`].
     cancel_token: CancellationToken,
+    /// TTL stamped onto `expires_at` when a job transitions to `Succeeded`.
+    /// The `CleanupWorker` deletes rows whose `expires_at` is in the past.
+    succeeded_ttl: Duration,
+    /// TTL stamped onto `expires_at` when a job transitions to a permanent
+    /// `Failed` state (i.e. retries exhausted).
+    failed_ttl: Duration,
 }
 
 impl JobProcessor {
@@ -40,6 +49,8 @@ impl JobProcessor {
             retry_policy: RetryPolicy::default(),
             worker_config,
             cancel_token: CancellationToken::new(),
+            succeeded_ttl: DEFAULT_SUCCEEDED_TTL,
+            failed_ttl: DEFAULT_FAILED_TTL,
         }
     }
 
@@ -56,6 +67,8 @@ impl JobProcessor {
             retry_policy,
             worker_config,
             cancel_token: CancellationToken::new(),
+            succeeded_ttl: DEFAULT_SUCCEEDED_TTL,
+            failed_ttl: DEFAULT_FAILED_TTL,
         }
     }
 
@@ -65,6 +78,15 @@ impl JobProcessor {
     /// impls.
     pub fn with_cancellation(mut self, cancel_token: CancellationToken) -> Self {
         self.cancel_token = cancel_token;
+        self
+    }
+
+    /// Override the TTLs stamped onto `job.expires_at` when jobs reach a
+    /// final state. The `CleanupWorker` uses `expires_at` to drop rows
+    /// out-of-band.
+    pub fn with_ttls(mut self, succeeded_ttl: Duration, failed_ttl: Duration) -> Self {
+        self.succeeded_ttl = succeeded_ttl;
+        self.failed_ttl = failed_ttl;
         self
     }
 
@@ -202,6 +224,10 @@ impl JobProcessor {
             return Err(e);
         }
 
+        // Stamp expiration so the out-of-band CleanupWorker can drop this
+        // row later without needing to re-evaluate its state.
+        job.expires_at = Some(Utc::now() + self.succeeded_ttl);
+
         // Add execution metadata
         for (key, value) in metadata {
             job.add_metadata(format!("exec_{}", key), value);
@@ -299,6 +325,10 @@ impl JobProcessor {
             error!("Failed to set job state to Failed: {}", e);
             return Err(e);
         }
+
+        // Permanent failure is a final state; stamp expiration so the
+        // CleanupWorker can drop it after `failed_ttl`.
+        job.expires_at = Some(Utc::now() + self.failed_ttl);
 
         // Update in storage
         self.storage

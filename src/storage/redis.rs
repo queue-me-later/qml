@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::time::timeout;
 
 use super::{RedisConfig, Storage, StorageError};
-use crate::core::{Job, JobState, JobStateKind};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob};
 
 /// Redis storage implementation for jobs
 ///
@@ -90,6 +90,17 @@ impl RedisStorage {
     /// Get the Redis key for all jobs set
     fn all_jobs_key(&self) -> String {
         format!("{}:all", self.config.key_prefix)
+    }
+
+    /// Hash key holding a single recurring-job template.
+    fn recurring_key(&self, id: &str) -> String {
+        format!("{}:recurring:{}", self.config.key_prefix, id)
+    }
+
+    /// Sorted-set of recurring-job ids keyed by `next_run_at` (epoch ms).
+    /// Used as a due-time index so `ZRANGEBYSCORE` can pull only due rows.
+    fn recurring_index_key(&self) -> String {
+        format!("{}:recurring:index", self.config.key_prefix)
     }
 
     /// Convert job state to a string for indexing
@@ -657,6 +668,161 @@ impl Storage for RedisStorage {
         }
 
         Ok(jobs)
+    }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.recurring_key(&job.id);
+        let json = serde_json::to_string(job).map_err(|e| {
+            StorageError::serialization_with_source(
+                "Failed to serialize recurring job",
+                Box::new(e),
+            )
+        })?;
+        self.with_timeout::<_, ()>(conn.set(&key, json)).await?;
+        let score = job.next_run_at.timestamp_millis() as f64;
+        self.with_timeout::<_, ()>(conn.zadd(self.recurring_index_key(), &job.id, score))
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.recurring_key(id);
+        let removed: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+        let _: i32 = self
+            .with_timeout::<_, i32>(conn.zrem(self.recurring_index_key(), id))
+            .await?;
+        Ok(removed > 0)
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.zrange(self.recurring_index_key(), 0, -1))
+            .await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let key = self.recurring_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            if let Some(s) = json {
+                let r: RecurringJob = serde_json::from_str(&s).map_err(|e| {
+                    StorageError::serialization_with_source(
+                        "Failed to parse recurring job",
+                        Box::new(e),
+                    )
+                })?;
+                out.push(r);
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let index = self.recurring_index_key();
+        let now_ms = now.timestamp_millis() as f64;
+        // Pull candidate ids; use ZRANGEBYSCORE for due windows.
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.zrangebyscore_limit(
+                &index,
+                f64::NEG_INFINITY,
+                now_ms,
+                0,
+                limit as isize,
+            ))
+            .await?;
+
+        let mut claimed = Vec::new();
+        // Park sentinel: far-future score so peers won't reclaim before
+        // the caller advances + upserts.
+        let park_ms = (now + chrono::Duration::days(3650)).timestamp_millis() as f64;
+        for id in ids {
+            // Acquire a per-id claim lock (SET NX) so two pollers don't
+            // both materialize the same firing.
+            let claim_key = format!("{}:recurring:claim:{}", self.config.key_prefix, id);
+            let claimed_ok: Option<String> = self
+                .with_timeout::<_, Option<String>>(
+                    redis::cmd("SET")
+                        .arg(&claim_key)
+                        .arg("1")
+                        .arg("NX")
+                        .arg("EX")
+                        .arg(60i64)
+                        .query_async(&mut conn),
+                )
+                .await?;
+            if claimed_ok.is_none() {
+                continue;
+            }
+
+            let key = self.recurring_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else { continue };
+            let r: RecurringJob = serde_json::from_str(&s).map_err(|e| {
+                StorageError::serialization_with_source(
+                    "Failed to parse recurring job",
+                    Box::new(e),
+                )
+            })?;
+            if !r.enabled || r.next_run_at > now {
+                continue;
+            }
+            // Park in the index so peer pollers skip it; `r.next_run_at`
+            // on the returned template is still the true firing time
+            // because the sentinel only lives in the ZSET index.
+            self.with_timeout::<_, ()>(conn.zadd(&index, &id, park_ms))
+                .await?;
+            claimed.push(r);
+            if claimed.len() >= limit {
+                break;
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        // Redis backends also set native TTL via update_job_indices, but
+        // `expires_at` on the Job is the authoritative clock because it
+        // gives the CleanupWorker a uniform cross-backend deadline.
+        let mut conn = self.get_connection().await?;
+        let all_key = self.all_jobs_key();
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.smembers(&all_key))
+            .await?;
+
+        let mut removed = 0usize;
+        for id in ids {
+            let key = self.job_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else { continue };
+            let job: Job = match serde_json::from_str(&s) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            let expired = match job.expires_at {
+                Some(ts) => ts < now,
+                None => false,
+            };
+            if !expired {
+                continue;
+            }
+            self.remove_job_indices(&id, &job).await?;
+            let _: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 }
 

@@ -8,7 +8,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use super::{PostgresConfig, Storage, StorageError};
-use crate::core::{Job, JobState, JobStateKind};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob};
 
 /// PostgreSQL storage implementation for jobs
 ///
@@ -363,6 +363,12 @@ impl PostgresStorage {
                     message: format!("Failed to get timeout_seconds: {}", e),
                 })?;
 
+        let expires_at: Option<DateTime<Utc>> =
+            row.try_get("expires_at")
+                .map_err(|e| StorageError::DeserializationError {
+                    message: format!("Failed to get expires_at: {}", e),
+                })?;
+
         let state = Self::data_to_job_state(&state_name, &state_data)?;
 
         Ok(Job {
@@ -378,6 +384,7 @@ impl PostgresStorage {
             metadata,
             job_type,
             timeout_seconds: timeout_seconds.map(|t| t as u64),
+            expires_at,
         })
     }
 
@@ -426,6 +433,40 @@ impl PostgresStorage {
     fn table_name(&self) -> String {
         self.config.full_table_name()
     }
+
+    /// Fully-qualified name of the recurring-jobs table. Hard-coded to
+    /// `qml_recurring_jobs` under the configured schema — there's no
+    /// config knob for it yet because there's only one copy per install.
+    fn recurring_table_name(&self) -> String {
+        format!("{}.qml_recurring_jobs", self.config.schema_name)
+    }
+
+    /// Materialize a row from `qml_recurring_jobs` into a [`RecurringJob`].
+    fn row_to_recurring(row: &sqlx::postgres::PgRow) -> Result<RecurringJob, StorageError> {
+        let err = |field: &str, e: sqlx::Error| StorageError::DeserializationError {
+            message: format!("Failed to get {}: {}", field, e),
+        };
+        Ok(RecurringJob {
+            id: row.try_get("id").map_err(|e| err("id", e))?,
+            cron: row.try_get("cron").map_err(|e| err("cron", e))?,
+            method: row.try_get("method").map_err(|e| err("method", e))?,
+            payload: row.try_get("payload").map_err(|e| err("payload", e))?,
+            queue: row.try_get("queue").map_err(|e| err("queue", e))?,
+            next_run_at: row
+                .try_get("next_run_at")
+                .map_err(|e| err("next_run_at", e))?,
+            last_run_at: row
+                .try_get("last_run_at")
+                .map_err(|e| err("last_run_at", e))?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| err("created_at", e))?,
+            updated_at: row
+                .try_get("updated_at")
+                .map_err(|e| err("updated_at", e))?,
+            enabled: row.try_get("enabled").map_err(|e| err("enabled", e))?,
+        })
+    }
 }
 
 #[async_trait]
@@ -451,8 +492,8 @@ impl Storage for PostgresStorage {
             INSERT INTO {} (
                 id, method_name, arguments, created_at, state_name, state_data,
                 queue_name, priority, max_retries, current_retries, metadata,
-                job_type, timeout_seconds
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                job_type, timeout_seconds, expires_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
             self.table_name()
         );
@@ -474,6 +515,7 @@ impl Storage for PostgresStorage {
                     .bind(&metadata)
                     .bind(&job.job_type)
                     .bind(job.timeout_seconds.map(|t| t as i32))
+                    .bind(job.expires_at)
                     .execute(&self.pool)
                     .await
             },
@@ -492,7 +534,7 @@ impl Storage for PostgresStorage {
         let query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE id = $1
             "#,
@@ -539,7 +581,8 @@ impl Storage for PostgresStorage {
             UPDATE {}
             SET method_name = $2, arguments = $3, state_name = $4, state_data = $5,
                 queue_name = $6, priority = $7, max_retries = $8, current_retries = $9,
-                metadata = $10, job_type = $11, timeout_seconds = $12, updated_at = NOW()
+                metadata = $10, job_type = $11, timeout_seconds = $12, expires_at = $13,
+                updated_at = NOW()
             WHERE id = $1
             "#,
             self.table_name()
@@ -558,6 +601,7 @@ impl Storage for PostgresStorage {
             .bind(metadata)
             .bind(&job.job_type)
             .bind(job.timeout_seconds.map(|t| t as i32))
+            .bind(job.expires_at)
             .execute(&self.pool)
             .await
             .map_err(|e| StorageError::OperationError {
@@ -600,7 +644,7 @@ impl Storage for PostgresStorage {
         let mut query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             "#,
             self.table_name()
@@ -704,7 +748,7 @@ impl Storage for PostgresStorage {
         let mut query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name IN ('enqueued', 'scheduled', 'awaiting_retry')
             AND (
@@ -747,7 +791,7 @@ impl Storage for PostgresStorage {
         let query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name = 'scheduled'
               AND (state_data->>'enqueue_at')::timestamptz <= $1
@@ -781,7 +825,7 @@ impl Storage for PostgresStorage {
         let query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name = 'awaiting_retry'
               AND (state_data->>'retry_at')::timestamptz <= $1
@@ -887,7 +931,7 @@ impl Storage for PostgresStorage {
             )
             RETURNING id, method_name, arguments, created_at, state_name, state_data,
                       queue_name, priority, max_retries, current_retries, metadata,
-                      job_type, timeout_seconds
+                      job_type, timeout_seconds, expires_at
             "#,
             table = self.table_name(),
             queue_filter = queue_filter,
@@ -978,6 +1022,138 @@ impl Storage for PostgresStorage {
         }
 
         Ok(jobs)
+    }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        let table = self.recurring_table_name();
+        let query = format!(
+            r#"
+            INSERT INTO {table} (
+                id, cron, method, payload, queue, next_run_at,
+                last_run_at, created_at, updated_at, enabled
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                cron = EXCLUDED.cron,
+                method = EXCLUDED.method,
+                payload = EXCLUDED.payload,
+                queue = EXCLUDED.queue,
+                next_run_at = EXCLUDED.next_run_at,
+                last_run_at = EXCLUDED.last_run_at,
+                updated_at = EXCLUDED.updated_at,
+                enabled = EXCLUDED.enabled
+            "#
+        );
+        sqlx::query(&query)
+            .bind(&job.id)
+            .bind(&job.cron)
+            .bind(&job.method)
+            .bind(&job.payload)
+            .bind(&job.queue)
+            .bind(job.next_run_at)
+            .bind(job.last_run_at)
+            .bind(job.created_at)
+            .bind(job.updated_at)
+            .bind(job.enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to upsert recurring job: {}", e),
+            })?;
+        Ok(())
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        let query = format!("DELETE FROM {} WHERE id = $1", self.recurring_table_name());
+        let result = sqlx::query(&query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to delete recurring job: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT id, cron, method, payload, queue, next_run_at,
+                   last_run_at, created_at, updated_at, enabled
+            FROM {}
+            ORDER BY id
+            "#,
+            self.recurring_table_name()
+        );
+        let rows = sqlx::query(&query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to list recurring jobs: {}", e),
+            })?;
+        rows.iter().map(Self::row_to_recurring).collect()
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        // Claim rows in a transaction: inner SELECT with FOR UPDATE SKIP
+        // LOCKED picks eligible recurring templates; outer UPDATE parks
+        // next_run_at far in the future so a peer poller won't reclaim
+        // them before the caller advances + upserts the real next_run_at.
+        let table = self.recurring_table_name();
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET next_run_at = $1 + INTERVAL '3650 days'
+            WHERE id IN (
+                SELECT id FROM {table}
+                WHERE enabled = TRUE AND next_run_at <= $1
+                ORDER BY next_run_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $2
+            )
+            RETURNING id, cron, method, payload, queue, next_run_at,
+                      last_run_at, created_at, updated_at, enabled
+            "#
+        );
+        let rows = sqlx::query(&query)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to fetch due recurring jobs: {}", e),
+            })?;
+
+        // The UPDATE parked the next_run_at to now + 3650d — restore the
+        // originally-due value in the returned structs so the caller can
+        // make forward-progress decisions from the true firing time.
+        // (The DB row stays parked until the caller upserts the advanced
+        // row.)
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let mut r = Self::row_to_recurring(row)?;
+            r.next_run_at = now;
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let query = format!(
+            "DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at < $1",
+            self.table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to delete expired jobs: {}", e),
+            })?;
+        Ok(result.rows_affected() as usize)
     }
 }
 

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use crate::core::{Job, JobState, JobStateKind};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob};
 
 pub mod config;
 pub mod database_init;
@@ -674,6 +674,45 @@ pub trait Storage: Send + Sync {
         limit: Option<usize>,
         queues: Option<&[String]>,
     ) -> Result<Vec<Job>, StorageError>;
+
+    /// Insert or update a [`RecurringJob`] template.
+    ///
+    /// Keyed by [`RecurringJob::id`]. Backends should upsert (insert on
+    /// first call, overwrite subsequent calls for the same id).
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError>;
+
+    /// Remove a recurring-job template by id.
+    ///
+    /// Returns `Ok(true)` if a row existed and was removed, `Ok(false)` if
+    /// the id was unknown.
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError>;
+
+    /// List recurring-job templates (for dashboards / operator tooling).
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError>;
+
+    /// Atomically claim recurring-job templates whose `next_run_at <= now`
+    /// and are `enabled`. Implementations must use locking (Postgres: `FOR
+    /// UPDATE SKIP LOCKED`, Redis: per-row `SET NX`) so two servers running
+    /// the poller cannot double-fire the same tick.
+    ///
+    /// Claimed rows are returned to the caller *before* `next_run_at` is
+    /// advanced — the caller is responsible for calling
+    /// [`RecurringJob::advance`] and then [`upsert_recurring_job`] to write
+    /// the new `next_run_at` back. The advance is done in-memory (not in
+    /// SQL) because cron expressions can't be computed by the database.
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError>;
+
+    /// Delete jobs whose `expires_at` is in the past.
+    ///
+    /// Called periodically by the cleanup worker. Backends should only
+    /// touch rows in a final state (Succeeded / Failed / Deleted) — in-
+    /// flight jobs should never carry an `expires_at`. Returns the number
+    /// of rows removed.
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
 }
 
 /// Storage instance that can hold any storage implementation
@@ -1010,6 +1049,62 @@ impl Storage for StorageInstance {
                     .fetch_available_jobs_atomic(worker_id, limit, queues)
                     .await
             }
+        }
+    }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.upsert_recurring_job(job).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.upsert_recurring_job(job).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.upsert_recurring_job(job).await,
+        }
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.remove_recurring_job(id).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.remove_recurring_job(id).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.remove_recurring_job(id).await,
+        }
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.list_recurring_jobs().await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.list_recurring_jobs().await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.list_recurring_jobs().await,
+        }
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.fetch_due_recurring_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.fetch_due_recurring_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.fetch_due_recurring_jobs(now, limit).await
+            }
+        }
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.delete_expired_jobs(now).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.delete_expired_jobs(now).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.delete_expired_jobs(now).await,
         }
     }
 }

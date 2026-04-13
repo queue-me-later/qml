@@ -12,9 +12,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    RetryPolicy, WorkerRegistry, processor::JobProcessor, scheduler::JobScheduler,
+    RetryPolicy, WorkerRegistry,
+    cleanup::{CleanupWorker, DEFAULT_CLEANUP_INTERVAL, DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL},
+    processor::JobProcessor,
+    recurring::RecurringJobPoller,
+    scheduler::JobScheduler,
     worker::WorkerConfig,
 };
+use crate::core::RecurringJob;
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
 
@@ -50,6 +55,21 @@ pub struct ServerConfig {
     /// This should comfortably exceed the typical `job_timeout` so a worker
     /// that's still alive isn't fighting with the recovery sweep.
     pub stale_processing_after: Duration,
+    /// Enable the recurring-job poller that materializes due
+    /// [`RecurringJob`](crate::core::RecurringJob) templates.
+    pub enable_recurring: bool,
+    /// Poll interval for the recurring-job poller. Defaults to 5 seconds so
+    /// minute-granularity crons fire promptly without hammering storage.
+    pub recurring_poll_interval: Duration,
+    /// Enable the background cleanup worker that deletes rows whose
+    /// `expires_at` is in the past.
+    pub enable_cleanup: bool,
+    /// Interval between cleanup sweeps. Defaults to 1 minute.
+    pub cleanup_interval: Duration,
+    /// TTL stamped onto successfully-completed jobs. Defaults to 24 hours.
+    pub succeeded_ttl: Duration,
+    /// TTL stamped onto permanently-failed jobs. Defaults to 7 days.
+    pub failed_ttl: Duration,
 }
 
 impl Default for ServerConfig {
@@ -66,6 +86,12 @@ impl Default for ServerConfig {
             scheduler_poll_interval: Duration::seconds(30),
             shutdown_timeout: Duration::seconds(30),
             stale_processing_after: Duration::minutes(5),
+            enable_recurring: true,
+            recurring_poll_interval: Duration::seconds(5),
+            enable_cleanup: true,
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+            succeeded_ttl: DEFAULT_SUCCEEDED_TTL,
+            failed_ttl: DEFAULT_FAILED_TTL,
         }
     }
 }
@@ -125,6 +151,42 @@ impl ServerConfig {
     /// on startup.
     pub fn stale_processing_after(mut self, threshold: Duration) -> Self {
         self.stale_processing_after = threshold;
+        self
+    }
+
+    /// Enable or disable the recurring-job poller.
+    pub fn enable_recurring(mut self, enable: bool) -> Self {
+        self.enable_recurring = enable;
+        self
+    }
+
+    /// Set the recurring-job poll interval.
+    pub fn recurring_poll_interval(mut self, interval: Duration) -> Self {
+        self.recurring_poll_interval = interval;
+        self
+    }
+
+    /// Enable or disable the background cleanup worker.
+    pub fn enable_cleanup(mut self, enable: bool) -> Self {
+        self.enable_cleanup = enable;
+        self
+    }
+
+    /// Set the cleanup-worker sweep interval.
+    pub fn cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+
+    /// Set the TTL stamped onto successfully-completed jobs.
+    pub fn succeeded_ttl(mut self, ttl: Duration) -> Self {
+        self.succeeded_ttl = ttl;
+        self
+    }
+
+    /// Set the TTL stamped onto permanently-failed jobs.
+    pub fn failed_ttl(mut self, ttl: Duration) -> Self {
+        self.failed_ttl = ttl;
         self
     }
 }
@@ -237,6 +299,31 @@ impl BackgroundJobServer {
             self.worker_handles.lock().await.push(scheduler_handle);
         }
 
+        // Start recurring-job poller if enabled
+        if self.config.enable_recurring {
+            let poller =
+                RecurringJobPoller::new(self.storage.clone(), self.config.recurring_poll_interval);
+            let cancel = shutdown_token.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = poller.run_until_cancelled(cancel).await {
+                    error!("Recurring poller error: {}", e);
+                }
+            });
+            self.worker_handles.lock().await.push(handle);
+        }
+
+        // Start cleanup worker if enabled
+        if self.config.enable_cleanup {
+            let cleanup = CleanupWorker::new(self.storage.clone(), self.config.cleanup_interval);
+            let cancel = shutdown_token.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = cleanup.run_until_cancelled(cancel).await {
+                    error!("Cleanup worker error: {}", e);
+                }
+            });
+            self.worker_handles.lock().await.push(handle);
+        }
+
         // Start worker threads
         self.start_workers(shutdown_token).await?;
 
@@ -311,6 +398,43 @@ impl BackgroundJobServer {
         &self.config
     }
 
+    /// Register (or update) a recurring job template.
+    ///
+    /// `id` uniquely identifies this template — calling again with the same
+    /// `id` replaces the previous definition. `cron` is a 6-field
+    /// cron expression (second minute hour day month day-of-week) parsed by
+    /// the `cron` crate. The template is stored via
+    /// [`Storage::upsert_recurring_job`] and the running
+    /// [`RecurringJobPoller`] will materialize it into a normal [`Job`] the
+    /// next time `next_run_at` is in the past.
+    pub async fn schedule_recurring(
+        &self,
+        id: impl Into<String>,
+        cron: impl Into<String>,
+        method: impl Into<String>,
+        payload: serde_json::Value,
+        queue: impl Into<String>,
+    ) -> Result<()> {
+        let recurring = RecurringJob::new(id, cron, method, payload, queue)?;
+        self.storage
+            .upsert_recurring_job(&recurring)
+            .await
+            .map_err(|e| QmlError::StorageError {
+                message: format!("Failed to upsert recurring job: {}", e),
+            })
+    }
+
+    /// Remove a recurring job template by id. Returns `true` if a row was
+    /// deleted, `false` if no template with that id existed.
+    pub async fn remove_recurring(&self, id: &str) -> Result<bool> {
+        self.storage
+            .remove_recurring_job(id)
+            .await
+            .map_err(|e| QmlError::StorageError {
+                message: format!("Failed to remove recurring job: {}", e),
+            })
+    }
+
     /// Start worker threads
     async fn start_workers(&self, shutdown_token: CancellationToken) -> Result<()> {
         let mut handles = self.worker_handles.lock().await;
@@ -334,7 +458,8 @@ impl BackgroundJobServer {
                 worker_config,
                 self.retry_policy.clone(),
             )
-            .with_cancellation(worker_cancel.clone());
+            .with_cancellation(worker_cancel.clone())
+            .with_ttls(self.config.succeeded_ttl, self.config.failed_ttl);
 
             let storage_clone = self.storage.clone();
             let config_clone = self.config.clone();

@@ -11,13 +11,19 @@ use std::marker::PhantomData;
 use crate::core::Job;
 use crate::error::{QmlError, Result};
 
+pub mod cleanup;
 pub mod processor;
+pub mod recurring;
 pub mod retry;
 pub mod scheduler;
 pub mod server;
 pub mod worker;
 
+pub use cleanup::{
+    CleanupWorker, DEFAULT_CLEANUP_INTERVAL, DEFAULT_FAILED_TTL, DEFAULT_SUCCEEDED_TTL,
+};
 pub use processor::JobProcessor;
+pub use recurring::{DEFAULT_RECURRING_BATCH_SIZE, RecurringJobPoller};
 pub use retry::{RetryPolicy, RetryStrategy};
 pub use scheduler::JobScheduler;
 pub use server::{BackgroundJobServer, ServerConfig};

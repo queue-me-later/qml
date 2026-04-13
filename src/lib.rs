@@ -426,7 +426,8 @@ pub mod storage;
 // Re-export main types for convenience
 pub use core::{Job, JobState, JobStateKind, RecurringJob};
 pub use dashboard::{
-    DashboardConfig, DashboardServer, DashboardService, JobStatistics, QueueStatistics,
+    DashboardAuth, DashboardConfig, DashboardServer, DashboardService, JobStatistics,
+    QueueStatistics,
 };
 pub use error::{QmlError, Result};
 pub use processing::{

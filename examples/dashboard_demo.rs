@@ -135,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         host: "127.0.0.1".to_string(),
         port: 8080,
         statistics_update_interval: 3, // Update every 3 seconds for demo
+        auth: None,
     };
 
     let dashboard = DashboardServer::new(Arc::clone(&storage), dashboard_config);

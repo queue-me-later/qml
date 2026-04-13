@@ -56,11 +56,11 @@ pub fn create_router(dashboard_service: Arc<DashboardService>) -> Router {
         .route("/api/statistics/queues", get(get_queue_statistics))
         // Job endpoints
         .route("/api/jobs", get(get_jobs))
-        .route("/api/jobs/:id", get(get_job_details))
-        .route("/api/jobs/:id/retry", post(retry_job))
-        .route("/api/jobs/:id", delete(delete_job))
+        .route("/api/jobs/{id}", get(get_job_details))
+        .route("/api/jobs/{id}/retry", post(retry_job))
+        .route("/api/jobs/{id}", delete(delete_job))
         // Queue endpoints
-        .route("/api/queues/:name/jobs", get(get_queue_jobs))
+        .route("/api/queues/{name}/jobs", get(get_queue_jobs))
         // Health check
         .route("/api/health", get(health_check))
         .with_state(dashboard_service)

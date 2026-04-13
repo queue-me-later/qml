@@ -1,4 +1,4 @@
-use axum::{Router, http::StatusCode, response::Html, routing::get};
+use axum::{Router, http::StatusCode, middleware, response::Html, routing::get};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -6,6 +6,7 @@ use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 
 use crate::dashboard::{
+    auth::{self, DashboardAuth},
     routes::create_router,
     service::DashboardService,
     websocket::{WebSocketManager, websocket_handler},
@@ -17,6 +18,14 @@ pub struct DashboardConfig {
     pub host: String,
     pub port: u16,
     pub statistics_update_interval: u64,
+    /// Optional authentication guard applied to every dashboard route.
+    ///
+    /// If `None` and the dashboard is bound to a non-loopback interface
+    /// (anything other than `localhost`, `127.0.0.1`, or `::1`),
+    /// [`DashboardServer::start`] refuses to start. This prevents the
+    /// common footgun of exposing an unauthenticated retry/delete API to
+    /// the network.
+    pub auth: Option<DashboardAuth>,
 }
 
 impl Default for DashboardConfig {
@@ -25,6 +34,7 @@ impl Default for DashboardConfig {
             host: "127.0.0.1".to_string(),
             port: 8080,
             statistics_update_interval: 5, // Update every 5 seconds
+            auth: None,
         }
     }
 }
@@ -49,6 +59,15 @@ impl DashboardServer {
 
     /// Start the dashboard server
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.config.auth.is_none() && !auth::is_loopback_host(&self.config.host) {
+            return Err(format!(
+                "refusing to start dashboard on non-loopback host '{}' without \
+                 DashboardConfig::auth — set an auth guard or bind to localhost",
+                self.config.host
+            )
+            .into());
+        }
+
         let addr: SocketAddr = format!("{}:{}", self.config.host, self.config.port).parse()?;
 
         // Create the main router
@@ -86,16 +105,29 @@ impl DashboardServer {
             .route("/queues", get(dashboard_ui))
             .route("/statistics", get(dashboard_ui));
 
-        // Combine all routers
-        Router::new()
+        let mut app = Router::new()
             .merge(api_router)
             .merge(ws_router)
-            .merge(ui_router)
-            .layer(
-                ServiceBuilder::new()
-                    .layer(CorsLayer::permissive()) // Allow all origins for development
-                    .into_inner(),
-            )
+            .merge(ui_router);
+
+        // DB4: same-origin guard on state-changing methods. Applied before
+        // auth so cross-site mutation attempts are rejected without leaking
+        // an auth challenge.
+        app = app.layer(middleware::from_fn(auth::csrf_guard));
+
+        // DB2: optional auth guard on every route.
+        if let Some(auth) = &self.config.auth {
+            app = app.layer(middleware::from_fn_with_state(
+                Arc::new(auth.clone()),
+                auth::require_auth,
+            ));
+        }
+
+        app.layer(
+            ServiceBuilder::new()
+                .layer(CorsLayer::permissive()) // Allow all origins for development
+                .into_inner(),
+        )
     }
 
     /// Get the WebSocket manager for external use

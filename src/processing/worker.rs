@@ -5,6 +5,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for worker instances
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,10 +108,29 @@ pub struct WorkerContext {
     pub attempt: u32,
     /// Previous exception if this is a retry
     pub previous_exception: Option<String>,
+    /// Cancellation token for cooperative shutdown. A long-running worker
+    /// impl can race its work against this token to drop out cleanly when
+    /// the server is asked to stop:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     _ = ctx.cancel.cancelled() => Ok(WorkerResult::retry(
+    ///         "shutting down".into(),
+    ///         None,
+    ///     )),
+    ///     res = do_expensive_work() => res,
+    /// }
+    /// ```
+    ///
+    /// The token is a child of the `BackgroundJobServer` shutdown token, so
+    /// calling `server.stop()` flips every context in flight.
+    pub cancel: CancellationToken,
 }
 
 impl WorkerContext {
-    /// Create a new worker context
+    /// Create a new worker context with a detached cancellation token. The
+    /// server installs a real, shutdown-linked token via
+    /// `WorkerContext::with_cancel`.
     pub fn new(config: WorkerConfig) -> Self {
         Self {
             config,
@@ -118,6 +138,7 @@ impl WorkerContext {
             execution_metadata: HashMap::new(),
             attempt: 1,
             previous_exception: None,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -133,7 +154,15 @@ impl WorkerContext {
             execution_metadata: HashMap::new(),
             attempt,
             previous_exception,
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Override the cancellation token. Builder-style so the server can
+    /// install the shutdown-linked child token.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// Add execution metadata

@@ -6,16 +6,22 @@
 use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::core::{Job, JobState};
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
 
+/// Maximum number of due jobs to drain per scheduler tick. Bounds the amount
+/// of work a single tick can enqueue if a large backlog has accumulated.
+const DEFAULT_SCHEDULER_BATCH_SIZE: usize = 1000;
+
 /// Job scheduler for managing delayed and recurring jobs
 pub struct JobScheduler {
     storage: Arc<dyn Storage>,
     poll_interval: Duration,
+    batch_size: usize,
 }
 
 impl JobScheduler {
@@ -24,6 +30,7 @@ impl JobScheduler {
         Self {
             storage,
             poll_interval: Duration::seconds(30), // Check every 30 seconds by default
+            batch_size: DEFAULT_SCHEDULER_BATCH_SIZE,
         }
     }
 
@@ -32,11 +39,19 @@ impl JobScheduler {
         Self {
             storage,
             poll_interval,
+            batch_size: DEFAULT_SCHEDULER_BATCH_SIZE,
         }
     }
 
-    /// Start the scheduler loop
+    /// Start the scheduler loop. Runs forever; use
+    /// [`JobScheduler::run_until_cancelled`] when you need to observe a
+    /// shutdown signal.
     pub async fn run(&self) -> Result<()> {
+        self.run_until_cancelled(CancellationToken::new()).await
+    }
+
+    /// Start the scheduler loop, exiting cleanly when `cancel` is cancelled.
+    pub async fn run_until_cancelled(&self, cancel: CancellationToken) -> Result<()> {
         info!(
             "Starting job scheduler with poll interval: {:?}",
             self.poll_interval
@@ -52,7 +67,14 @@ impl JobScheduler {
             );
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    debug!("Scheduler loop exiting on cancellation");
+                    return Ok(());
+                }
+                _ = interval.tick() => {}
+            }
 
             if let Err(e) = self.process_scheduled_jobs().await {
                 error!("Error processing scheduled jobs: {}", e);
@@ -69,47 +91,20 @@ impl JobScheduler {
         debug!("Checking for scheduled jobs ready for execution");
 
         let now = Utc::now();
-
-        // Get all scheduled jobs
-        let scheduled_state = JobState::scheduled(now, "check");
-        let jobs = self
+        let ready_jobs = self
             .storage
-            .list(Some(&scheduled_state), None, None)
+            .fetch_due_scheduled_jobs(now, self.batch_size)
             .await
             .map_err(|e| QmlError::StorageError {
-                message: format!("Failed to list scheduled jobs: {}", e),
+                message: format!("Failed to fetch due scheduled jobs: {}", e),
             })?;
-
-        let mut ready_jobs = Vec::new();
-
-        for job in jobs {
-            if let JobState::Scheduled { enqueue_at, .. } = &job.state {
-                if *enqueue_at <= now {
-                    ready_jobs.push(job);
-                }
-            }
-        }
 
         debug!(
             "Found {} scheduled jobs ready for execution",
             ready_jobs.len()
         );
 
-        // Enqueue ready jobs
-        for mut job in ready_jobs {
-            info!("Enqueueing scheduled job: {}", job.id);
-
-            let enqueued_state = JobState::enqueued(&job.queue);
-            if let Err(e) = job.set_state(enqueued_state) {
-                error!("Failed to set job state to Enqueued: {}", e);
-                continue;
-            }
-
-            if let Err(e) = self.storage.update(&job).await {
-                error!("Failed to update job in storage: {}", e);
-            }
-        }
-
+        self.enqueue_due_jobs(ready_jobs, "scheduled").await;
         Ok(())
     }
 
@@ -118,32 +113,24 @@ impl JobScheduler {
         debug!("Checking for jobs ready for retry");
 
         let now = Utc::now();
-
-        // Get all jobs awaiting retry
-        let retry_state = JobState::awaiting_retry(now, 1, "check");
-        let jobs = self
+        let ready_jobs = self
             .storage
-            .list(Some(&retry_state), None, None)
+            .fetch_due_retry_jobs(now, self.batch_size)
             .await
             .map_err(|e| QmlError::StorageError {
-                message: format!("Failed to list retry jobs: {}", e),
+                message: format!("Failed to fetch due retry jobs: {}", e),
             })?;
-
-        let mut ready_jobs = Vec::new();
-
-        for job in jobs {
-            if let JobState::AwaitingRetry { retry_at, .. } = &job.state {
-                if *retry_at <= now {
-                    ready_jobs.push(job);
-                }
-            }
-        }
 
         debug!("Found {} retry jobs ready for execution", ready_jobs.len());
 
-        // Enqueue ready retry jobs
-        for mut job in ready_jobs {
-            info!("Enqueueing retry job: {}", job.id);
+        self.enqueue_due_jobs(ready_jobs, "retry").await;
+        Ok(())
+    }
+
+    /// Transition a batch of due jobs into the Enqueued state.
+    async fn enqueue_due_jobs(&self, jobs: Vec<Job>, kind: &str) {
+        for mut job in jobs {
+            info!("Enqueueing {} job: {}", kind, job.id);
 
             let enqueued_state = JobState::enqueued(&job.queue);
             if let Err(e) = job.set_state(enqueued_state) {
@@ -155,8 +142,6 @@ impl JobScheduler {
                 error!("Failed to update job in storage: {}", e);
             }
         }
-
-        Ok(())
     }
 
     /// Schedule a job for future execution
@@ -243,6 +228,85 @@ mod tests {
         // Check that the job is now enqueued
         let updated_job = storage.get(&job_id).await.unwrap().unwrap();
         assert!(matches!(updated_job.state, JobState::Enqueued { .. }));
+    }
+
+    #[tokio::test]
+    async fn fetch_due_scheduled_jobs_bounds_to_limit_and_past_due() {
+        // Regression test for B1: scheduler must not drag every scheduled job
+        // into memory when only a handful are due.
+        let storage = Arc::new(MemoryStorage::new());
+
+        // 1000 jobs scheduled far in the future.
+        for _ in 0..1000 {
+            let mut job = Job::new("noop", vec![]);
+            job.set_state(JobState::scheduled(
+                Utc::now() + Duration::hours(1),
+                "future",
+            ))
+            .unwrap();
+            storage.enqueue(&job).await.unwrap();
+        }
+
+        // 10 jobs already past due.
+        let mut due_ids = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let mut job = Job::new("noop", vec![]);
+            job.set_state(JobState::scheduled(
+                Utc::now() - Duration::seconds(5),
+                "past",
+            ))
+            .unwrap();
+            due_ids.push(job.id.clone());
+            storage.enqueue(&job).await.unwrap();
+        }
+
+        let due = storage
+            .fetch_due_scheduled_jobs(Utc::now(), 100)
+            .await
+            .unwrap();
+
+        assert_eq!(due.len(), 10, "storage should only return the 10 past-due jobs");
+        for job in &due {
+            assert!(due_ids.contains(&job.id));
+        }
+
+        // Running the scheduler must transition exactly those 10 jobs.
+        let scheduler = JobScheduler::new(storage.clone());
+        scheduler.process_scheduled_jobs().await.unwrap();
+
+        for id in &due_ids {
+            let job = storage.get(id).await.unwrap().unwrap();
+            assert!(
+                matches!(job.state, JobState::Enqueued { .. }),
+                "job {} should have moved to Enqueued",
+                id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_due_retry_jobs_filters_future_retries() {
+        let storage = Arc::new(MemoryStorage::new());
+
+        // AwaitingRetry is only reachable via Processing → AwaitingRetry, so
+        // bypass state validation by assigning the state field directly for
+        // this fixture.
+        let mut future_retry = Job::new("noop", vec![]);
+        future_retry.state =
+            JobState::awaiting_retry(Utc::now() + Duration::minutes(10), "later");
+        storage.enqueue(&future_retry).await.unwrap();
+
+        let mut due_retry = Job::new("noop", vec![]);
+        due_retry.state = JobState::awaiting_retry(Utc::now() - Duration::seconds(1), "now");
+        let due_id = due_retry.id.clone();
+        storage.enqueue(&due_retry).await.unwrap();
+
+        let due = storage
+            .fetch_due_retry_jobs(Utc::now(), 100)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, due_id);
     }
 
     #[tokio::test]

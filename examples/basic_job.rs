@@ -121,7 +121,6 @@ fn main() -> Result<(), QmlError> {
     let failed_state = JobState::failed(
         "Network timeout after 30 seconds",
         Some("at line 42 in network_module".to_string()),
-        1,
     );
     retry_job.set_state(failed_state)?;
     println!("   → Failed (attempt 1)");
@@ -129,7 +128,7 @@ fn main() -> Result<(), QmlError> {
     // Schedule retry
     let retry_time = Utc::now() + Duration::minutes(5);
     let awaiting_retry_state =
-        JobState::awaiting_retry(retry_time, 1, "Network timeout after 30 seconds");
+        JobState::awaiting_retry(retry_time, "Network timeout after 30 seconds");
     retry_job.set_state(awaiting_retry_state)?;
     println!("   → Awaiting retry in 5 minutes");
 

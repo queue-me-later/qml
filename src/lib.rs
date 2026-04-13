@@ -363,7 +363,7 @@ pub mod processing;
 pub mod storage;
 
 // Re-export main types for convenience
-pub use core::{Job, JobState};
+pub use core::{Job, JobState, JobStateKind};
 pub use dashboard::{
     DashboardConfig, DashboardServer, DashboardService, JobStatistics, QueueStatistics,
 };

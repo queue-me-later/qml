@@ -240,10 +240,10 @@ fn parse_job_state(state_str: &str) -> Option<JobState> {
         "enqueued" => Some(JobState::enqueued("default")),
         "processing" => Some(JobState::processing("worker", "server")),
         "succeeded" => Some(JobState::succeeded(0, None)),
-        "failed" => Some(JobState::failed("error", None, 0)),
+        "failed" => Some(JobState::failed("error", None)),
         "scheduled" => Some(JobState::scheduled(chrono::Utc::now(), "reason")),
         "awaiting_retry" | "awaitingretry" => {
-            Some(JobState::awaiting_retry(chrono::Utc::now(), 0, "error"))
+            Some(JobState::awaiting_retry(chrono::Utc::now(), "error"))
         }
         "deleted" => Some(JobState::deleted(None)),
         _ => None,

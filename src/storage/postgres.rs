@@ -8,7 +8,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use super::{PostgresConfig, Storage, StorageError};
-use crate::core::{Job, JobState};
+use crate::core::{Job, JobState, JobStateKind};
 
 /// PostgreSQL storage implementation for jobs
 ///
@@ -342,6 +342,12 @@ impl PostgresStorage {
                     message: format!("Failed to get max_retries: {}", e),
                 })?;
 
+        let current_retries: i32 =
+            row.try_get("current_retries")
+                .map_err(|e| StorageError::DeserializationError {
+                    message: format!("Failed to get current_retries: {}", e),
+                })?;
+
         let metadata_json: Option<serde_json::Value> =
             row.try_get("metadata")
                 .map_err(|e| StorageError::DeserializationError {
@@ -379,6 +385,7 @@ impl PostgresStorage {
             queue: queue_name,
             priority,
             max_retries: max_retries as u32,
+            attempt: current_retries.max(0) as u32,
             metadata,
             job_type,
             timeout_seconds: timeout_seconds.map(|t| t as u64),
@@ -474,7 +481,7 @@ impl Storage for PostgresStorage {
                     .bind(&job.queue)
                     .bind(job.priority)
                     .bind(job.max_retries as i32)
-                    .bind(0i32) // current_retries starts at 0
+                    .bind(job.attempt as i32)
                     .bind(&metadata)
                     .bind(&job.job_type)
                     .bind(job.timeout_seconds.map(|t| t as i32))
@@ -496,7 +503,7 @@ impl Storage for PostgresStorage {
         let query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
             FROM {}
             WHERE id = $1
             "#,
@@ -542,8 +549,8 @@ impl Storage for PostgresStorage {
             r#"
             UPDATE {}
             SET method_name = $2, arguments = $3, state_name = $4, state_data = $5,
-                queue_name = $6, priority = $7, max_retries = $8, metadata = $9,
-                job_type = $10, timeout_seconds = $11, updated_at = NOW()
+                queue_name = $6, priority = $7, max_retries = $8, current_retries = $9,
+                metadata = $10, job_type = $11, timeout_seconds = $12, updated_at = NOW()
             WHERE id = $1
             "#,
             self.table_name()
@@ -558,6 +565,7 @@ impl Storage for PostgresStorage {
             .bind(&job.queue)
             .bind(job.priority)
             .bind(job.max_retries as i32)
+            .bind(job.attempt as i32)
             .bind(metadata)
             .bind(&job.job_type)
             .bind(job.timeout_seconds.map(|t| t as i32))
@@ -603,7 +611,7 @@ impl Storage for PostgresStorage {
         let mut query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
             FROM {}
             "#,
             self.table_name()
@@ -658,7 +666,7 @@ impl Storage for PostgresStorage {
         Ok(jobs)
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         let query = format!(
             "SELECT state_name, COUNT(*) as count FROM {} GROUP BY state_name",
             self.table_name()
@@ -686,19 +694,18 @@ impl Storage for PostgresStorage {
                         message: format!("Failed to get count from count query: {}", e),
                     })?;
 
-            // Create a dummy state for the count lookup
-            let dummy_state = match state_name.as_str() {
-                "enqueued" => JobState::enqueued("default"),
-                "processing" => JobState::processing("dummy", "dummy"),
-                "succeeded" => JobState::succeeded(0, None),
-                "failed" => JobState::failed("dummy", None, 0),
-                "deleted" => JobState::deleted(None),
-                "scheduled" => JobState::scheduled(Utc::now(), "dummy"),
-                "awaiting_retry" => JobState::awaiting_retry(Utc::now(), 0, "dummy"),
+            let kind = match state_name.as_str() {
+                "enqueued" => JobStateKind::Enqueued,
+                "processing" => JobStateKind::Processing,
+                "succeeded" => JobStateKind::Succeeded,
+                "failed" => JobStateKind::Failed,
+                "deleted" => JobStateKind::Deleted,
+                "scheduled" => JobStateKind::Scheduled,
+                "awaiting_retry" => JobStateKind::AwaitingRetry,
                 _ => continue, // Skip unknown states
             };
 
-            counts.insert(dummy_state, count as usize);
+            counts.insert(kind, count as usize);
         }
 
         Ok(counts)
@@ -708,7 +715,7 @@ impl Storage for PostgresStorage {
         let mut query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
             FROM {}
             WHERE state_name IN ('enqueued', 'scheduled', 'awaiting_retry')
             AND (
@@ -743,124 +750,176 @@ impl Storage for PostgresStorage {
         Ok(jobs)
     }
 
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT id, method_name, arguments, created_at, state_name, state_data,
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+            FROM {}
+            WHERE state_name = 'scheduled'
+              AND (state_data->>'enqueue_at')::timestamptz <= $1
+            ORDER BY priority DESC, created_at ASC
+            LIMIT $2
+            "#,
+            self.table_name()
+        );
+
+        let rows = sqlx::query(&query)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to fetch due scheduled jobs: {}", e),
+            })?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            jobs.push(Self::row_to_job(&row)?);
+        }
+        Ok(jobs)
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT id, method_name, arguments, created_at, state_name, state_data,
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds
+            FROM {}
+            WHERE state_name = 'awaiting_retry'
+              AND (state_data->>'retry_at')::timestamptz <= $1
+            ORDER BY priority DESC, created_at ASC
+            LIMIT $2
+            "#,
+            self.table_name()
+        );
+
+        let rows = sqlx::query(&query)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to fetch due retry jobs: {}", e),
+            })?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            jobs.push(Self::row_to_job(&row)?);
+        }
+        Ok(jobs)
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        // Single UPDATE: flips every stale Processing row back to Enqueued.
+        // `jsonb_build_object` synthesizes a fresh Enqueued state_data from
+        // the job's own `queue_name` column; `enqueued_at` is ISO-8601 so it
+        // round-trips through serde_json::from_value into chrono::DateTime.
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET state_name = 'enqueued',
+                state_data = jsonb_build_object(
+                    'enqueued_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                    'queue', queue_name
+                ),
+                locked_by = NULL,
+                locked_at = NULL,
+                lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE state_name = 'processing'
+              AND (state_data->>'started_at')::timestamptz < $1
+            "#,
+            table = self.table_name()
+        );
+
+        let result = sqlx::query(&query)
+            .bind(stale_before)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to requeue stranded jobs: {}", e),
+            })?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
     async fn fetch_and_lock_job(
         &self,
         worker_id: &str,
         queues: Option<&[String]>,
     ) -> Result<Option<Job>, StorageError> {
-        let mut transaction =
-            self.pool
-                .begin()
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to start transaction: {}", e),
-                })?;
+        // Build the new Processing state first so we can bind it directly —
+        // no need to read the row back, mutate it in Rust, then write it.
+        let processing_state = JobState::Processing {
+            worker_id: worker_id.to_string(),
+            started_at: chrono::Utc::now(),
+            server_name: "postgres-storage".to_string(),
+        };
+        let new_state_name = Self::job_state_to_name(&processing_state);
+        let new_state_data = Self::job_state_to_data(&processing_state)?;
 
-        // Use SELECT FOR UPDATE SKIP LOCKED for atomic job fetching
-        let mut query = format!(
+        // Single UPDATE ... RETURNING: the inner SELECT claims one eligible
+        // row with FOR UPDATE SKIP LOCKED, the outer UPDATE flips its state,
+        // and RETURNING hands back the full row so we can hydrate the Job.
+        // Collapsing the old transaction + separate UPDATE saves a round-trip
+        // and removes a window where the row is locked but not yet marked.
+        let queue_filter = match queues {
+            Some(qs) if !qs.is_empty() => {
+                let placeholders: Vec<String> = (3..3 + qs.len()).map(|i| format!("${}", i)).collect();
+                format!(" AND queue_name = ANY(ARRAY[{}])", placeholders.join(","))
+            }
+            _ => String::new(),
+        };
+
+        let query = format!(
             r#"
-            SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
-            FROM {}
-            WHERE state_name IN ('enqueued', 'retrying')
-        "#,
-            self.table_name()
+            UPDATE {table}
+            SET state_name = $1, state_data = $2, updated_at = NOW()
+            WHERE id = (
+                SELECT id FROM {table}
+                WHERE state_name IN ('enqueued', 'awaiting_retry')
+                  {queue_filter}
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING id, method_name, arguments, created_at, state_name, state_data,
+                      queue_name, priority, max_retries, current_retries, metadata,
+                      job_type, timeout_seconds
+            "#,
+            table = self.table_name(),
+            queue_filter = queue_filter,
         );
 
-        // Add queue filtering if specified
-        if let Some(queues) = queues {
-            if !queues.is_empty() {
-                let queue_placeholders: Vec<String> =
-                    (1..=queues.len()).map(|i| format!("${}", i)).collect();
-                query.push_str(&format!(
-                    " AND queue_name = ANY(ARRAY[{}])",
-                    queue_placeholders.join(",")
-                ));
-            }
-        }
-
-        // Order by priority and creation time, then lock and skip locked rows
-        query.push_str(" ORDER BY priority DESC, created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1");
-
-        let mut sqlx_query = sqlx::query(&query);
-
-        // Bind queue names if provided
-        if let Some(queues) = queues {
-            for queue in queues {
+        let mut sqlx_query = sqlx::query(&query).bind(&new_state_name).bind(&new_state_data);
+        if let Some(qs) = queues {
+            for queue in qs {
                 sqlx_query = sqlx_query.bind(queue);
             }
         }
 
         let row = sqlx_query
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&self.pool)
             .await
             .map_err(|e| StorageError::OperationError {
                 message: format!("Failed to fetch and lock job: {}", e),
             })?;
 
-        if let Some(row) = row {
-            let mut job = Self::row_to_job(&row)?;
-
-            // Mark as processing and add worker metadata
-            job.state = JobState::Processing {
-                worker_id: worker_id.to_string(),
-                started_at: chrono::Utc::now(),
-                server_name: "postgres-storage".to_string(),
-            };
-
-            // Update the job in the same transaction
-            let (state_name, state_data, _arguments) = Self::job_to_row_values(&job)?;
-            let metadata = if job.metadata.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                    StorageError::SerializationError {
-                        message: format!("Failed to serialize metadata: {}", e),
-                    }
-                })?)
-            };
-
-            let update_query = format!(
-                r#"
-                UPDATE {}
-                SET state_name = $2, state_data = $3, metadata = $4, updated_at = NOW()
-                WHERE id = $1
-            "#,
-                self.table_name()
-            );
-
-            let job_uuid = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
-                message: format!("Invalid job ID format: {}", e),
-            })?;
-
-            sqlx::query(&update_query)
-                .bind(job_uuid)
-                .bind(state_name)
-                .bind(state_data)
-                .bind(metadata)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to update job state: {}", e),
-                })?;
-
-            transaction
-                .commit()
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to commit transaction: {}", e),
-                })?;
-
-            Ok(Some(job))
-        } else {
-            // No available jobs
-            transaction
-                .commit()
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to commit transaction: {}", e),
-                })?;
-            Ok(None)
+        match row {
+            Some(row) => Ok(Some(Self::row_to_job(&row)?)),
+            None => Ok(None),
         }
     }
 

@@ -5,6 +5,7 @@
 
 use chrono::Utc;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::{
@@ -14,14 +15,16 @@ use crate::core::{Job, JobState};
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
 
-const RETRY_COUNT_METADATA_KEY: &str = "__qml_retry_count";
-
 /// Job processor that executes jobs and manages their lifecycle
 pub struct JobProcessor {
     worker_registry: Arc<WorkerRegistry>,
     storage: Arc<dyn Storage>,
     retry_policy: RetryPolicy,
     worker_config: WorkerConfig,
+    /// Cancellation token handed to every `WorkerContext` this processor
+    /// creates. Defaults to a detached token; the server installs a
+    /// shutdown-linked child via [`JobProcessor::with_cancellation`].
+    cancel_token: CancellationToken,
 }
 
 impl JobProcessor {
@@ -36,6 +39,7 @@ impl JobProcessor {
             storage,
             retry_policy: RetryPolicy::default(),
             worker_config,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -51,7 +55,17 @@ impl JobProcessor {
             storage,
             retry_policy,
             worker_config,
+            cancel_token: CancellationToken::new(),
         }
+    }
+
+    /// Install a cancellation token that will be cloned into every
+    /// [`WorkerContext`] produced by this processor. Used by
+    /// `BackgroundJobServer` to wire cooperative shutdown through to worker
+    /// impls.
+    pub fn with_cancellation(mut self, cancel_token: CancellationToken) -> Self {
+        self.cancel_token = cancel_token;
+        self
     }
 
     /// Get the worker ID for this processor
@@ -66,6 +80,11 @@ impl JobProcessor {
 
         info!("Starting job processing: {} ({})", job_id, method);
 
+        // Record that we're taking another crack at this job. This runs before
+        // we fail for a missing worker so lookups still count against the retry
+        // budget.
+        job.attempt = job.attempt.saturating_add(1);
+
         // Check if we have a worker for this job method
         let worker = match self.worker_registry.get_worker(&method) {
             Some(worker) => worker,
@@ -76,14 +95,10 @@ impl JobProcessor {
                         &mut job,
                         format!("No worker registered for method: {}", method),
                         None,
-                        0,
                     )
                     .await;
             }
         };
-
-        // Determine retry count before state transitions
-        let retry_count = self.extract_retry_count(&job);
 
         // Update job state to Processing (if not already)
         if !matches!(job.state, JobState::Processing { .. }) {
@@ -107,16 +122,13 @@ impl JobProcessor {
         }
 
         // Create worker context
-        let context = if retry_count > 0 {
+        let context = if job.attempt > 1 {
             let previous_exception = self.extract_previous_exception(&job);
-            WorkerContext::retry_from(
-                self.worker_config.clone(),
-                retry_count + 1,
-                previous_exception,
-            )
+            WorkerContext::retry_from(self.worker_config.clone(), job.attempt, previous_exception)
         } else {
             WorkerContext::new(self.worker_config.clone())
-        };
+        }
+        .with_cancel(self.cancel_token.clone());
 
         // Execute the job
         let start_time = Utc::now();
@@ -132,7 +144,7 @@ impl JobProcessor {
                     "Job {} timed out after {:?}",
                     job_id, self.worker_config.job_timeout
                 );
-                return self.handle_job_timeout(&mut job, retry_count).await;
+                return self.handle_job_timeout(&mut job).await;
             }
         };
 
@@ -151,19 +163,17 @@ impl JobProcessor {
                 error, retry_at, ..
             }) => {
                 warn!("Job {} failed and will be retried: {}", job_id, error);
-                self.handle_job_retry(&mut job, error, retry_at, retry_count)
-                    .await
+                self.handle_job_retry(&mut job, error, retry_at).await
             }
             Ok(WorkerResult::Failure {
                 error, context: _, ..
             }) => {
                 error!("Job {} failed permanently: {}", job_id, error);
-                self.fail_job_permanently(&mut job, error, None, retry_count)
-                    .await
+                self.fail_job_permanently(&mut job, error, None).await
             }
             Err(e) => {
                 error!("Job {} execution error: {}", job_id, e);
-                self.handle_execution_error(&mut job, e, retry_count).await
+                self.handle_execution_error(&mut job, e).await
             }
         }
     }
@@ -197,9 +207,6 @@ impl JobProcessor {
             job.add_metadata(&format!("exec_{}", key), value);
         }
 
-        // Clean up retry metadata now that the job completed
-        job.metadata.remove(RETRY_COUNT_METADATA_KEY);
-
         // Update in storage
         self.storage
             .update(job)
@@ -217,7 +224,6 @@ impl JobProcessor {
         job: &mut Job,
         error: String,
         retry_at: Option<chrono::DateTime<Utc>>,
-        current_retry_count: u32,
     ) -> Result<()> {
         // Check if job is already in a final state
         if job.state.is_final() {
@@ -225,44 +231,36 @@ impl JobProcessor {
             return Ok(());
         }
 
-        let next_attempt = current_retry_count + 1;
-
         // Check if we should retry based on policy
-        if !self.should_retry_attempt(job, None, next_attempt) {
+        if !self.should_retry_attempt(job, None) {
             debug!(
                 "Retry limit exceeded for job {}, failing permanently",
                 job.id
             );
-            return self
-                .fail_job_permanently(job, error, None, current_retry_count)
-                .await;
+            return self.fail_job_permanently(job, error, None).await;
         }
 
         // First transition to Failed state
-        let failed_state = JobState::failed(error.clone(), None, current_retry_count);
+        let failed_state = JobState::failed(error.clone(), None);
         if let Err(e) = job.set_state(failed_state) {
             error!("Failed to set job state to Failed: {}", e);
             return Err(e);
         }
 
-        // Calculate retry time
+        // Calculate retry time — the retry policy counts attempts starting from
+        // 1, and `job.attempt` already reflects the just-completed attempt, so
+        // pass it through unchanged.
         let retry_time = retry_at
-            .or_else(|| self.retry_policy.calculate_retry_time(next_attempt))
+            .or_else(|| self.retry_policy.calculate_retry_time(job.attempt))
             .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(60));
 
         // Then transition to AwaitingRetry
-        let retry_state = JobState::awaiting_retry(retry_time, next_attempt, &error);
+        let retry_state = JobState::awaiting_retry(retry_time, &error);
 
         if let Err(e) = job.set_state(retry_state) {
             error!("Failed to set job state to AwaitingRetry: {}", e);
             return Err(e);
         }
-
-        // Persist retry attempt so subsequent processing can recover the count
-        job.metadata.insert(
-            RETRY_COUNT_METADATA_KEY.to_string(),
-            next_attempt.to_string(),
-        );
 
         // Update in storage
         self.storage
@@ -273,8 +271,8 @@ impl JobProcessor {
             })?;
 
         info!(
-            "Job {} scheduled for retry #{} at {}",
-            job.id, next_attempt, retry_time
+            "Job {} scheduled for retry (attempt #{}) at {}",
+            job.id, job.attempt, retry_time
         );
         Ok(())
     }
@@ -285,7 +283,6 @@ impl JobProcessor {
         job: &mut Job,
         error: String,
         stack_trace: Option<String>,
-        retry_count: u32,
     ) -> Result<()> {
         // Check if job is already in a final state
         if job.state.is_final() {
@@ -296,15 +293,12 @@ impl JobProcessor {
             return Ok(());
         }
 
-        let failed_state = JobState::failed(error, stack_trace, retry_count);
+        let failed_state = JobState::failed(error, stack_trace);
 
         if let Err(e) = job.set_state(failed_state) {
             error!("Failed to set job state to Failed: {}", e);
             return Err(e);
         }
-
-        // Retry limit reached, clear internal retry metadata
-        job.metadata.remove(RETRY_COUNT_METADATA_KEY);
 
         // Update in storage
         self.storage
@@ -316,33 +310,24 @@ impl JobProcessor {
 
         error!(
             "Job {} failed permanently after {} attempts",
-            job.id,
-            retry_count + 1
+            job.id, job.attempt
         );
         Ok(())
     }
 
     /// Handle job timeout
-    async fn handle_job_timeout(&self, job: &mut Job, retry_count: u32) -> Result<()> {
+    async fn handle_job_timeout(&self, job: &mut Job) -> Result<()> {
         let timeout_error = format!("Job timed out after {:?}", self.worker_config.job_timeout);
 
-        let next_attempt = retry_count + 1;
-        if self.should_retry_attempt(job, Some("TimeoutError"), next_attempt) {
-            self.handle_job_retry(job, timeout_error, None, retry_count)
-                .await
+        if self.should_retry_attempt(job, Some("TimeoutError")) {
+            self.handle_job_retry(job, timeout_error, None).await
         } else {
-            self.fail_job_permanently(job, timeout_error, None, retry_count)
-                .await
+            self.fail_job_permanently(job, timeout_error, None).await
         }
     }
 
     /// Handle execution errors
-    async fn handle_execution_error(
-        &self,
-        job: &mut Job,
-        error: QmlError,
-        retry_count: u32,
-    ) -> Result<()> {
+    async fn handle_execution_error(&self, job: &mut Job, error: QmlError) -> Result<()> {
         let error_type = match &error {
             QmlError::StorageError { .. } => "StorageError",
             QmlError::WorkerError { .. } => "WorkerError",
@@ -351,42 +336,26 @@ impl JobProcessor {
         };
 
         let error_message = error.to_string();
-        let next_attempt = retry_count + 1;
 
-        if self.should_retry_attempt(job, Some(error_type), next_attempt) {
-            self.handle_job_retry(job, error_message, None, retry_count)
-                .await
+        if self.should_retry_attempt(job, Some(error_type)) {
+            self.handle_job_retry(job, error_message, None).await
         } else {
-            self.fail_job_permanently(job, error_message, None, retry_count)
-                .await
+            self.fail_job_permanently(job, error_message, None).await
         }
     }
 
-    /// Determine whether another retry should be attempted for this job
-    fn should_retry_attempt(
-        &self,
-        job: &Job,
-        exception_type: Option<&str>,
-        next_attempt: u32,
-    ) -> bool {
-        if job.max_retries > 0 && next_attempt > job.max_retries {
+    /// Determine whether another retry should be attempted for this job.
+    ///
+    /// `job.attempt` is the number of attempts completed so far (including the
+    /// one that just failed). The next run would be retry `#job.attempt`, so
+    /// both the job-level cap and the retry policy are checked against that
+    /// value.
+    fn should_retry_attempt(&self, job: &Job, exception_type: Option<&str>) -> bool {
+        if job.max_retries > 0 && job.attempt > job.max_retries {
             return false;
         }
 
-        self.retry_policy.should_retry(exception_type, next_attempt)
-    }
-
-    /// Extract retry count from job state
-    fn extract_retry_count(&self, job: &Job) -> u32 {
-        match &job.state {
-            JobState::AwaitingRetry { retry_count, .. } => *retry_count,
-            JobState::Failed { retry_count, .. } => *retry_count,
-            _ => job
-                .metadata
-                .get(RETRY_COUNT_METADATA_KEY)
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(0),
-        }
+        self.retry_policy.should_retry(exception_type, job.attempt)
     }
 
     /// Extract previous exception from job state
@@ -535,10 +504,8 @@ mod tests {
         processor.process_job(job.clone()).await.unwrap();
 
         let mut retry_job = storage.get(&job_id).await.unwrap().unwrap();
-        match &retry_job.state {
-            JobState::AwaitingRetry { retry_count, .. } => assert_eq!(*retry_count, 1),
-            other => panic!("Expected AwaitingRetry, got {:?}", other),
-        }
+        assert!(matches!(retry_job.state, JobState::AwaitingRetry { .. }));
+        assert_eq!(retry_job.attempt, 1);
 
         // Make the retry immediately eligible by re-enqueuing it
         retry_job
@@ -550,10 +517,8 @@ mod tests {
         processor.process_job(retry_job).await.unwrap();
 
         let final_job = storage.get(&job_id).await.unwrap().unwrap();
-        match final_job.state {
-            JobState::Failed { retry_count, .. } => assert_eq!(retry_count, 1),
-            state => panic!("Expected Failed state, got {:?}", state),
-        }
+        assert!(matches!(final_job.state, JobState::Failed { .. }));
+        assert_eq!(final_job.attempt, 2);
     }
 
     #[tokio::test]
@@ -577,10 +542,8 @@ mod tests {
         processor.process_job(job.clone()).await.unwrap();
 
         let mut retry_job = storage.get(&job_id).await.unwrap().unwrap();
-        match &retry_job.state {
-            JobState::AwaitingRetry { retry_count, .. } => assert_eq!(*retry_count, 1),
-            other => panic!("Expected AwaitingRetry, got {:?}", other),
-        }
+        assert!(matches!(retry_job.state, JobState::AwaitingRetry { .. }));
+        assert_eq!(retry_job.attempt, 1);
 
         retry_job
             .set_state(JobState::enqueued(&retry_job.queue))
@@ -590,9 +553,46 @@ mod tests {
         processor.process_job(retry_job).await.unwrap();
 
         let final_job = storage.get(&job_id).await.unwrap().unwrap();
-        match final_job.state {
-            JobState::Failed { retry_count, .. } => assert_eq!(retry_count, 1),
-            state => panic!("Expected Failed state, got {:?}", state),
-        }
+        assert!(matches!(final_job.state, JobState::Failed { .. }));
+        assert_eq!(final_job.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_to_enqueued_to_failed_increments_attempt() {
+        // Regression test for B3: when a job is manually re-enqueued after a
+        // terminal failure, the processor must treat the next run as a
+        // distinct attempt and bump `job.attempt` accordingly rather than
+        // resetting it or double-counting.
+        let storage = Arc::new(MemoryStorage::new());
+        let mut registry = WorkerRegistry::new();
+        registry.register(TestWorker::new("manual_retry_method", false, false));
+        let registry = Arc::new(registry);
+
+        let config = WorkerConfig::new("test-worker");
+        let processor = JobProcessor::new(registry, storage.clone(), config);
+
+        let job = Job::new("manual_retry_method", vec![]);
+        let job_id = job.id.clone();
+        storage.enqueue(&job).await.unwrap();
+
+        // First attempt: worker returns Failure, so this hits the permanent
+        // failure path directly.
+        processor.process_job(job).await.unwrap();
+        let after_first = storage.get(&job_id).await.unwrap().unwrap();
+        assert!(matches!(after_first.state, JobState::Failed { .. }));
+        assert_eq!(after_first.attempt, 1);
+
+        // Manual retry: Failed → Enqueued is a legal transition.
+        let mut manual = after_first;
+        manual
+            .set_state(JobState::enqueued(&manual.queue))
+            .unwrap();
+        storage.update(&manual).await.unwrap();
+
+        // Second attempt: fails again, attempt counter must advance.
+        processor.process_job(manual).await.unwrap();
+        let after_second = storage.get(&job_id).await.unwrap().unwrap();
+        assert!(matches!(after_second.state, JobState::Failed { .. }));
+        assert_eq!(after_second.attempt, 2);
     }
 }

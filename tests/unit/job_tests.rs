@@ -245,13 +245,12 @@ fn test_job_complex_state_transitions() {
     job.set_state(JobState::processing("w1", "s1")).unwrap();
 
     // Processing -> Failed
-    job.set_state(JobState::failed("Network error", None, 1))
+    job.set_state(JobState::failed("Network error", None))
         .unwrap();
 
     // Failed -> AwaitingRetry
     job.set_state(JobState::awaiting_retry(
         Utc::now() + chrono::Duration::minutes(5),
-        1,
         "Network error",
     ))
     .unwrap();

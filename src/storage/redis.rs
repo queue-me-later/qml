@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use redis::{AsyncCommands, Client, RedisResult, aio::ConnectionManager};
 use serde_json;
 use std::collections::HashMap;
 use tokio::time::timeout;
 
 use super::{RedisConfig, Storage, StorageError};
-use crate::core::{Job, JobState};
+use crate::core::{Job, JobState, JobStateKind};
 
 /// Redis storage implementation for jobs
 ///
@@ -338,7 +338,7 @@ impl Storage for RedisStorage {
         }
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         let mut conn = self.get_connection().await?;
         let counts_key = self.job_counts_key();
 
@@ -347,17 +347,17 @@ impl Storage for RedisStorage {
         let mut counts = HashMap::new();
         for (state_str, count) in raw_counts {
             if count > 0 {
-                let state = match state_str.as_str() {
-                    "enqueued" => JobState::enqueued(""),
-                    "processing" => JobState::processing("", ""),
-                    "succeeded" => JobState::succeeded(0, None),
-                    "failed" => JobState::failed("", None, 0),
-                    "deleted" => JobState::deleted(None),
-                    "scheduled" => JobState::scheduled(Utc::now(), ""),
-                    "awaiting_retry" => JobState::awaiting_retry(Utc::now(), 0, ""),
+                let kind = match state_str.as_str() {
+                    "enqueued" => JobStateKind::Enqueued,
+                    "processing" => JobStateKind::Processing,
+                    "succeeded" => JobStateKind::Succeeded,
+                    "failed" => JobStateKind::Failed,
+                    "deleted" => JobStateKind::Deleted,
+                    "scheduled" => JobStateKind::Scheduled,
+                    "awaiting_retry" => JobStateKind::AwaitingRetry,
                     _ => continue,
                 };
-                counts.insert(state, count as usize);
+                counts.insert(kind, count as usize);
             }
         }
 
@@ -392,6 +392,105 @@ impl Storage for RedisStorage {
         Ok(jobs)
     }
 
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // NOTE: this iterates the scheduled state set and filters client-side.
+        // A future optimization is to maintain a ZSET scored by enqueue_at so
+        // ZRANGEBYSCORE can push the time predicate to Redis directly.
+        let mut conn = self.get_connection().await?;
+        let state_key = self.state_index_key("scheduled");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&state_key)).await?;
+
+        let mut due = Vec::new();
+        for job_id in job_ids {
+            if let Some(job) = self.get(&job_id).await? {
+                if let JobState::Scheduled { enqueue_at, .. } = &job.state {
+                    if *enqueue_at <= now {
+                        due.push(job);
+                    }
+                }
+            }
+        }
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // NOTE: same client-side filter tradeoff as fetch_due_scheduled_jobs.
+        let mut conn = self.get_connection().await?;
+        let state_key = self.state_index_key("awaiting_retry");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&state_key)).await?;
+
+        let mut due = Vec::new();
+        for job_id in job_ids {
+            if let Some(job) = self.get(&job_id).await? {
+                if let JobState::AwaitingRetry { retry_at, .. } = &job.state {
+                    if *retry_at <= now {
+                        due.push(job);
+                    }
+                }
+            }
+        }
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        // Iterate the processing state set, transition every stale job back
+        // to Enqueued. Done Rust-side (not Lua) because we need to
+        // round-trip through `serde_json` to build the new JobState cleanly
+        // — the Lua script path in fetch_and_lock_job is pragmatic but
+        // fragile, and this is a cold startup sweep so perf isn't critical.
+        let mut conn = self.get_connection().await?;
+        let processing_key = self.state_index_key("processing");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&processing_key)).await?;
+
+        let mut recovered = 0;
+        for job_id in job_ids {
+            let Some(mut job) = self.get(&job_id).await? else {
+                continue;
+            };
+            let stale = matches!(
+                &job.state,
+                JobState::Processing { started_at, .. } if *started_at < stale_before
+            );
+            if !stale {
+                continue;
+            }
+
+            // Bypass `Job::set_state` — `Processing → Enqueued` isn't in
+            // the normal allowlist, but stale recovery is a legitimate
+            // out-of-band transition.
+            job.state = JobState::enqueued(&job.queue);
+            self.update(&job).await?;
+            recovered += 1;
+        }
+
+        Ok(recovered)
+    }
+
     async fn fetch_and_lock_job(
         &self,
         worker_id: &str,
@@ -423,34 +522,39 @@ impl Storage for RedisStorage {
                 return nil
             end
             
-            -- Parse job to check if it's still available
+            -- Parse job to check if it's still available. JobState is
+            -- externally tagged by serde, so the variant surfaces as a single
+            -- key on job.state (e.g. Enqueued, AwaitingRetry). Any job whose
+            -- variant is not Enqueued or AwaitingRetry is not eligible.
             local job = cjson.decode(job_data)
-            if job.state.type ~= 'enqueued' and job.state.type ~= 'retrying' then
-                -- Job is no longer available, remove from available set
+            if not (job.state.Enqueued or job.state.AwaitingRetry) then
                 redis.call('ZREM', available_key, job_id)
                 return nil
             end
-            
-            -- Mark job as processing
+
+            -- Mark job as processing, matching the externally-tagged layout
+            -- so Rust can deserialize it back into JobState::Processing.
             job.state = {
-                type = 'processing',
-                worker_id = worker_id,
-                started_at = current_time
+                Processing = {
+                    worker_id = worker_id,
+                    started_at = current_time,
+                    server_name = 'redis-storage'
+                }
             }
             job.updated_at = current_time
-            
+
             -- Update job in Redis
             redis.call('SET', job_key, cjson.encode(job))
-            
+
             -- Remove from available jobs and update indices
             redis.call('ZREM', available_key, job_id)
             redis.call('SREM', 'qml:state:enqueued', job_id)
-            redis.call('SREM', 'qml:state:retrying', job_id)
+            redis.call('SREM', 'qml:state:awaiting_retry', job_id)
             redis.call('SADD', 'qml:state:processing', job_id)
-            
+
             -- Update counters
             redis.call('HINCRBY', 'qml:counts', 'enqueued', -1)
-            redis.call('HINCRBY', 'qml:counts', 'retrying', -1)
+            redis.call('HINCRBY', 'qml:counts', 'awaiting_retry', -1)
             redis.call('HINCRBY', 'qml:counts', 'processing', 1)
             
             return job_data

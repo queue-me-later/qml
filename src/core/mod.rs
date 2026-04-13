@@ -7,4 +7,4 @@ pub mod job;
 pub mod job_state;
 
 pub use job::Job;
-pub use job_state::JobState;
+pub use job_state::{JobState, JobStateKind};

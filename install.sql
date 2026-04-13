@@ -15,8 +15,10 @@ CREATE TABLE IF NOT EXISTS qml.qml_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     method_name VARCHAR(255) NOT NULL,
     arguments JSONB NOT NULL DEFAULT '[]'::jsonb,
-    -- Job state management
-    state_name VARCHAR(50) NOT NULL DEFAULT 'pending',
+    -- Job state management. state_name is the serde discriminant of
+    -- JobState (enqueued, processing, succeeded, failed, deleted, scheduled,
+    -- awaiting_retry); state_data carries the variant's fields as JSONB.
+    state_name VARCHAR(50) NOT NULL DEFAULT 'enqueued',
     state_data JSONB NOT NULL DEFAULT '{}'::jsonb,
     -- Queue and priority management
     queue_name VARCHAR(255) NOT NULL DEFAULT 'default',
@@ -95,25 +97,6 @@ CREATE TRIGGER trigger_update_qml_jobs_updated_at
     EXECUTE FUNCTION qml.update_updated_at_column();
 
 -- =========================================================================
--- JOB STATE ENUM (Optional - for type safety)
--- =========================================================================
-
--- Create job state enum type for better type safety
-DO $$ BEGIN
-    CREATE TYPE qml.job_state AS ENUM (
-        'pending',      -- Job is waiting to be processed
-        'running',      -- Job is currently being processed
-        'completed',    -- Job completed successfully
-        'failed',       -- Job failed and won't be retried
-        'cancelled',    -- Job was cancelled
-        'retrying',     -- Job failed but will be retried
-        'scheduled'     -- Job is scheduled for future execution
-    );
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END $$;
-
--- =========================================================================
 -- DISTRIBUTED JOB LOCKING FUNCTIONS
 -- =========================================================================
 
@@ -185,39 +168,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to get next available job with locking
-CREATE OR REPLACE FUNCTION qml.get_next_job(
-    p_worker_id VARCHAR(255),
-    p_queue_names VARCHAR(255)[] DEFAULT ARRAY['default'],
-    p_lock_duration INTERVAL DEFAULT '5 minutes'::interval
-) RETURNS TABLE(job_id UUID, method_name VARCHAR, arguments JSONB) AS $$
-DECLARE
-    selected_job_id UUID;
-BEGIN
-    -- Find and lock the next available job atomically
-    SELECT id INTO selected_job_id
-    FROM qml.qml_jobs
-    WHERE
-        state_name = 'pending'
-        AND queue_name = ANY(p_queue_names)
-        AND (scheduled_at IS NULL OR scheduled_at <= NOW())
-        AND (locked_by IS NULL OR lock_expires_at < NOW())
-    ORDER BY priority DESC, created_at ASC
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED;
-
-    -- If we found a job, try to acquire the lock
-    IF selected_job_id IS NOT NULL THEN
-        IF qml.acquire_job_lock(selected_job_id, p_worker_id, p_lock_duration) THEN
-            -- Return the job details
-            RETURN QUERY
-            SELECT j.id, j.method_name, j.arguments
-            FROM qml.qml_jobs j
-            WHERE j.id = selected_job_id;
-        END IF;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
+-- Note: job fetch-and-lock lives in the Rust storage layer — a single
+-- UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *
+-- in PostgresStorage::fetch_and_lock_job. No stored procedure is needed.
 
 -- =========================================================================
 -- TABLE AND COLUMN DOCUMENTATION
@@ -251,7 +204,6 @@ COMMENT ON COLUMN qml.qml_jobs.lock_expires_at IS 'When the current job lock exp
 COMMENT ON FUNCTION qml.acquire_job_lock IS 'Atomically acquire a distributed lock on a job';
 COMMENT ON FUNCTION qml.release_job_lock IS 'Release a job lock held by a specific worker';
 COMMENT ON FUNCTION qml.cleanup_expired_locks IS 'Clean up all expired job locks (maintenance)';
-COMMENT ON FUNCTION qml.get_next_job IS 'Get and lock the next available job for processing';
 COMMENT ON FUNCTION qml.update_updated_at_column IS 'Trigger function to automatically update updated_at timestamp';
 
 -- =========================================================================
@@ -264,7 +216,7 @@ BEGIN
     RAISE NOTICE 'QML PostgreSQL schema installation completed successfully';
     RAISE NOTICE 'Schema: qml';
     RAISE NOTICE 'Tables: qml_jobs';
-    RAISE NOTICE 'Functions: acquire_job_lock, release_job_lock, cleanup_expired_locks, get_next_job';
+    RAISE NOTICE 'Functions: acquire_job_lock, release_job_lock, cleanup_expired_locks';
     RAISE NOTICE 'Triggers: automatic updated_at timestamp';
     RAISE NOTICE 'Ready for production job processing with distributed locking support';
 END

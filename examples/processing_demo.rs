@@ -277,13 +277,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check results
     let job_counts = storage.get_job_counts().await?;
     println!("\n📊 Job Processing Results:");
-    for (state, count) in &job_counts {
-        let state_name = match state {
-            qml_rs::JobState::Succeeded { .. } => "✅ Succeeded",
-            qml_rs::JobState::Failed { .. } => "❌ Failed",
-            qml_rs::JobState::Processing { .. } => "🔄 Processing",
-            qml_rs::JobState::AwaitingRetry { .. } => "⏳ Awaiting Retry",
-            qml_rs::JobState::Enqueued { .. } => "📥 Enqueued",
+    for (kind, count) in &job_counts {
+        let state_name = match kind {
+            qml_rs::JobStateKind::Succeeded => "✅ Succeeded",
+            qml_rs::JobStateKind::Failed => "❌ Failed",
+            qml_rs::JobStateKind::Processing => "🔄 Processing",
+            qml_rs::JobStateKind::AwaitingRetry => "⏳ Awaiting Retry",
+            qml_rs::JobStateKind::Enqueued => "📥 Enqueued",
             _ => "📝 Other",
         };
         println!("   {} {}", state_name, count);
@@ -356,14 +356,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check final results
     let final_counts = storage.get_job_counts().await?;
     println!("\n📊 Final Job Counts:");
-    for (state, count) in &final_counts {
-        let state_name = match state {
-            qml_rs::JobState::Succeeded { .. } => "✅ Succeeded",
-            qml_rs::JobState::Failed { .. } => "❌ Failed",
-            qml_rs::JobState::Scheduled { .. } => "📅 Scheduled",
-            qml_rs::JobState::Processing { .. } => "🔄 Processing",
-            qml_rs::JobState::AwaitingRetry { .. } => "⏳ Awaiting Retry",
-            qml_rs::JobState::Enqueued { .. } => "📥 Enqueued",
+    for (kind, count) in &final_counts {
+        let state_name = match kind {
+            qml_rs::JobStateKind::Succeeded => "✅ Succeeded",
+            qml_rs::JobStateKind::Failed => "❌ Failed",
+            qml_rs::JobStateKind::Scheduled => "📅 Scheduled",
+            qml_rs::JobStateKind::Processing => "🔄 Processing",
+            qml_rs::JobStateKind::AwaitingRetry => "⏳ Awaiting Retry",
+            qml_rs::JobStateKind::Enqueued => "📥 Enqueued",
             _ => "📝 Other",
         };
         println!("   {} {}", state_name, count);
@@ -392,27 +392,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📋 Job execution analysis:");
     for job in all_jobs {
+        let attempt = job.attempt;
         let status = match &job.state {
             qml_rs::JobState::Succeeded { total_duration, .. } => {
                 format!("✅ Succeeded in {}ms", total_duration)
             }
-            qml_rs::JobState::Failed {
-                exception,
-                retry_count,
-                ..
-            } => {
-                format!(
-                    "❌ Failed after {} attempts: {}",
-                    retry_count + 1,
-                    exception
-                )
+            qml_rs::JobState::Failed { exception, .. } => {
+                format!("❌ Failed after {} attempts: {}", attempt, exception)
             }
-            qml_rs::JobState::AwaitingRetry {
-                retry_count,
-                last_exception,
-                ..
-            } => {
-                format!("⏳ Retry #{} scheduled: {}", retry_count, last_exception)
+            qml_rs::JobState::AwaitingRetry { last_exception, .. } => {
+                format!("⏳ Retry after attempt #{}: {}", attempt, last_exception)
             }
             _ => "📝 Other state".to_string(),
         };

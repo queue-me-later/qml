@@ -226,6 +226,14 @@ pub struct Job {
     /// Default: `0` (no retries)
     pub max_retries: u32,
 
+    /// Number of attempts that have been made to execute this job.
+    ///
+    /// Incremented by the job processor each time it begins executing the job.
+    /// `0` means the job has never been attempted; `1` after the first attempt,
+    /// and so on. Used to enforce retry limits and surface attempt counts to
+    /// observers without stuffing state into [`JobState`] variants.
+    pub attempt: u32,
+
     /// Additional metadata for the job
     ///
     /// Key-value pairs for storing arbitrary information about the job.
@@ -311,6 +319,7 @@ impl Job {
             queue: "default".to_string(),
             priority: 0,
             max_retries: 0,
+            attempt: 0,
             metadata: HashMap::new(),
             job_type: None,
             timeout_seconds: None,
@@ -368,6 +377,7 @@ impl Job {
             queue,
             priority,
             max_retries,
+            attempt: 0,
             metadata: HashMap::new(),
             job_type: None,
             timeout_seconds: None,
@@ -641,6 +651,7 @@ impl Job {
         let mut cloned = self.clone();
         cloned.id = Uuid::new_v4().to_string();
         cloned.created_at = Utc::now();
+        cloned.attempt = 0;
         cloned
     }
 }

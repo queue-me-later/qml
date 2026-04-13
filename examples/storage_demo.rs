@@ -1,5 +1,5 @@
 use qml_rs::{
-    Job, JobState, Storage,
+    Job, JobState, JobStateKind, Storage,
     storage::{MemoryConfig, StorageConfig, StorageInstance},
 };
 
@@ -162,11 +162,11 @@ async fn demo_storage_operations(
     // Get job counts
     println!("  📊 Getting job counts...");
     let counts = storage.get_job_counts().await?;
-    for (state, count) in &counts {
-        let state_name = match state {
-            JobState::Enqueued { .. } => "Enqueued",
-            JobState::Processing { .. } => "Processing",
-            JobState::Scheduled { .. } => "Scheduled",
+    for (kind, count) in &counts {
+        let state_name = match kind {
+            JobStateKind::Enqueued => "Enqueued",
+            JobStateKind::Processing => "Processing",
+            JobStateKind::Scheduled => "Scheduled",
             _ => "Other",
         };
         println!("     ✓ {}: {} jobs", state_name, count);

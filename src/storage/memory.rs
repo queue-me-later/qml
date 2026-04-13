@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{MemoryConfig, Storage, StorageError};
-use crate::core::{Job, JobState};
+use crate::core::{Job, JobState, JobStateKind};
 
 /// Job lock information for MemoryStorage
 #[derive(Debug, Clone)]
@@ -196,21 +196,12 @@ impl Storage for MemoryStorage {
         }
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         let jobs = self.jobs.read().unwrap();
         let mut counts = HashMap::new();
 
         for job in jobs.values() {
-            let key = match &job.state {
-                JobState::Enqueued { .. } => JobState::enqueued(""),
-                JobState::Processing { .. } => JobState::processing("", ""),
-                JobState::Succeeded { .. } => JobState::succeeded(0, None),
-                JobState::Failed { .. } => JobState::failed("", None, 0),
-                JobState::Deleted { .. } => JobState::deleted(None),
-                JobState::Scheduled { .. } => JobState::scheduled(Utc::now(), ""),
-                JobState::AwaitingRetry { .. } => JobState::awaiting_retry(Utc::now(), 0, ""),
-            };
-            *counts.entry(key).or_insert(0) += 1;
+            *counts.entry(job.state.kind()).or_insert(0) += 1;
         }
 
         Ok(counts)
@@ -219,6 +210,84 @@ impl Storage for MemoryStorage {
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {
         let jobs = self.jobs.read().unwrap();
         Ok(Self::get_available_jobs_internal(&jobs, limit))
+    }
+
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let jobs = self.jobs.read().unwrap();
+        let mut due: Vec<Job> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::Scheduled { enqueue_at, .. } => *enqueue_at <= now,
+                _ => false,
+            })
+            .cloned()
+            .collect();
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let jobs = self.jobs.read().unwrap();
+        let mut due: Vec<Job> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::AwaitingRetry { retry_at, .. } => *retry_at <= now,
+                _ => false,
+            })
+            .cloned()
+            .collect();
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let mut locks = self.locks.lock().unwrap();
+
+        let mut recovered = 0;
+        for job in jobs.values_mut() {
+            let stale = matches!(
+                &job.state,
+                JobState::Processing { started_at, .. } if *started_at < stale_before
+            );
+            if !stale {
+                continue;
+            }
+
+            // Drop any lingering lock first so the new Enqueued state can
+            // actually be picked up by fetch_and_lock_job.
+            locks.remove(&job.id);
+            // Bypass `set_state` — `Processing → Enqueued` isn't in the
+            // allowlist (manual retry goes via Failed), but for stale
+            // recovery this is the correct transition.
+            job.state = JobState::enqueued(&job.queue);
+            recovered += 1;
+        }
+
+        Ok(recovered)
     }
 
     async fn fetch_and_lock_job(
@@ -444,18 +513,14 @@ mod tests {
 
         let counts = storage.get_job_counts().await.unwrap();
 
-        // Check that we have the right number of different state types
-        assert!(counts.len() >= 2);
+        assert_eq!(counts.get(&JobStateKind::Enqueued).copied(), Some(2));
+        assert_eq!(counts.get(&JobStateKind::Processing).copied(), Some(1));
 
-        // Since we're grouping by state type, we should have some enqueued and processing
-        let has_enqueued = counts
-            .keys()
-            .any(|k| matches!(k, JobState::Enqueued { .. }));
-        let has_processing = counts
-            .keys()
-            .any(|k| matches!(k, JobState::Processing { .. }));
-        assert!(has_enqueued);
-        assert!(has_processing);
+        // Regression for B2: two calls against unchanged data must produce
+        // equal maps. Before JobStateKind, JobState's Hash impl dragged in
+        // per-call timestamps so this held only by accident.
+        let counts_again = storage.get_job_counts().await.unwrap();
+        assert_eq!(counts, counts_again);
     }
 
     #[tokio::test]
@@ -528,6 +593,58 @@ mod tests {
         // This should trigger cleanup and succeed
         assert!(storage.enqueue(&job3).await.is_ok());
         assert_eq!(storage.len(), 2); // job1 should be cleaned up
+    }
+
+    #[tokio::test]
+    async fn requeue_stranded_jobs_only_touches_stale_processing() {
+        // Regression test for S3: only jobs whose `Processing::started_at`
+        // is older than `stale_before` should be swept back to Enqueued.
+        let storage = MemoryStorage::new();
+
+        // Fresh Processing (1 second ago) — must NOT be recovered.
+        let mut fresh = create_test_job();
+        fresh.state = JobState::Processing {
+            started_at: Utc::now() - Duration::seconds(1),
+            worker_id: "w1".into(),
+            server_name: "s1".into(),
+        };
+        let fresh_id = fresh.id.clone();
+        storage.enqueue(&fresh).await.unwrap();
+
+        // Stale Processing (1 hour ago) — must be recovered.
+        let mut stranded = create_test_job();
+        stranded.state = JobState::Processing {
+            started_at: Utc::now() - Duration::hours(1),
+            worker_id: "dead".into(),
+            server_name: "dead-srv".into(),
+        };
+        let stranded_id = stranded.id.clone();
+        storage.enqueue(&stranded).await.unwrap();
+
+        // Unrelated Enqueued — must remain untouched.
+        let mut untouched = create_test_job();
+        untouched.state = JobState::enqueued("default");
+        let untouched_id = untouched.id.clone();
+        storage.enqueue(&untouched).await.unwrap();
+
+        let recovered = storage
+            .requeue_stranded_jobs(Utc::now() - Duration::minutes(5))
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1);
+
+        assert!(matches!(
+            storage.get(&fresh_id).await.unwrap().unwrap().state,
+            JobState::Processing { .. }
+        ));
+        assert!(matches!(
+            storage.get(&stranded_id).await.unwrap().unwrap().state,
+            JobState::Enqueued { .. }
+        ));
+        assert!(matches!(
+            storage.get(&untouched_id).await.unwrap().unwrap().state,
+            JobState::Enqueued { .. }
+        ));
     }
 
     #[tokio::test]

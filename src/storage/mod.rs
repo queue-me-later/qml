@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use crate::core::{Job, JobState};
+use crate::core::{Job, JobState, JobStateKind};
 
 pub mod config;
 pub mod database_init;
@@ -402,7 +403,7 @@ pub trait Storage: Send + Sync {
     /// }
     /// # });
     /// ```
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError>;
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError>;
 
     /// Get jobs that are ready to be processed immediately.
     ///
@@ -439,6 +440,45 @@ pub trait Storage: Send + Sync {
     /// # });
     /// ```
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError>;
+
+    /// Fetch scheduled jobs whose `enqueue_at` has already passed.
+    ///
+    /// Storage backends are expected to push the time predicate down to the
+    /// engine (SQL WHERE, Redis ZRANGEBYSCORE, etc.) rather than loading every
+    /// scheduled job into memory. Results are ordered by priority (desc) then
+    /// `created_at` (asc) when the backend supports ordering.
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Fetch awaiting-retry jobs whose `retry_at` has already passed.
+    ///
+    /// Same contract as [`fetch_due_scheduled_jobs`] but for jobs in the
+    /// `AwaitingRetry` state.
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Recover jobs stranded in the `Processing` state by a previous server
+    /// instance.
+    ///
+    /// A job is considered stranded if its `Processing::started_at` is
+    /// earlier than `stale_before`. Matching jobs are transitioned back to
+    /// `Enqueued` (preserving their original `queue`) and any explicit locks
+    /// on them are cleared. Returns the number of jobs recovered.
+    ///
+    /// This is called by `BackgroundJobServer::start` on startup with
+    /// `stale_before = now - config.stale_processing_after`. `stale_before`
+    /// should comfortably exceed the typical job runtime so a worker that's
+    /// still alive on another server isn't fighting the sweep.
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError>;
 
     /// Atomically fetch and lock a job for processing to prevent race conditions.
     ///
@@ -831,7 +871,7 @@ impl Storage for StorageInstance {
         }
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         match self {
             StorageInstance::Memory(storage) => storage.get_job_counts().await,
             #[cfg(feature = "redis")]
@@ -848,6 +888,49 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.get_available_jobs(limit).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.get_available_jobs(limit).await,
+        }
+    }
+
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.fetch_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.fetch_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.fetch_due_scheduled_jobs(now, limit).await
+            }
+        }
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+        }
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.requeue_stranded_jobs(stale_before).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.requeue_stranded_jobs(stale_before).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.requeue_stranded_jobs(stale_before).await,
         }
     }
 

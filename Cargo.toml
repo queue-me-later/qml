@@ -24,7 +24,7 @@ redis = { version = "0.32.4", features = [
     "tokio-comp",
     "connection-manager",
 ], optional = true }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 fastrand = "2.3"
 
 # Dashboard and web server dependencies

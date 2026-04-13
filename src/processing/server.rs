@@ -531,20 +531,6 @@ impl BackgroundJobServer {
     }
 }
 
-impl Clone for BackgroundJobServer {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            storage: self.storage.clone(),
-            worker_registry: self.worker_registry.clone(),
-            retry_policy: self.retry_policy.clone(),
-            is_running: Arc::new(tokio::sync::RwLock::new(false)),
-            shutdown_token: Arc::new(tokio::sync::Mutex::new(CancellationToken::new())),
-            worker_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

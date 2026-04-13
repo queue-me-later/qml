@@ -197,8 +197,6 @@ pub struct BackgroundJobServer {
     storage: Arc<dyn Storage>,
     worker_registry: Arc<WorkerRegistry>,
     retry_policy: RetryPolicy,
-    #[allow(dead_code)]
-    scheduler: Option<JobScheduler>,
     is_running: Arc<tokio::sync::RwLock<bool>>,
     /// Parent cancellation token for the running instance. Cancelling it
     /// tells every worker loop (and the scheduler loop) to drain cleanly.
@@ -215,21 +213,11 @@ impl BackgroundJobServer {
         storage: Arc<dyn Storage>,
         worker_registry: Arc<WorkerRegistry>,
     ) -> Self {
-        let scheduler = if config.enable_scheduler {
-            Some(JobScheduler::with_poll_interval(
-                storage.clone(),
-                config.scheduler_poll_interval,
-            ))
-        } else {
-            None
-        };
-
         Self {
             config,
             storage,
             worker_registry,
             retry_policy: RetryPolicy::default(),
-            scheduler,
             is_running: Arc::new(tokio::sync::RwLock::new(false)),
             shutdown_token: Arc::new(tokio::sync::Mutex::new(CancellationToken::new())),
             worker_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -545,21 +533,11 @@ impl BackgroundJobServer {
 
 impl Clone for BackgroundJobServer {
     fn clone(&self) -> Self {
-        let scheduler = if self.config.enable_scheduler {
-            Some(JobScheduler::with_poll_interval(
-                self.storage.clone(),
-                self.config.scheduler_poll_interval,
-            ))
-        } else {
-            None
-        };
-
         Self {
             config: self.config.clone(),
             storage: self.storage.clone(),
             worker_registry: self.worker_registry.clone(),
             retry_policy: self.retry_policy.clone(),
-            scheduler,
             is_running: Arc::new(tokio::sync::RwLock::new(false)),
             shutdown_token: Arc::new(tokio::sync::Mutex::new(CancellationToken::new())),
             worker_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),

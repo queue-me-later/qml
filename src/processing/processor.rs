@@ -137,9 +137,7 @@ impl JobProcessor {
             // Save the updated state
             if let Err(e) = self.storage.update(&job).await {
                 error!("Failed to update job state in storage: {}", e);
-                return Err(QmlError::StorageError {
-                    message: e.to_string(),
-                });
+                return Err(e.into());
             }
         }
 
@@ -234,12 +232,7 @@ impl JobProcessor {
         }
 
         // Update in storage
-        self.storage
-            .update(job)
-            .await
-            .map_err(|e| QmlError::StorageError {
-                message: e.to_string(),
-            })?;
+        self.storage.update(job).await?;
 
         Ok(())
     }
@@ -289,12 +282,7 @@ impl JobProcessor {
         }
 
         // Update in storage
-        self.storage
-            .update(job)
-            .await
-            .map_err(|e| QmlError::StorageError {
-                message: e.to_string(),
-            })?;
+        self.storage.update(job).await?;
 
         info!(
             "Job {} scheduled for retry (attempt #{}) at {}",
@@ -331,12 +319,7 @@ impl JobProcessor {
         job.expires_at = Some(Utc::now() + self.failed_ttl);
 
         // Update in storage
-        self.storage
-            .update(job)
-            .await
-            .map_err(|e| QmlError::StorageError {
-                message: e.to_string(),
-            })?;
+        self.storage.update(job).await?;
 
         error!(
             "Job {} failed permanently after {} attempts",

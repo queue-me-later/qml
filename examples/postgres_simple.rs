@@ -7,7 +7,7 @@
 //! - Retrieving jobs and statistics
 
 #[cfg(feature = "postgres")]
-use qml_rs::{Job, JobState, Storage};
+use qml_rs::{Job, JobState, MonitoringApi, Storage};
 
 #[cfg(feature = "postgres")]
 use qml_rs::storage::{PostgresConfig, PostgresStorage};

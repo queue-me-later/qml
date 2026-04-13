@@ -702,7 +702,7 @@ impl BackgroundJobServer {
 mod tests {
     use super::*;
     use crate::processing::{Worker, WorkerContext, WorkerResult};
-    use crate::storage::MemoryStorage;
+    use crate::storage::{MemoryStorage, MonitoringApi};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

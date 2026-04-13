@@ -9,8 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Duration;
 use qml_rs::{
-    BackgroundJobServer, Job, JobState, MemoryStorage, ServerConfig, Storage, Worker,
-    WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, Job, JobState, MemoryStorage, MonitoringApi, ServerConfig, Storage,
+    Worker, WorkerContext, WorkerRegistry, WorkerResult,
 };
 
 struct NoopWorker;

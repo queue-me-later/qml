@@ -68,7 +68,7 @@ pub use redis::RedisStorage;
 ///
 /// ### Basic Storage Operations
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, Storage};
+/// use qml_rs::{MemoryStorage, Job, MonitoringApi, Storage};
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();
@@ -153,7 +153,7 @@ pub use redis::RedisStorage;
 ///
 /// ### Job Filtering and Statistics
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, JobState, Storage};
+/// use qml_rs::{MemoryStorage, Job, JobState, MonitoringApi, Storage};
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();
@@ -187,7 +187,7 @@ pub use redis::RedisStorage;
 /// # });
 /// ```
 #[async_trait]
-pub trait Storage: Send + Sync {
+pub trait Storage: MonitoringApi + Send + Sync {
     /// Store a new job in the storage backend.
     ///
     /// Persists a job to the storage system, making it available for processing.
@@ -220,190 +220,6 @@ pub trait Storage: Send + Sync {
     /// # });
     /// ```
     async fn enqueue(&self, job: &Job) -> Result<(), StorageError>;
-
-    /// Retrieve a job by its unique identifier.
-    ///
-    /// Fetches a complete job record including all metadata, current state,
-    /// and configuration. Returns `None` if the job doesn't exist.
-    ///
-    /// ## Arguments
-    /// * `job_id` - The unique identifier of the job to retrieve
-    ///
-    /// ## Returns
-    /// * `Ok(Some(job))` - Job exists and was retrieved successfully
-    /// * `Ok(None)` - Job doesn't exist in storage
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let job = Job::new("process_data", serde_json::json!(["file.csv".to_string()]));
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Retrieve the job
-    /// match storage.get(&job.id).await.unwrap() {
-    ///     Some(retrieved_job) => {
-    ///         println!("Found job: {} ({})", retrieved_job.id, retrieved_job.method);
-    ///     },
-    ///     None => println!("Job not found"),
-    /// }
-    /// # });
-    /// ```
-    async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError>;
-
-    /// Update an existing job's state and metadata.
-    ///
-    /// Modifies a job record in storage, typically used for state transitions
-    /// (e.g., Enqueued → Processing → Succeeded). The entire job record is updated.
-    ///
-    /// ## Arguments
-    /// * `job` - The job with updated information to persist
-    ///
-    /// ## Returns
-    /// * `Ok(())` - Job was updated successfully
-    /// * `Err(StorageError)` - Storage operation failed (job may not exist)
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, JobState, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let mut job = Job::new("process_order", serde_json::json!(["order123".to_string()]));
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Update job state to processing
-    /// job.set_state(JobState::processing("worker-1", "server-1")).unwrap();
-    /// storage.update(&job).await.unwrap();
-    ///
-    /// // Add metadata and update again
-    /// job.add_metadata("processed_by", "worker-1");
-    /// storage.update(&job).await.unwrap();
-    /// # });
-    /// ```
-    async fn update(&self, job: &Job) -> Result<(), StorageError>;
-
-    /// Remove a job from storage (soft or hard delete).
-    ///
-    /// Deletes a job record from the storage system. Some implementations may
-    /// perform soft deletion (marking as deleted) while others perform hard deletion.
-    ///
-    /// ## Arguments
-    /// * `job_id` - The unique identifier of the job to delete
-    ///
-    /// ## Returns
-    /// * `Ok(true)` - Job existed and was deleted successfully
-    /// * `Ok(false)` - Job didn't exist (nothing to delete)
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let job = Job::new("cleanup_task", serde_json::Value::Null);
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Delete the job
-    /// let was_deleted = storage.delete(&job.id).await.unwrap();
-    /// assert!(was_deleted);
-    ///
-    /// // Verify it's gone
-    /// let retrieved = storage.get(&job.id).await.unwrap();
-    /// assert!(retrieved.is_none());
-    /// # });
-    /// ```
-    async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
-
-    /// List jobs with optional filtering and pagination.
-    ///
-    /// Retrieves multiple jobs from storage with optional filtering by state
-    /// and pagination support. Useful for building dashboards and monitoring tools.
-    ///
-    /// ## Arguments
-    /// * `state_filter` - Optional job state to filter by (e.g., only failed jobs)
-    /// * `limit` - Maximum number of jobs to return (None = no limit)
-    /// * `offset` - Number of jobs to skip for pagination (None = start from beginning)
-    ///
-    /// ## Returns
-    /// * `Ok(jobs)` - Vector of jobs matching the criteria
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, JobState, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Create several jobs
-    /// for i in 0..10 {
-    ///     let job = Job::new("task", serde_json::json!([i.to_string()]));
-    ///     storage.enqueue(&job).await.unwrap();
-    /// }
-    ///
-    /// // List all jobs
-    /// let all_jobs = storage.list(None, None, None).await.unwrap();
-    /// println!("Total jobs: {}", all_jobs.len());
-    ///
-    /// // List first 5 jobs
-    /// let first_five = storage.list(None, Some(5), None).await.unwrap();
-    /// println!("First 5 jobs: {}", first_five.len());
-    ///
-    /// // List next 5 jobs (pagination)
-    /// let next_five = storage.list(None, Some(5), Some(5)).await.unwrap();
-    /// println!("Next 5 jobs: {}", next_five.len());
-    /// # });
-    /// ```
-    async fn list(
-        &self,
-        state_filter: Option<&JobState>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Get the count of jobs grouped by their current state.
-    ///
-    /// Returns statistics about job distribution across different states.
-    /// Useful for monitoring and dashboard displays.
-    ///
-    /// ## Returns
-    /// * `Ok(counts)` - HashMap mapping each job state to its count
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust,ignore
-    /// use qml_rs::{MemoryStorage, Job, JobState, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Create jobs in different states
-    /// let mut job1 = Job::new("task1", serde_json::Value::Null);
-    /// storage.enqueue(&job1).await.unwrap();
-    ///
-    /// let mut job2 = Job::new("task2", serde_json::Value::Null);
-    /// job2.set_state(JobState::processing("worker-1", "server-1")).unwrap();
-    /// storage.update(&job2).await.unwrap();
-    ///
-    /// // Get statistics
-    /// let counts = storage.get_job_counts().await;
-    /// match counts {
-    ///     Ok(counts) => for (state, count) in counts {
-    ///         println!("State {:?}: {} jobs", state, count);
-    ///     },
-    ///     Err(e) => println!("Error: {}", e),
-    /// }
-    /// # });
-    /// ```
-    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError>;
 
     /// Get jobs that are ready to be processed immediately.
     ///
@@ -930,18 +746,45 @@ impl StorageInstance {
     }
 }
 
+/// Dashboard-facing subset of storage operations.
+///
+/// [`MonitoringApi`] carves out the five methods the Axum dashboard and its
+/// [`DashboardService`](crate::dashboard::DashboardService) actually touch
+/// (`get`, `update`, `delete`, `list`, `get_job_counts`) so that dashboard
+/// tests can be written against a ~100-line fake instead of a full
+/// [`Storage`] backend. Every real [`Storage`] implementation is also a
+/// [`MonitoringApi`], so callers holding an `Arc<dyn Storage>` can pass it
+/// anywhere an `Arc<dyn MonitoringApi>` is expected via trait upcasting.
+///
+/// The trait deliberately includes `update` and `delete` even though they
+/// mutate state — the dashboard needs them for its retry-job and delete-job
+/// actions, and pretending they're read-only would force callers back onto
+/// the full [`Storage`] trait and defeat the testing payoff.
 #[async_trait]
-impl Storage for StorageInstance {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.enqueue(job).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.enqueue(job).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.enqueue(job).await,
-        }
-    }
+pub trait MonitoringApi: Send + Sync {
+    /// Retrieve a job by its unique identifier.
+    async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError>;
 
+    /// Update an existing job's state and metadata.
+    async fn update(&self, job: &Job) -> Result<(), StorageError>;
+
+    /// Remove a job from storage (soft or hard delete).
+    async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
+
+    /// List jobs with optional filtering and pagination.
+    async fn list(
+        &self,
+        state_filter: Option<&JobState>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Get the count of jobs grouped by their current state.
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError>;
+}
+
+#[async_trait]
+impl MonitoringApi for StorageInstance {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         match self {
             StorageInstance::Memory(storage) => storage.get(job_id).await,
@@ -994,6 +837,19 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.get_job_counts().await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.get_job_counts().await,
+        }
+    }
+}
+
+#[async_trait]
+impl Storage for StorageInstance {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.enqueue(job).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.enqueue(job).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.enqueue(job).await,
         }
     }
 

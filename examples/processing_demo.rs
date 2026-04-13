@@ -15,8 +15,9 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use qml_rs::{
-    BackgroundJobServer, Job, JobScheduler, RetryPolicy, RetryStrategy, ServerConfig, Storage,
-    StorageInstance, TypedWorker, WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, Job, JobScheduler, MonitoringApi, RetryPolicy, RetryStrategy,
+    ServerConfig, Storage, StorageInstance, TypedWorker, WorkerContext, WorkerRegistry,
+    WorkerResult,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{

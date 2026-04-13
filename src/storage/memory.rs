@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::{MemoryConfig, Storage, StorageError};
+use super::{MemoryConfig, MonitoringApi, Storage, StorageError};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Job lock information for MemoryStorage
@@ -121,24 +121,7 @@ impl Default for MemoryStorage {
 }
 
 #[async_trait]
-impl Storage for MemoryStorage {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        // Check capacity before adding
-        if self.is_at_capacity() {
-            return Err(StorageError::capacity_exceeded(format!(
-                "Memory storage is at capacity ({} jobs)",
-                self.len()
-            )));
-        }
-
-        // Store the job. Expired-job cleanup is handled out-of-band by
-        // `CleanupWorker` via `delete_expired_jobs` — no per-enqueue sweep.
-        let mut jobs = self.jobs.write().unwrap();
-        jobs.insert(job.id.clone(), job.clone());
-
-        Ok(())
-    }
-
+impl MonitoringApi for MemoryStorage {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         let jobs = self.jobs.read().unwrap();
         Ok(jobs.get(job_id).cloned())
@@ -201,6 +184,26 @@ impl Storage for MemoryStorage {
         }
 
         Ok(counts)
+    }
+}
+
+#[async_trait]
+impl Storage for MemoryStorage {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        // Check capacity before adding
+        if self.is_at_capacity() {
+            return Err(StorageError::capacity_exceeded(format!(
+                "Memory storage is at capacity ({} jobs)",
+                self.len()
+            )));
+        }
+
+        // Store the job. Expired-job cleanup is handled out-of-band by
+        // `CleanupWorker` via `delete_expired_jobs` — no per-enqueue sweep.
+        let mut jobs = self.jobs.write().unwrap();
+        jobs.insert(job.id.clone(), job.clone());
+
+        Ok(())
     }
 
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {

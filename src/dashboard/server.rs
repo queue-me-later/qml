@@ -11,7 +11,7 @@ use crate::dashboard::{
     service::DashboardService,
     websocket::{WebSocketManager, websocket_handler},
 };
-use crate::storage::Storage;
+use crate::storage::MonitoringApi;
 
 #[cfg(feature = "metrics")]
 use crate::processing::PrometheusMetrics;
@@ -66,7 +66,7 @@ pub struct DashboardServer {
 }
 
 impl DashboardServer {
-    pub fn new(storage: Arc<dyn Storage>, config: DashboardConfig) -> Self {
+    pub fn new(storage: Arc<dyn MonitoringApi>, config: DashboardConfig) -> Self {
         let dashboard_service = Arc::new(DashboardService::new(storage));
         let websocket_manager = Arc::new(WebSocketManager::new(Arc::clone(&dashboard_service)));
 

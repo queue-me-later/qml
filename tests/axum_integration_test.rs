@@ -6,7 +6,7 @@
 //! 3. Everything integrates smoothly with Axum's patterns
 
 use qml_rs::storage::{MemoryConfig, StorageConfig, StorageInstance};
-use qml_rs::{Job, Storage};
+use qml_rs::{Job, MonitoringApi, Storage};
 
 #[tokio::test]
 async fn test_qml_integration_in_axum_style() {

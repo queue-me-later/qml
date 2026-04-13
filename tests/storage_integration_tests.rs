@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use qml_rs::{
-    Job, JobState, Storage,
+    Job, JobState, MonitoringApi, Storage,
     storage::{MemoryConfig, StorageConfig, StorageInstance},
 };
 

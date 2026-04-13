@@ -1,5 +1,5 @@
 use qml_rs::{
-    Job, JobState, JobStateKind, Storage,
+    Job, JobState, JobStateKind, MonitoringApi, Storage,
     storage::{MemoryConfig, StorageConfig, StorageInstance},
 };
 

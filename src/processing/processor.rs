@@ -479,7 +479,7 @@ impl JobProcessor {
 mod tests {
     use super::*;
     use crate::processing::{RetryStrategy, Worker};
-    use crate::storage::MemoryStorage;
+    use crate::storage::{MemoryStorage, MonitoringApi};
     use async_trait::async_trait;
     use chrono::Duration;
     use std::sync::Arc;

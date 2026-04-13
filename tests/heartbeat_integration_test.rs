@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use qml_rs::{
-    BackgroundJobServer, Job, JobState, MemoryStorage, ServerConfig, ServerInfo, Storage, Worker,
-    WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, Job, JobState, MemoryStorage, MonitoringApi, ServerConfig, ServerInfo,
+    Storage, Worker, WorkerContext, WorkerRegistry, WorkerResult,
 };
 
 struct TickWorker {

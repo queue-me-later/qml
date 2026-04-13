@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::core::{JobState, JobStateKind};
 use crate::error::QmlError;
-use crate::storage::Storage;
+use crate::storage::MonitoringApi;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatistics {
@@ -52,11 +52,11 @@ pub struct ServerStatistics {
 }
 
 pub struct DashboardService {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn MonitoringApi>,
 }
 
 impl DashboardService {
-    pub fn new(storage: Arc<dyn Storage>) -> Self {
+    pub fn new(storage: Arc<dyn MonitoringApi>) -> Self {
         Self { storage }
     }
 

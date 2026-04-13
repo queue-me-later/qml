@@ -5,7 +5,7 @@ use serde_json;
 use std::collections::HashMap;
 use tokio::time::timeout;
 
-use super::{RedisConfig, Storage, StorageError};
+use super::{MonitoringApi, RedisConfig, Storage, StorageError};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Redis storage implementation for jobs
@@ -234,26 +234,7 @@ impl RedisStorage {
 }
 
 #[async_trait]
-impl Storage for RedisStorage {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        let mut conn = self.get_connection().await?;
-        let job_key = self.job_key(&job.id);
-
-        // Serialize the job
-        let job_json = serde_json::to_string(job).map_err(|e| {
-            StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
-        })?;
-
-        // Store the job
-        self.with_timeout::<_, ()>(conn.set(&job_key, job_json))
-            .await?;
-
-        // Update indices
-        self.update_job_indices(job, None).await?;
-
-        Ok(())
-    }
-
+impl MonitoringApi for RedisStorage {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         let mut conn = self.get_connection().await?;
         let job_key = self.job_key(job_id);
@@ -390,6 +371,28 @@ impl Storage for RedisStorage {
         }
 
         Ok(counts)
+    }
+}
+
+#[async_trait]
+impl Storage for RedisStorage {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        let mut conn = self.get_connection().await?;
+        let job_key = self.job_key(&job.id);
+
+        // Serialize the job
+        let job_json = serde_json::to_string(job).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
+        })?;
+
+        // Store the job
+        self.with_timeout::<_, ()>(conn.set(&job_key, job_json))
+            .await?;
+
+        // Update indices
+        self.update_job_indices(job, None).await?;
+
+        Ok(())
     }
 
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {

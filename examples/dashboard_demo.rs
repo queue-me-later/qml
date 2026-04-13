@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth: None,
     };
 
-    let dashboard = DashboardServer::new(Arc::clone(&storage), dashboard_config);
+    let dashboard = DashboardServer::new(storage.clone(), dashboard_config);
 
     info!("🖥️  Dashboard available at: http://127.0.0.1:8080");
     info!("📊 WebSocket updates every 3 seconds");

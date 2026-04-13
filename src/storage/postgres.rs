@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use super::{PostgresConfig, Storage, StorageError};
+use super::{MonitoringApi, PostgresConfig, Storage, StorageError};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Default name of the jobs table. `PostgresConfig::table_name` defaults to
@@ -567,62 +567,7 @@ impl PostgresStorage {
 }
 
 #[async_trait]
-impl Storage for PostgresStorage {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        let (state_name, state_data, arguments) = Self::job_to_row_values(job)?;
-        let metadata = if job.metadata.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                StorageError::SerializationError {
-                    message: format!("Failed to serialize metadata: {}", e),
-                }
-            })?)
-        };
-
-        let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
-            message: format!("Invalid job ID format: {}", e),
-        })?;
-
-        let query = format!(
-            r#"
-            INSERT INTO {} (
-                id, method_name, arguments, created_at, state_name, state_data,
-                queue_name, priority, max_retries, current_retries, metadata,
-                job_type, timeout_seconds, expires_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            "#,
-            self.table_name()
-        );
-
-        // Use handle_schema_error to wrap the database operation
-        self.handle_schema_error(
-            || async {
-                sqlx::query(&query)
-                    .bind(job_id)
-                    .bind(&job.method)
-                    .bind(&arguments)
-                    .bind(job.created_at)
-                    .bind(&state_name)
-                    .bind(&state_data)
-                    .bind(&job.queue)
-                    .bind(job.priority)
-                    .bind(job.max_retries as i32)
-                    .bind(job.attempt as i32)
-                    .bind(&metadata)
-                    .bind(&job.job_type)
-                    .bind(job.timeout_seconds.map(|t| t as i32))
-                    .bind(job.expires_at)
-                    .execute(&self.pool)
-                    .await
-            },
-            "enqueue",
-        )
-        .await?;
-
-        Ok(())
-    }
-
+impl MonitoringApi for PostgresStorage {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         let job_uuid = Uuid::from_str(job_id).map_err(|e| StorageError::InvalidJobData {
             message: format!("Invalid job ID format: {}", e),
@@ -839,6 +784,64 @@ impl Storage for PostgresStorage {
         }
 
         Ok(counts)
+    }
+}
+
+#[async_trait]
+impl Storage for PostgresStorage {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        let (state_name, state_data, arguments) = Self::job_to_row_values(job)?;
+        let metadata = if job.metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&job.metadata).map_err(|e| {
+                StorageError::SerializationError {
+                    message: format!("Failed to serialize metadata: {}", e),
+                }
+            })?)
+        };
+
+        let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
+            message: format!("Invalid job ID format: {}", e),
+        })?;
+
+        let query = format!(
+            r#"
+            INSERT INTO {} (
+                id, method_name, arguments, created_at, state_name, state_data,
+                queue_name, priority, max_retries, current_retries, metadata,
+                job_type, timeout_seconds, expires_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            "#,
+            self.table_name()
+        );
+
+        // Use handle_schema_error to wrap the database operation
+        self.handle_schema_error(
+            || async {
+                sqlx::query(&query)
+                    .bind(job_id)
+                    .bind(&job.method)
+                    .bind(&arguments)
+                    .bind(job.created_at)
+                    .bind(&state_name)
+                    .bind(&state_data)
+                    .bind(&job.queue)
+                    .bind(job.priority)
+                    .bind(job.max_retries as i32)
+                    .bind(job.attempt as i32)
+                    .bind(&metadata)
+                    .bind(&job.job_type)
+                    .bind(job.timeout_seconds.map(|t| t as i32))
+                    .bind(job.expires_at)
+                    .execute(&self.pool)
+                    .await
+            },
+            "enqueue",
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {

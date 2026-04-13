@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/queue-me-later/qml"
 keywords = ["background", "jobs", "async", "queue", "worker"]
 categories = ["asynchronous", "web-programming"]
-exclude = ["examples/*", "tests/*"]
+exclude = ["examples/*", "tests/*", "CLAUDE.md", "TODO.md"]
 
 [dependencies]
 tokio = { version = "1.47.1", features = ["full"] }

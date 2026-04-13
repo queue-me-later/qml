@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use chrono::Duration;
 use qml_rs::{
-    BackgroundJobServer, Job, JobState, MemoryStorage, MonitoringApi, ServerConfig, Storage,
-    Worker, WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, Job, JobState, MemoryStorage, ServerConfig, Storage, Worker,
+    WorkerContext, WorkerRegistry, WorkerResult,
 };
 
 struct CountingWorker {
@@ -80,12 +80,13 @@ async fn recurring_job_fires_on_cron_schedule_without_duplicates() {
     server_a.stop().await.unwrap();
     server_b.stop().await.unwrap();
 
-    // A 1-second cron over ~3 seconds should fire 2–3 times. Neither
-    // server should double-fire any tick.
+    // A 1-second cron over ~3.2 seconds fires 3 or 4 times depending on
+    // where the sleep window lands relative to the wall-clock second
+    // boundary. Neither server should double-fire any tick.
     let fired = count.load(Ordering::Relaxed);
     assert!(
-        (2..=3).contains(&fired),
-        "expected 2-3 firings, got {}",
+        (2..=4).contains(&fired),
+        "expected 2-4 firings, got {}",
         fired
     );
 

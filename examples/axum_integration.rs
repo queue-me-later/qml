@@ -18,7 +18,7 @@
 //! cargo run --example axum_integration
 //! curl -X POST http://127.0.0.1:3000/jobs \
 //!   -H 'Content-Type: application/json' \
-//!   -d '{"method": "send_email", "arguments": ["user@example.com"]}'
+//!   -d '{"method": "send_email", "payload": {"to": "user@example.com"}}'
 //! ```
 
 use axum::{
@@ -44,7 +44,8 @@ struct AppState {
 #[derive(Deserialize)]
 struct CreateJobRequest {
     method: String,
-    arguments: Vec<String>,
+    #[serde(default)]
+    payload: serde_json::Value,
     queue: Option<String>,
 }
 
@@ -52,7 +53,7 @@ struct CreateJobRequest {
 struct JobResponse {
     id: String,
     method: String,
-    arguments: Vec<String>,
+    payload: serde_json::Value,
     queue: String,
     state: String,
     created_at: String,
@@ -70,7 +71,7 @@ impl From<Job> for JobResponse {
         Self {
             id: job.id.to_string(),
             method: job.method,
-            arguments: job.arguments,
+            payload: job.payload,
             queue: job.queue,
             state: format!("{:?}", job.state),
             created_at: job.created_at.to_rfc3339(),
@@ -116,7 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("💡 Try creating a job:");
     println!("   curl -X POST http://127.0.0.1:3000/jobs \\");
     println!("     -H 'Content-Type: application/json' \\");
-    println!("     -d '{{\"method\": \"send_email\", \"arguments\": [\"user@example.com\"]}}'");
+    println!(
+        "     -d '{{\"method\": \"send_email\", \"payload\": {{\"to\": \"user@example.com\"}}}}'"
+    );
 
     axum::serve(listener, app).await?;
 
@@ -137,7 +140,7 @@ async fn create_job(
     Json(payload): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<JobResponse>), StatusCode> {
     // Create a new job
-    let mut job = Job::new(&payload.method, payload.arguments);
+    let mut job = Job::new(&payload.method, payload.payload);
 
     // Set queue if specified
     if let Some(queue) = payload.queue {
@@ -333,7 +336,7 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
 ✅ Runtime Configuration:
    ```rust
    async fn my_handler(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
-       let job = Job::new("process_data", vec!["data".to_string()]);
+       let job = Job::new("process_data", serde_json::json!({"data": "data"}));
        state.storage.enqueue(&job).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
        Ok(Json(serde_json::json!({"job_id": job.id.to_string()})))
    }

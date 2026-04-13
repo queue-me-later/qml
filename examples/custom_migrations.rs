@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 QML Embedded Schema Installation Demo");
     println!("=========================================");
     println!();
-    
+
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://postgres:password@localhost:5432/qml".to_string());
 
@@ -32,10 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Automatic installation (recommended for development)
     println!("🔄 Method 1: Automatic Schema Installation");
     println!("   Perfect for development and testing environments");
-    
+
     let auto_config = PostgresConfig::new()
         .with_database_url(database_url.clone())
-        .with_auto_migrate(true)        // Schema installs automatically
+        .with_auto_migrate(true) // Schema installs automatically
         .with_max_connections(10);
 
     match PostgresStorage::new(auto_config).await {
@@ -52,10 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Manual installation (recommended for production)
     println!("🔧 Method 2: Manual Schema Installation");
     println!("   Recommended for production environments");
-    
+
     let manual_config = PostgresConfig::new()
         .with_database_url(database_url.clone())
-        .with_auto_migrate(false)       // Manual control
+        .with_auto_migrate(false) // Manual control
         .with_max_connections(50)
         .with_min_connections(5)
         .with_connect_timeout(Duration::from_secs(10));
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match PostgresStorage::new(manual_config).await {
         Ok(storage) => {
             println!("   📡 Storage initialized without auto-migration");
-            
+
             // Check if schema exists
             match storage.schema_exists().await {
                 Ok(true) => {

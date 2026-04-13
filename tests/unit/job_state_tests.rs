@@ -8,14 +8,14 @@ fn test_job_state_names() {
     assert_eq!(JobState::enqueued("default").name(), "Enqueued");
     assert_eq!(JobState::processing("w1", "s1").name(), "Processing");
     assert_eq!(JobState::succeeded(100, None).name(), "Succeeded");
-    assert_eq!(JobState::failed("error", None, 1).name(), "Failed");
+    assert_eq!(JobState::failed("error", None).name(), "Failed");
     assert_eq!(JobState::deleted(None).name(), "Deleted");
     assert_eq!(
         JobState::scheduled(Utc::now(), "delayed").name(),
         "Scheduled"
     );
     assert_eq!(
-        JobState::awaiting_retry(Utc::now(), 1, "error").name(),
+        JobState::awaiting_retry(Utc::now(), "error").name(),
         "AwaitingRetry"
     );
 }
@@ -25,10 +25,10 @@ fn test_job_state_is_final() {
     assert!(!JobState::enqueued("default").is_final());
     assert!(!JobState::processing("w1", "s1").is_final());
     assert!(JobState::succeeded(100, None).is_final());
-    assert!(JobState::failed("error", None, 1).is_final());
+    assert!(JobState::failed("error", None).is_final());
     assert!(JobState::deleted(None).is_final());
     assert!(!JobState::scheduled(Utc::now(), "delayed").is_final());
-    assert!(!JobState::awaiting_retry(Utc::now(), 1, "error").is_final());
+    assert!(!JobState::awaiting_retry(Utc::now(), "error").is_final());
 }
 
 #[test]
@@ -36,10 +36,10 @@ fn test_job_state_is_active() {
     assert!(JobState::enqueued("default").is_active());
     assert!(JobState::processing("w1", "s1").is_active());
     assert!(!JobState::succeeded(100, None).is_active());
-    assert!(!JobState::failed("error", None, 1).is_active());
+    assert!(!JobState::failed("error", None).is_active());
     assert!(!JobState::deleted(None).is_active());
     assert!(JobState::scheduled(Utc::now(), "delayed").is_active());
-    assert!(JobState::awaiting_retry(Utc::now(), 1, "error").is_active());
+    assert!(JobState::awaiting_retry(Utc::now(), "error").is_active());
 }
 
 #[test]
@@ -47,10 +47,10 @@ fn test_valid_state_transitions() {
     let enqueued = JobState::enqueued("default");
     let processing = JobState::processing("worker1", "server1");
     let succeeded = JobState::succeeded(100, None);
-    let failed = JobState::failed("error", None, 1);
+    let failed = JobState::failed("error", None);
     let deleted = JobState::deleted(None);
     let scheduled = JobState::scheduled(Utc::now() + Duration::hours(1), "delayed");
-    let awaiting_retry = JobState::awaiting_retry(Utc::now() + Duration::minutes(5), 1, "error");
+    let awaiting_retry = JobState::awaiting_retry(Utc::now() + Duration::minutes(5), "error");
 
     // From Enqueued
     assert!(enqueued.can_transition_to(&processing));
@@ -143,17 +143,15 @@ fn test_job_state_creation_methods() {
     }
 
     // Test failed
-    let failed = JobState::failed("Test error", Some("Stack trace".to_string()), 2);
+    let failed = JobState::failed("Test error", Some("Stack trace".to_string()));
     if let JobState::Failed {
         exception,
         stack_trace,
-        retry_count,
         failed_at,
     } = failed
     {
         assert_eq!(exception, "Test error");
         assert_eq!(stack_trace, Some("Stack trace".to_string()));
-        assert_eq!(retry_count, 2);
         assert!((failed_at - now).num_seconds().abs() < 2);
     } else {
         panic!("Expected Failed state");
@@ -186,16 +184,14 @@ fn test_job_state_creation_methods() {
 
     // Test awaiting retry
     let retry_time = now + Duration::minutes(30);
-    let awaiting_retry = JobState::awaiting_retry(retry_time, 3, "Connection timeout");
+    let awaiting_retry = JobState::awaiting_retry(retry_time, "Connection timeout");
     if let JobState::AwaitingRetry {
         retry_at,
-        retry_count,
         last_exception,
         scheduled_at,
     } = awaiting_retry
     {
         assert_eq!(retry_at, retry_time);
-        assert_eq!(retry_count, 3);
         assert_eq!(last_exception, "Connection timeout");
         assert!((scheduled_at - now).num_seconds().abs() < 2);
     } else {
@@ -209,10 +205,10 @@ fn test_job_state_serialization() {
         JobState::enqueued("test"),
         JobState::processing("worker1", "server1"),
         JobState::succeeded(1000, Some("result".to_string())),
-        JobState::failed("error", None, 1),
+        JobState::failed("error", None),
         JobState::deleted(Some("reason".to_string())),
         JobState::scheduled(Utc::now() + Duration::hours(1), "delayed"),
-        JobState::awaiting_retry(Utc::now() + Duration::minutes(5), 2, "timeout"),
+        JobState::awaiting_retry(Utc::now() + Duration::minutes(5), "timeout"),
     ];
 
     for state in states {

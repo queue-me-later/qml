@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use crate::core::{Job, JobState};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 pub mod config;
 pub mod database_init;
@@ -22,7 +23,7 @@ pub use config::PostgresConfig;
 pub use config::RedisConfig;
 pub use config::{MemoryConfig, StorageConfig};
 #[cfg(feature = "postgres")]
-pub use database_init::{DatabaseInitializer, DatabaseInitError};
+pub use database_init::{DatabaseInitError, DatabaseInitializer};
 pub use error::StorageError;
 pub use memory::MemoryStorage;
 #[cfg(feature = "postgres")]
@@ -67,13 +68,13 @@ pub use redis::RedisStorage;
 ///
 /// ### Basic Storage Operations
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, Storage};
+/// use qml_rs::{MemoryStorage, Job, MonitoringApi, Storage};
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();
 ///
 /// // Create and store a job
-/// let job = Job::new("send_email", vec!["user@example.com".to_string()]);
+/// let job = Job::new("send_email", serde_json::json!(["user@example.com".to_string()]));
 /// storage.enqueue(&job).await.unwrap();
 ///
 /// // Retrieve the job
@@ -100,7 +101,7 @@ pub use redis::RedisStorage;
 ///
 /// // Enqueue some jobs
 /// for i in 0..5 {
-///     let job = Job::new("process_item", vec![i.to_string()]);
+///     let job = Job::new("process_item", serde_json::json!([i.to_string()]));
 ///     storage.enqueue(&job).await.unwrap();
 /// }
 ///
@@ -152,14 +153,14 @@ pub use redis::RedisStorage;
 ///
 /// ### Job Filtering and Statistics
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, JobState, Storage};
+/// use qml_rs::{MemoryStorage, Job, JobState, MonitoringApi, Storage};
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();
 ///
 /// // Create jobs in different states
-/// let mut job1 = Job::new("task1", vec![]);
-/// let mut job2 = Job::new("task2", vec![]);
+/// let mut job1 = Job::new("task1", serde_json::Value::Null);
+/// let mut job2 = Job::new("task2", serde_json::Value::Null);
 /// job2.set_state(JobState::processing("worker-1", "server-1")).unwrap();
 ///
 /// storage.enqueue(&job1).await.unwrap();
@@ -186,7 +187,7 @@ pub use redis::RedisStorage;
 /// # });
 /// ```
 #[async_trait]
-pub trait Storage: Send + Sync {
+pub trait Storage: MonitoringApi + Send + Sync {
     /// Store a new job in the storage backend.
     ///
     /// Persists a job to the storage system, making it available for processing.
@@ -208,7 +209,7 @@ pub trait Storage: Send + Sync {
     ///
     /// let job = Job::with_config(
     ///     "send_notification",
-    ///     vec!["user123".to_string()],
+    ///     serde_json::json!({ "user_id": "user123" }),
     ///     "notifications", // queue
     ///     5,              // priority
     ///     3               // max_retries
@@ -219,190 +220,6 @@ pub trait Storage: Send + Sync {
     /// # });
     /// ```
     async fn enqueue(&self, job: &Job) -> Result<(), StorageError>;
-
-    /// Retrieve a job by its unique identifier.
-    ///
-    /// Fetches a complete job record including all metadata, current state,
-    /// and configuration. Returns `None` if the job doesn't exist.
-    ///
-    /// ## Arguments
-    /// * `job_id` - The unique identifier of the job to retrieve
-    ///
-    /// ## Returns
-    /// * `Ok(Some(job))` - Job exists and was retrieved successfully
-    /// * `Ok(None)` - Job doesn't exist in storage
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let job = Job::new("process_data", vec!["file.csv".to_string()]);
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Retrieve the job
-    /// match storage.get(&job.id).await.unwrap() {
-    ///     Some(retrieved_job) => {
-    ///         println!("Found job: {} ({})", retrieved_job.id, retrieved_job.method);
-    ///     },
-    ///     None => println!("Job not found"),
-    /// }
-    /// # });
-    /// ```
-    async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError>;
-
-    /// Update an existing job's state and metadata.
-    ///
-    /// Modifies a job record in storage, typically used for state transitions
-    /// (e.g., Enqueued → Processing → Succeeded). The entire job record is updated.
-    ///
-    /// ## Arguments
-    /// * `job` - The job with updated information to persist
-    ///
-    /// ## Returns
-    /// * `Ok(())` - Job was updated successfully
-    /// * `Err(StorageError)` - Storage operation failed (job may not exist)
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, JobState, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let mut job = Job::new("process_order", vec!["order123".to_string()]);
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Update job state to processing
-    /// job.set_state(JobState::processing("worker-1", "server-1")).unwrap();
-    /// storage.update(&job).await.unwrap();
-    ///
-    /// // Add metadata and update again
-    /// job.add_metadata("processed_by", "worker-1");
-    /// storage.update(&job).await.unwrap();
-    /// # });
-    /// ```
-    async fn update(&self, job: &Job) -> Result<(), StorageError>;
-
-    /// Remove a job from storage (soft or hard delete).
-    ///
-    /// Deletes a job record from the storage system. Some implementations may
-    /// perform soft deletion (marking as deleted) while others perform hard deletion.
-    ///
-    /// ## Arguments
-    /// * `job_id` - The unique identifier of the job to delete
-    ///
-    /// ## Returns
-    /// * `Ok(true)` - Job existed and was deleted successfully
-    /// * `Ok(false)` - Job didn't exist (nothing to delete)
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let job = Job::new("cleanup_task", vec![]);
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Delete the job
-    /// let was_deleted = storage.delete(&job.id).await.unwrap();
-    /// assert!(was_deleted);
-    ///
-    /// // Verify it's gone
-    /// let retrieved = storage.get(&job.id).await.unwrap();
-    /// assert!(retrieved.is_none());
-    /// # });
-    /// ```
-    async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
-
-    /// List jobs with optional filtering and pagination.
-    ///
-    /// Retrieves multiple jobs from storage with optional filtering by state
-    /// and pagination support. Useful for building dashboards and monitoring tools.
-    ///
-    /// ## Arguments
-    /// * `state_filter` - Optional job state to filter by (e.g., only failed jobs)
-    /// * `limit` - Maximum number of jobs to return (None = no limit)
-    /// * `offset` - Number of jobs to skip for pagination (None = start from beginning)
-    ///
-    /// ## Returns
-    /// * `Ok(jobs)` - Vector of jobs matching the criteria
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, JobState, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Create several jobs
-    /// for i in 0..10 {
-    ///     let job = Job::new("task", vec![i.to_string()]);
-    ///     storage.enqueue(&job).await.unwrap();
-    /// }
-    ///
-    /// // List all jobs
-    /// let all_jobs = storage.list(None, None, None).await.unwrap();
-    /// println!("Total jobs: {}", all_jobs.len());
-    ///
-    /// // List first 5 jobs
-    /// let first_five = storage.list(None, Some(5), None).await.unwrap();
-    /// println!("First 5 jobs: {}", first_five.len());
-    ///
-    /// // List next 5 jobs (pagination)
-    /// let next_five = storage.list(None, Some(5), Some(5)).await.unwrap();
-    /// println!("Next 5 jobs: {}", next_five.len());
-    /// # });
-    /// ```
-    async fn list(
-        &self,
-        state_filter: Option<&JobState>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Get the count of jobs grouped by their current state.
-    ///
-    /// Returns statistics about job distribution across different states.
-    /// Useful for monitoring and dashboard displays.
-    ///
-    /// ## Returns
-    /// * `Ok(counts)` - HashMap mapping each job state to its count
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust,ignore
-    /// use qml_rs::{MemoryStorage, Job, JobState, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Create jobs in different states
-    /// let mut job1 = Job::new("task1", vec![]);
-    /// storage.enqueue(&job1).await.unwrap();
-    ///
-    /// let mut job2 = Job::new("task2", vec![]);
-    /// job2.set_state(JobState::processing("worker-1", "server-1")).unwrap();
-    /// storage.update(&job2).await.unwrap();
-    ///
-    /// // Get statistics
-    /// let counts = storage.get_job_counts().await;
-    /// match counts {
-    ///     Ok(counts) => for (state, count) in counts {
-    ///         println!("State {:?}: {} jobs", state, count);
-    ///     },
-    ///     Err(e) => println!("Error: {}", e),
-    /// }
-    /// # });
-    /// ```
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError>;
 
     /// Get jobs that are ready to be processed immediately.
     ///
@@ -425,7 +242,7 @@ pub trait Storage: Send + Sync {
     ///
     /// // Enqueue several jobs
     /// for i in 0..5 {
-    ///     let job = Job::new("process_item", vec![i.to_string()]);
+    ///     let job = Job::new("process_item", serde_json::json!([i.to_string()]));
     ///     storage.enqueue(&job).await.unwrap();
     /// }
     ///
@@ -439,6 +256,45 @@ pub trait Storage: Send + Sync {
     /// # });
     /// ```
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError>;
+
+    /// Fetch scheduled jobs whose `enqueue_at` has already passed.
+    ///
+    /// Storage backends are expected to push the time predicate down to the
+    /// engine (SQL WHERE, Redis ZRANGEBYSCORE, etc.) rather than loading every
+    /// scheduled job into memory. Results are ordered by priority (desc) then
+    /// `created_at` (asc) when the backend supports ordering.
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Fetch awaiting-retry jobs whose `retry_at` has already passed.
+    ///
+    /// Same contract as [`fetch_due_scheduled_jobs`] but for jobs in the
+    /// `AwaitingRetry` state.
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Recover jobs stranded in the `Processing` state by a previous server
+    /// instance.
+    ///
+    /// A job is considered stranded if its `Processing::started_at` is
+    /// earlier than `stale_before`. Matching jobs are transitioned back to
+    /// `Enqueued` (preserving their original `queue`) and any explicit locks
+    /// on them are cleared. Returns the number of jobs recovered.
+    ///
+    /// This is called by `BackgroundJobServer::start` on startup with
+    /// `stale_before = now - config.stale_processing_after`. `stale_before`
+    /// should comfortably exceed the typical job runtime so a worker that's
+    /// still alive on another server isn't fighting the sweep.
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError>;
 
     /// Atomically fetch and lock a job for processing to prevent race conditions.
     ///
@@ -473,7 +329,7 @@ pub trait Storage: Send + Sync {
     /// for i in 0..3 {
     ///     let job = Job::with_config(
     ///         "process_item",
-    ///         vec![i.to_string()],
+    ///         serde_json::json!({ "index": i }),
     ///         if i == 0 { "critical" } else { "normal" }, // different queues
     ///         i as i32,
     ///         3
@@ -526,7 +382,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let job = Job::new("exclusive_task", vec![]);
+    /// let job = Job::new("exclusive_task", serde_json::Value::Null);
     /// storage.enqueue(&job).await.unwrap();
     ///
     /// // Worker 1 tries to acquire lock
@@ -572,7 +428,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # tokio_test::block_on(async {
     /// let storage = MemoryStorage::new();
-    /// let job = Job::new("task_with_lock", vec![]);
+    /// let job = Job::new("task_with_lock", serde_json::Value::Null);
     /// storage.enqueue(&job).await.unwrap();
     ///
     /// // Acquire lock
@@ -615,7 +471,7 @@ pub trait Storage: Send + Sync {
     ///
     /// // Enqueue batch of jobs
     /// for i in 0..10 {
-    ///     let job = Job::new("batch_process", vec![i.to_string()]);
+    ///     let job = Job::new("batch_process", serde_json::json!({ "i": i }));
     ///     storage.enqueue(&job).await.unwrap();
     /// }
     ///
@@ -624,8 +480,7 @@ pub trait Storage: Send + Sync {
     /// println!("Worker-1 got {} jobs for batch processing", jobs.len());
     ///
     /// for job in jobs {
-    ///     println!("Processing job {} with argument: {}", job.id, job.arguments[0]);
-    ///     // All jobs are now locked and marked as processing
+    ///     println!("Processing job {} with payload: {}", job.id, job.payload);
     /// }
     /// # });
     /// ```
@@ -635,6 +490,123 @@ pub trait Storage: Send + Sync {
         limit: Option<usize>,
         queues: Option<&[String]>,
     ) -> Result<Vec<Job>, StorageError>;
+
+    /// Insert or update a [`RecurringJob`] template.
+    ///
+    /// Keyed by [`RecurringJob::id`]. Backends should upsert (insert on
+    /// first call, overwrite subsequent calls for the same id).
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError>;
+
+    /// Remove a recurring-job template by id.
+    ///
+    /// Returns `Ok(true)` if a row existed and was removed, `Ok(false)` if
+    /// the id was unknown.
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError>;
+
+    /// List recurring-job templates (for dashboards / operator tooling).
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError>;
+
+    /// Atomically claim recurring-job templates whose `next_run_at <= now`
+    /// and are `enabled`. Implementations must use locking (Postgres: `FOR
+    /// UPDATE SKIP LOCKED`, Redis: per-row `SET NX`) so two servers running
+    /// the poller cannot double-fire the same tick.
+    ///
+    /// Claimed rows are returned to the caller *before* `next_run_at` is
+    /// advanced — the caller is responsible for calling
+    /// [`RecurringJob::advance`] and then [`upsert_recurring_job`] to write
+    /// the new `next_run_at` back. The advance is done in-memory (not in
+    /// SQL) because cron expressions can't be computed by the database.
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError>;
+
+    /// Delete jobs whose `expires_at` is in the past.
+    ///
+    /// Called periodically by the cleanup worker. Backends should only
+    /// touch rows in a final state (Succeeded / Failed / Deleted) — in-
+    /// flight jobs should never carry an `expires_at`. Returns the number
+    /// of rows removed.
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
+
+    // ---------------------------------------------------------------------
+    // D1: server heartbeats + dead-server detection
+    // ---------------------------------------------------------------------
+
+    /// Insert or update a live [`ServerInfo`] registration. Called once on
+    /// [`BackgroundJobServer::start`](crate::processing::BackgroundJobServer::start)
+    /// when heartbeats are enabled. Backends should upsert (replace on
+    /// duplicate `server_id`).
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError>;
+
+    /// Bump `last_heartbeat` for a previously-registered `server_id`.
+    /// Returns `Ok(true)` if the row existed and was updated, `Ok(false)`
+    /// if the server was not registered (or had already been reclaimed).
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError>;
+
+    /// Remove a server registration. Called from `stop()` on graceful
+    /// shutdown, and by peers after reclaiming a dead server's jobs.
+    /// Returns `Ok(true)` if a row existed and was deleted.
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError>;
+
+    /// Return every server whose `last_heartbeat < stale_before`. Peers
+    /// call this to find servers that have likely crashed.
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError>;
+
+    /// Re-queue every `Processing` job whose
+    /// [`JobState::Processing::server_name`] matches `server_id`, returning
+    /// the number of jobs moved back to `Enqueued`. Used by the heartbeat
+    /// worker to actively reclaim a dead peer's in-flight work rather than
+    /// waiting for lock-expiry or the next startup sweep.
+    ///
+    /// This is idempotent: a second call after the first reclaim sees zero
+    /// matching `Processing` rows and returns 0.
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError>;
+
+    // -- D2: generic named distributed locks -----------------------------
+
+    /// Try to acquire a named distributed lock.
+    ///
+    /// `resource` is the lock key (arbitrary user-chosen string).
+    /// `owner` identifies the holder (e.g. `server_id`, `worker_id`, or a
+    /// caller-supplied token). `ttl` is how long the lock lives before
+    /// another owner can take it over.
+    ///
+    /// Semantics:
+    /// - If no row exists for `resource`, the lock is created and
+    ///   `Ok(true)` is returned.
+    /// - If a row exists but `expires_at` is in the past, it is taken
+    ///   over (`owner` and `expires_at` overwritten) and `Ok(true)` is
+    ///   returned.
+    /// - If a row exists, is not expired, and is held by the same
+    ///   `owner`, the `expires_at` is refreshed and `Ok(true)` is
+    ///   returned (re-entrant / extend).
+    /// - Otherwise returns `Ok(false)`.
+    ///
+    /// This is a separate mechanism from [`Storage::try_acquire_job_lock`]
+    /// — job locks live on the job row so fetch-and-lock remains a single
+    /// atomic `UPDATE ... RETURNING`. Generic locks exist for user-facing
+    /// "at most one instance of X" semantics (e.g. a recurring report
+    /// that must not overlap with itself).
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError>;
+
+    /// Release a named lock. Only the current `owner` can release.
+    /// Returns `Ok(true)` if a matching row was deleted, `Ok(false)` if
+    /// no row existed or it was owned by someone else.
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError>;
 }
 
 /// Storage instance that can hold any storage implementation
@@ -774,18 +746,45 @@ impl StorageInstance {
     }
 }
 
+/// Dashboard-facing subset of storage operations.
+///
+/// [`MonitoringApi`] carves out the five methods the Axum dashboard and its
+/// [`DashboardService`](crate::dashboard::DashboardService) actually touch
+/// (`get`, `update`, `delete`, `list`, `get_job_counts`) so that dashboard
+/// tests can be written against a ~100-line fake instead of a full
+/// [`Storage`] backend. Every real [`Storage`] implementation is also a
+/// [`MonitoringApi`], so callers holding an `Arc<dyn Storage>` can pass it
+/// anywhere an `Arc<dyn MonitoringApi>` is expected via trait upcasting.
+///
+/// The trait deliberately includes `update` and `delete` even though they
+/// mutate state — the dashboard needs them for its retry-job and delete-job
+/// actions, and pretending they're read-only would force callers back onto
+/// the full [`Storage`] trait and defeat the testing payoff.
 #[async_trait]
-impl Storage for StorageInstance {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.enqueue(job).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.enqueue(job).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.enqueue(job).await,
-        }
-    }
+pub trait MonitoringApi: Send + Sync {
+    /// Retrieve a job by its unique identifier.
+    async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError>;
 
+    /// Update an existing job's state and metadata.
+    async fn update(&self, job: &Job) -> Result<(), StorageError>;
+
+    /// Remove a job from storage (soft or hard delete).
+    async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
+
+    /// List jobs with optional filtering and pagination.
+    async fn list(
+        &self,
+        state_filter: Option<&JobState>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Get the count of jobs grouped by their current state.
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError>;
+}
+
+#[async_trait]
+impl MonitoringApi for StorageInstance {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         match self {
             StorageInstance::Memory(storage) => storage.get(job_id).await,
@@ -831,13 +830,26 @@ impl Storage for StorageInstance {
         }
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         match self {
             StorageInstance::Memory(storage) => storage.get_job_counts().await,
             #[cfg(feature = "redis")]
             StorageInstance::Redis(storage) => storage.get_job_counts().await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.get_job_counts().await,
+        }
+    }
+}
+
+#[async_trait]
+impl Storage for StorageInstance {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.enqueue(job).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.enqueue(job).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.enqueue(job).await,
         }
     }
 
@@ -848,6 +860,49 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.get_available_jobs(limit).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.get_available_jobs(limit).await,
+        }
+    }
+
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.fetch_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.fetch_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.fetch_due_scheduled_jobs(now, limit).await
+            }
+        }
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+        }
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.requeue_stranded_jobs(stale_before).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.requeue_stranded_jobs(stale_before).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.requeue_stranded_jobs(stale_before).await,
         }
     }
 
@@ -928,6 +983,148 @@ impl Storage for StorageInstance {
                     .fetch_available_jobs_atomic(worker_id, limit, queues)
                     .await
             }
+        }
+    }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.upsert_recurring_job(job).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.upsert_recurring_job(job).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.upsert_recurring_job(job).await,
+        }
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.remove_recurring_job(id).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.remove_recurring_job(id).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.remove_recurring_job(id).await,
+        }
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.list_recurring_jobs().await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.list_recurring_jobs().await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.list_recurring_jobs().await,
+        }
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.fetch_due_recurring_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.fetch_due_recurring_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.fetch_due_recurring_jobs(now, limit).await
+            }
+        }
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.delete_expired_jobs(now).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.delete_expired_jobs(now).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.delete_expired_jobs(now).await,
+        }
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.register_server(info).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.register_server(info).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.register_server(info).await,
+        }
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.heartbeat_server(server_id, now).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.heartbeat_server(server_id, now).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.heartbeat_server(server_id, now).await,
+        }
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.deregister_server(server_id).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.deregister_server(server_id).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.deregister_server(server_id).await,
+        }
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.list_dead_servers(stale_before).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.list_dead_servers(stale_before).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.list_dead_servers(stale_before).await,
+        }
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.reclaim_jobs_from_server(server_id).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.reclaim_jobs_from_server(server_id).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.reclaim_jobs_from_server(server_id).await,
+        }
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => {
+                storage.try_acquire_lock(resource, owner, ttl).await
+            }
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.try_acquire_lock(resource, owner, ttl).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.try_acquire_lock(resource, owner, ttl).await
+            }
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.release_lock(resource, owner).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.release_lock(resource, owner).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.release_lock(resource, owner).await,
         }
     }
 }

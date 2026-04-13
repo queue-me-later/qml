@@ -5,9 +5,9 @@
 //! directly in the binary and only requires the 'postgres' feature to be enabled.
 
 #[cfg(feature = "postgres")]
-use qml_rs::{Job, Storage};
-#[cfg(feature = "postgres")]
 use qml_rs::storage::{PostgresConfig, PostgresStorage, StorageError};
+#[cfg(feature = "postgres")]
+use qml_rs::{Job, Storage};
 #[cfg(feature = "postgres")]
 use std::time::Duration;
 #[cfg(feature = "postgres")]
@@ -16,9 +16,9 @@ use tracing::{info, warn};
 #[cfg(feature = "postgres")]
 #[derive(Debug)]
 pub enum MigrationStrategy {
-    Development,    // Auto-migrate everything with embedded schema
-    Production,     // Manual migration control with embedded schema
-    Testing,        // Minimal resources with embedded schema
+    Development, // Auto-migrate everything with embedded schema
+    Production,  // Manual migration control with embedded schema
+    Testing,     // Minimal resources with embedded schema
 }
 
 #[cfg(feature = "postgres")]
@@ -32,13 +32,16 @@ impl DatabaseManager {
     /// Create a new DatabaseManager with the specified strategy
     ///
     /// All strategies now use the embedded install.sql schema - no external files needed!
-    pub async fn new(database_url: String, strategy: MigrationStrategy) -> Result<Self, StorageError> {
+    pub async fn new(
+        database_url: String,
+        strategy: MigrationStrategy,
+    ) -> Result<Self, StorageError> {
         let config = match strategy {
             MigrationStrategy::Development => {
                 info!("🚀 Development strategy: Auto-migration enabled with embedded schema");
                 PostgresConfig::new()
                     .with_database_url(database_url)
-                    .with_auto_migrate(true)        // Auto-install embedded schema
+                    .with_auto_migrate(true) // Auto-install embedded schema
                     .with_max_connections(10)
                     .with_min_connections(2)
             }
@@ -46,7 +49,7 @@ impl DatabaseManager {
                 info!("🏭 Production strategy: Manual migration control with embedded schema");
                 PostgresConfig::new()
                     .with_database_url(database_url)
-                    .with_auto_migrate(false)       // Manual control for production
+                    .with_auto_migrate(false) // Manual control for production
                     .with_max_connections(50)
                     .with_min_connections(5)
                     .with_connect_timeout(Duration::from_secs(10))
@@ -55,7 +58,7 @@ impl DatabaseManager {
                 info!("🧪 Testing strategy: Minimal resources with embedded schema");
                 PostgresConfig::new()
                     .with_database_url(database_url)
-                    .with_auto_migrate(true)        // Auto-install for fast tests
+                    .with_auto_migrate(true) // Auto-install for fast tests
                     .with_max_connections(2)
                     .with_min_connections(1)
             }
@@ -92,7 +95,7 @@ impl DatabaseManager {
     /// Perform health check
     pub async fn health_check(&self) -> Result<(), StorageError> {
         info!("🏥 Running health check...");
-        
+
         // Check schema exists
         if !self.storage.schema_exists().await? {
             return Err(StorageError::Configuration {
@@ -101,9 +104,12 @@ impl DatabaseManager {
         }
 
         // Test basic operations
-        let test_job = Job::new("health_check".to_string(), vec!["test".to_string()]);
+        let test_job = Job::new(
+            "health_check".to_string(),
+            serde_json::json!(["test".to_string()]),
+        );
         self.storage.enqueue(&test_job).await?;
-        
+
         // Basic validation - just test that we can enqueue
         info!("✅ Basic job enqueue test passed");
 
@@ -139,15 +145,15 @@ async fn demo() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         println!("📊 Testing strategy: {:?}", strategy);
         println!("   Features: Embedded schema installation, no external files required");
-        
+
         let db_manager = DatabaseManager::new(database_url.clone(), strategy).await?;
-        
+
         // Ensure schema is properly installed
         db_manager.ensure_schema().await?;
-        
+
         // Run health check
         db_manager.health_check().await?;
-        
+
         println!("   ✅ Strategy completed successfully");
         println!();
     }

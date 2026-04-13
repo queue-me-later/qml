@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::core::JobState;
+use crate::core::{JobState, JobStateKind};
 use crate::error::QmlError;
-use crate::storage::Storage;
+use crate::storage::MonitoringApi;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatistics {
@@ -52,11 +52,11 @@ pub struct ServerStatistics {
 }
 
 pub struct DashboardService {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn MonitoringApi>,
 }
 
 impl DashboardService {
-    pub fn new(storage: Arc<dyn Storage>) -> Self {
+    pub fn new(storage: Arc<dyn MonitoringApi>) -> Self {
         Self { storage }
     }
 
@@ -76,16 +76,16 @@ impl DashboardService {
                     deleted: 0,
                 };
 
-                for (state, count) in counts {
+                for (kind, count) in counts {
                     stats.total_jobs += count as u64;
-                    match state {
-                        JobState::Enqueued { .. } => stats.enqueued += count as u64,
-                        JobState::Processing { .. } => stats.processing += count as u64,
-                        JobState::Succeeded { .. } => stats.succeeded += count as u64,
-                        JobState::Failed { .. } => stats.failed += count as u64,
-                        JobState::Scheduled { .. } => stats.scheduled += count as u64,
-                        JobState::AwaitingRetry { .. } => stats.awaiting_retry += count as u64,
-                        JobState::Deleted { .. } => stats.deleted += count as u64,
+                    match kind {
+                        JobStateKind::Enqueued => stats.enqueued += count as u64,
+                        JobStateKind::Processing => stats.processing += count as u64,
+                        JobStateKind::Succeeded => stats.succeeded += count as u64,
+                        JobStateKind::Failed => stats.failed += count as u64,
+                        JobStateKind::Scheduled => stats.scheduled += count as u64,
+                        JobStateKind::AwaitingRetry => stats.awaiting_retry += count as u64,
+                        JobStateKind::Deleted => stats.deleted += count as u64,
                     }
                 }
 

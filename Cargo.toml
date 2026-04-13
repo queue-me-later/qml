@@ -1,6 +1,6 @@
 [package]
 name = "qml-rs"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 authors = ["QML Contributors"]
 description = "A Rust implementation of QML background job processing"
@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/queue-me-later/qml"
 keywords = ["background", "jobs", "async", "queue", "worker"]
 categories = ["asynchronous", "web-programming"]
-exclude = ["examples/*", "tests/*"]
+exclude = ["examples/*", "tests/*", "CLAUDE.md", "TODO.md"]
 
 [dependencies]
 tokio = { version = "1.47.1", features = ["full"] }
@@ -24,16 +24,15 @@ redis = { version = "0.32.4", features = [
     "tokio-comp",
     "connection-manager",
 ], optional = true }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 fastrand = "2.3"
+cron = "0.16"
 
-# Dashboard and web server dependencies
-axum = { version = "0.8.4", features = ["ws"] }
-tower = "0.5"
-tower-http = { version = "0.6.6", features = ["cors", "fs"] }
-hyper = { version = "1.0", features = ["full"] }
-tokio-tungstenite = "0.27.0"                                  # For WebSocket support
-futures-util = "0.3"
+# Dashboard and web server dependencies (gated behind the `dashboard` feature)
+axum = { version = "0.8.4", features = ["ws"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6.6", features = ["cors", "fs"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # PostgreSQL storage support
 sqlx = { version = "0.8", features = [
@@ -44,6 +43,11 @@ sqlx = { version = "0.8", features = [
     "uuid",
     "json",
 ], optional = true }
+
+# Prometheus metrics (feature = "metrics"). Default features off — we don't
+# need the `push` client, process stats (pulls in libc/procfs), or the
+# protobuf encoder; the text encoder is always compiled.
+prometheus = { version = "0.14", default-features = false, optional = true }
 # Future cron job support
 # cron = { version = "0.12", optional = true }
 
@@ -57,6 +61,13 @@ default = []
 # Storage backend features
 postgres = ["sqlx"]
 redis = ["dep:redis"]
+# Built-in HTTP dashboard (axum + tower + WebSocket UI). Off by default so
+# headless workers don't pay the compile cost of pulling in axum/tower.
+dashboard = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
+# Prometheus metrics: provides a `PrometheusMetrics` registry + a
+# `PrometheusMiddleware` for the F1 middleware stack, plus a `/metrics`
+# route on the dashboard when combined with the `dashboard` feature.
+metrics = ["dep:prometheus"]
 # Future features for later phases
 # cron-jobs = ["cron"]
 
@@ -71,15 +82,35 @@ path = "examples/storage_demo.rs"
 [[example]]
 name = "dashboard_demo"
 path = "examples/dashboard_demo.rs"
+required-features = ["dashboard"]
 
 [[example]]
 name = "processing_demo"
 path = "examples/processing_demo.rs"
 
 [[example]]
+name = "middleware_metrics"
+path = "examples/middleware_metrics.rs"
+
+[[example]]
+name = "metrics_demo"
+path = "examples/metrics_demo.rs"
+required-features = ["metrics"]
+
+[[example]]
 name = "postgres_simple"
 path = "examples/postgres_simple.rs"
+required-features = ["postgres"]
 
 [[example]]
 name = "custom_migrations"
 path = "examples/custom_migrations.rs"
+required-features = ["postgres"]
+
+# Demonstrates embedding qml-rs inside a user's own axum app. The example
+# imports axum directly, so it needs the `dashboard` feature (which is what
+# pulls axum into the dependency graph).
+[[example]]
+name = "axum_integration"
+path = "examples/axum_integration.rs"
+required-features = ["dashboard"]

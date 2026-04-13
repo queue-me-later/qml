@@ -5,6 +5,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for worker instances
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,16 +16,10 @@ pub struct WorkerConfig {
     pub server_name: String,
     /// Queues that this worker will process
     pub queues: Vec<String>,
-    /// Maximum number of concurrent jobs this worker can handle
-    pub concurrency: usize,
     /// Timeout for job execution
     pub job_timeout: Duration,
     /// Polling interval for checking new jobs
     pub polling_interval: Duration,
-    /// Whether to automatically retry failed jobs
-    pub auto_retry: bool,
-    /// Maximum number of retry attempts
-    pub max_retries: u32,
 }
 
 impl Default for WorkerConfig {
@@ -33,11 +28,8 @@ impl Default for WorkerConfig {
             worker_id: uuid::Uuid::new_v4().to_string(),
             server_name: "default".to_string(),
             queues: vec!["default".to_string()],
-            concurrency: 5,
             job_timeout: Duration::minutes(5),
             polling_interval: Duration::seconds(1),
-            auto_retry: true,
-            max_retries: 3,
         }
     }
 }
@@ -63,12 +55,6 @@ impl WorkerConfig {
         self
     }
 
-    /// Set the concurrency level
-    pub fn concurrency(mut self, concurrency: usize) -> Self {
-        self.concurrency = concurrency;
-        self
-    }
-
     /// Set the job timeout
     pub fn job_timeout(mut self, timeout: Duration) -> Self {
         self.job_timeout = timeout;
@@ -78,18 +64,6 @@ impl WorkerConfig {
     /// Set the polling interval
     pub fn polling_interval(mut self, interval: Duration) -> Self {
         self.polling_interval = interval;
-        self
-    }
-
-    /// Set auto retry behavior
-    pub fn auto_retry(mut self, auto_retry: bool) -> Self {
-        self.auto_retry = auto_retry;
-        self
-    }
-
-    /// Set maximum retry attempts
-    pub fn max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
         self
     }
 }
@@ -107,10 +81,29 @@ pub struct WorkerContext {
     pub attempt: u32,
     /// Previous exception if this is a retry
     pub previous_exception: Option<String>,
+    /// Cancellation token for cooperative shutdown. A long-running worker
+    /// impl can race its work against this token to drop out cleanly when
+    /// the server is asked to stop:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     _ = ctx.cancel.cancelled() => Ok(WorkerResult::retry(
+    ///         "shutting down".into(),
+    ///         None,
+    ///     )),
+    ///     res = do_expensive_work() => res,
+    /// }
+    /// ```
+    ///
+    /// The token is a child of the `BackgroundJobServer` shutdown token, so
+    /// calling `server.stop()` flips every context in flight.
+    pub cancel: CancellationToken,
 }
 
 impl WorkerContext {
-    /// Create a new worker context
+    /// Create a new worker context with a detached cancellation token. The
+    /// server installs a real, shutdown-linked token via
+    /// `WorkerContext::with_cancel`.
     pub fn new(config: WorkerConfig) -> Self {
         Self {
             config,
@@ -118,6 +111,7 @@ impl WorkerContext {
             execution_metadata: HashMap::new(),
             attempt: 1,
             previous_exception: None,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -133,7 +127,15 @@ impl WorkerContext {
             execution_metadata: HashMap::new(),
             attempt,
             previous_exception,
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Override the cancellation token. Builder-style so the server can
+    /// install the shutdown-linked child token.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// Add execution metadata

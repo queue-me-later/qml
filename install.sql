@@ -15,8 +15,10 @@ CREATE TABLE IF NOT EXISTS qml.qml_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     method_name VARCHAR(255) NOT NULL,
     arguments JSONB NOT NULL DEFAULT '[]'::jsonb,
-    -- Job state management
-    state_name VARCHAR(50) NOT NULL DEFAULT 'pending',
+    -- Job state management. state_name is the serde discriminant of
+    -- JobState (enqueued, processing, succeeded, failed, deleted, scheduled,
+    -- awaiting_retry); state_data carries the variant's fields as JSONB.
+    state_name VARCHAR(50) NOT NULL DEFAULT 'enqueued',
     state_data JSONB NOT NULL DEFAULT '{}'::jsonb,
     -- Queue and priority management
     queue_name VARCHAR(255) NOT NULL DEFAULT 'default',
@@ -75,6 +77,78 @@ CREATE INDEX IF NOT EXISTS idx_qml_jobs_job_type ON qml.qml_jobs(job_type) WHERE
 CREATE INDEX IF NOT EXISTS idx_qml_jobs_job_type ON qml.qml_jobs(job_type) WHERE job_type IS NOT NULL;
 
 -- =========================================================================
+-- RECURRING JOB TEMPLATES (R1)
+-- =========================================================================
+
+-- Recurring job templates. The RecurringJobPoller claims rows whose
+-- `next_run_at <= now()` using FOR UPDATE SKIP LOCKED so two servers
+-- cannot double-fire the same tick.
+CREATE TABLE IF NOT EXISTS qml.qml_recurring_jobs (
+    id TEXT PRIMARY KEY,
+    cron TEXT NOT NULL,
+    method TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT 'null'::jsonb,
+    queue TEXT NOT NULL DEFAULT 'default',
+    next_run_at TIMESTAMPTZ NOT NULL,
+    last_run_at TIMESTAMPTZ DEFAULT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_qml_recurring_next_run_at
+    ON qml.qml_recurring_jobs(next_run_at)
+    WHERE enabled = TRUE;
+
+COMMENT ON TABLE qml.qml_recurring_jobs IS
+    'Cron-scheduled job templates materialized into qml_jobs by the RecurringJobPoller';
+
+-- =========================================================================
+-- SERVER HEARTBEATS (D1)
+-- =========================================================================
+
+-- Live server registry. Every BackgroundJobServer with heartbeats enabled
+-- inserts one row and bumps `last_heartbeat` on a fixed interval. Peers
+-- scan for rows whose `last_heartbeat` is older than the dead-server
+-- timeout and reclaim their in-flight Processing jobs.
+CREATE TABLE IF NOT EXISTS qml.qml_servers (
+    server_id TEXT PRIMARY KEY,
+    server_name TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    worker_count INTEGER NOT NULL DEFAULT 0,
+    queues TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]
+);
+
+CREATE INDEX IF NOT EXISTS idx_qml_servers_last_heartbeat
+    ON qml.qml_servers(last_heartbeat);
+
+COMMENT ON TABLE qml.qml_servers IS
+    'Live server registry: running BackgroundJobServers register here and bump last_heartbeat periodically so peers can reclaim jobs from crashed servers';
+
+-- =========================================================================
+-- GENERIC NAMED LOCKS (D2)
+-- =========================================================================
+
+-- Generic named distributed locks, keyed by a user-provided `resource`
+-- string. Separate from the per-job locks on qml_jobs — those stay on
+-- the job row so fetch-and-lock remains a single UPDATE RETURNING.
+-- This table exists for user-facing "don't run two instances of X"
+-- semantics (e.g. at-most-one recurring report).
+CREATE TABLE IF NOT EXISTS qml.qml_locks (
+    resource TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_qml_locks_expires_at
+    ON qml.qml_locks(expires_at);
+
+COMMENT ON TABLE qml.qml_locks IS
+    'Generic named distributed locks acquired via Storage::try_acquire_lock. Re-entrant for the same owner; takeover is allowed once expires_at is in the past.';
+
+-- =========================================================================
 -- TRIGGERS AND FUNCTIONS
 -- =========================================================================
 
@@ -93,25 +167,6 @@ CREATE TRIGGER trigger_update_qml_jobs_updated_at
     BEFORE UPDATE ON qml.qml_jobs
     FOR EACH ROW
     EXECUTE FUNCTION qml.update_updated_at_column();
-
--- =========================================================================
--- JOB STATE ENUM (Optional - for type safety)
--- =========================================================================
-
--- Create job state enum type for better type safety
-DO $$ BEGIN
-    CREATE TYPE qml.job_state AS ENUM (
-        'pending',      -- Job is waiting to be processed
-        'running',      -- Job is currently being processed
-        'completed',    -- Job completed successfully
-        'failed',       -- Job failed and won't be retried
-        'cancelled',    -- Job was cancelled
-        'retrying',     -- Job failed but will be retried
-        'scheduled'     -- Job is scheduled for future execution
-    );
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END $$;
 
 -- =========================================================================
 -- DISTRIBUTED JOB LOCKING FUNCTIONS
@@ -185,39 +240,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to get next available job with locking
-CREATE OR REPLACE FUNCTION qml.get_next_job(
-    p_worker_id VARCHAR(255),
-    p_queue_names VARCHAR(255)[] DEFAULT ARRAY['default'],
-    p_lock_duration INTERVAL DEFAULT '5 minutes'::interval
-) RETURNS TABLE(job_id UUID, method_name VARCHAR, arguments JSONB) AS $$
-DECLARE
-    selected_job_id UUID;
-BEGIN
-    -- Find and lock the next available job atomically
-    SELECT id INTO selected_job_id
-    FROM qml.qml_jobs
-    WHERE
-        state_name = 'pending'
-        AND queue_name = ANY(p_queue_names)
-        AND (scheduled_at IS NULL OR scheduled_at <= NOW())
-        AND (locked_by IS NULL OR lock_expires_at < NOW())
-    ORDER BY priority DESC, created_at ASC
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED;
-
-    -- If we found a job, try to acquire the lock
-    IF selected_job_id IS NOT NULL THEN
-        IF qml.acquire_job_lock(selected_job_id, p_worker_id, p_lock_duration) THEN
-            -- Return the job details
-            RETURN QUERY
-            SELECT j.id, j.method_name, j.arguments
-            FROM qml.qml_jobs j
-            WHERE j.id = selected_job_id;
-        END IF;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
+-- Note: job fetch-and-lock lives in the Rust storage layer — a single
+-- UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *
+-- in PostgresStorage::fetch_and_lock_job. No stored procedure is needed.
 
 -- =========================================================================
 -- TABLE AND COLUMN DOCUMENTATION
@@ -251,7 +276,6 @@ COMMENT ON COLUMN qml.qml_jobs.lock_expires_at IS 'When the current job lock exp
 COMMENT ON FUNCTION qml.acquire_job_lock IS 'Atomically acquire a distributed lock on a job';
 COMMENT ON FUNCTION qml.release_job_lock IS 'Release a job lock held by a specific worker';
 COMMENT ON FUNCTION qml.cleanup_expired_locks IS 'Clean up all expired job locks (maintenance)';
-COMMENT ON FUNCTION qml.get_next_job IS 'Get and lock the next available job for processing';
 COMMENT ON FUNCTION qml.update_updated_at_column IS 'Trigger function to automatically update updated_at timestamp';
 
 -- =========================================================================
@@ -263,8 +287,8 @@ DO $$
 BEGIN
     RAISE NOTICE 'QML PostgreSQL schema installation completed successfully';
     RAISE NOTICE 'Schema: qml';
-    RAISE NOTICE 'Tables: qml_jobs';
-    RAISE NOTICE 'Functions: acquire_job_lock, release_job_lock, cleanup_expired_locks, get_next_job';
+    RAISE NOTICE 'Tables: qml_jobs, qml_recurring_jobs, qml_servers, qml_locks';
+    RAISE NOTICE 'Functions: acquire_job_lock, release_job_lock, cleanup_expired_locks';
     RAISE NOTICE 'Triggers: automatic updated_at timestamp';
     RAISE NOTICE 'Ready for production job processing with distributed locking support';
 END

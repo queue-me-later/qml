@@ -15,15 +15,35 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use qml_rs::{
-    BackgroundJobServer, Job, JobScheduler, RetryPolicy, RetryStrategy, ServerConfig, Storage,
-    StorageInstance, Worker, WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, Job, JobScheduler, MonitoringApi, RetryPolicy, RetryStrategy,
+    ServerConfig, Storage, StorageInstance, TypedWorker, WorkerContext, WorkerRegistry,
+    WorkerResult,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmailArgs {
+    to: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaymentArgs {
+    order_id: String,
+    amount: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReportArgs {
+    report_type: String,
+    period: String,
+}
 
 // Example workers for different job types
 struct EmailWorker {
@@ -44,30 +64,32 @@ impl EmailWorker {
 }
 
 #[async_trait]
-impl Worker for EmailWorker {
-    async fn execute(&self, job: &Job, context: &WorkerContext) -> qml_rs::Result<WorkerResult> {
-        let email = &job.arguments[0];
-        let _message = &job.arguments[1];
+impl TypedWorker for EmailWorker {
+    type Args = EmailArgs;
 
-        info!("Sending email to {} (attempt {})", email, context.attempt);
+    async fn execute(
+        &self,
+        args: Self::Args,
+        context: &WorkerContext,
+    ) -> qml_rs::Result<WorkerResult> {
+        info!("Sending email to {} (attempt {})", args.to, context.attempt);
 
         // Simulate email sending with potential failure
-        if email.contains("fail") && context.attempt < 3 {
-            warn!("Email sending failed for {}, will retry", email);
+        if args.to.contains("fail") && context.attempt < 3 {
+            warn!("Email sending failed for {}, will retry", args.to);
             return Ok(WorkerResult::retry(
-                format!("SMTP error for {}", email),
+                format!("SMTP error for {}", args.to),
                 Some(Utc::now() + Duration::seconds(5)),
             ));
         }
 
-        // Simulate processing time
         sleep(std::time::Duration::from_millis(100)).await;
 
         self.sent_count.fetch_add(1, Ordering::Relaxed);
-        info!("Email sent successfully to {}", email);
+        info!("Email sent successfully to {}", args.to);
 
         Ok(WorkerResult::success(
-            Some(format!("Email sent to {}", email)),
+            Some(format!("Email sent to {}", args.to)),
             context.duration().num_milliseconds() as u64,
         ))
     }
@@ -95,30 +117,34 @@ impl PaymentWorker {
 }
 
 #[async_trait]
-impl Worker for PaymentWorker {
-    async fn execute(&self, job: &Job, _context: &WorkerContext) -> qml_rs::Result<WorkerResult> {
-        let order_id = &job.arguments[0];
-        let amount = &job.arguments[1];
+impl TypedWorker for PaymentWorker {
+    type Args = PaymentArgs;
 
+    async fn execute(
+        &self,
+        args: Self::Args,
+        _context: &WorkerContext,
+    ) -> qml_rs::Result<WorkerResult> {
         info!(
             "Processing payment for order {} amount {}",
-            order_id, amount
+            args.order_id, args.amount
         );
 
-        // Simulate payment processing
         sleep(std::time::Duration::from_millis(200)).await;
 
-        // Simulate occasional permanent failures for invalid amounts
-        if amount.parse::<f64>().is_err() {
-            error!("Invalid payment amount: {}", amount);
-            return Ok(WorkerResult::failure(format!("Invalid amount: {}", amount)));
+        if args.amount.parse::<f64>().is_err() {
+            error!("Invalid payment amount: {}", args.amount);
+            return Ok(WorkerResult::failure(format!(
+                "Invalid amount: {}",
+                args.amount
+            )));
         }
 
         self.processed_count.fetch_add(1, Ordering::Relaxed);
-        info!("Payment processed successfully for order {}", order_id);
+        info!("Payment processed successfully for order {}", args.order_id);
 
         Ok(WorkerResult::success(
-            Some(format!("Payment {} processed", order_id)),
+            Some(format!("Payment {} processed", args.order_id)),
             200,
         ))
     }
@@ -131,20 +157,28 @@ impl Worker for PaymentWorker {
 struct ReportWorker;
 
 #[async_trait]
-impl Worker for ReportWorker {
-    async fn execute(&self, job: &Job, _context: &WorkerContext) -> qml_rs::Result<WorkerResult> {
-        let report_type = &job.arguments[0];
-        let period = &job.arguments[1];
+impl TypedWorker for ReportWorker {
+    type Args = ReportArgs;
 
-        info!("Generating {} report for period {}", report_type, period);
+    async fn execute(
+        &self,
+        args: Self::Args,
+        _context: &WorkerContext,
+    ) -> qml_rs::Result<WorkerResult> {
+        info!(
+            "Generating {} report for period {}",
+            args.report_type, args.period
+        );
 
-        // Simulate long-running report generation
         sleep(std::time::Duration::from_millis(500)).await;
 
         info!("Report generated successfully");
 
         Ok(WorkerResult::success(
-            Some(format!("{} report for {} generated", report_type, period)),
+            Some(format!(
+                "{} report for {} generated",
+                args.report_type, args.period
+            )),
             500,
         ))
     }
@@ -175,9 +209,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create worker registry
     let mut worker_registry = WorkerRegistry::new();
-    worker_registry.register(email_worker);
-    worker_registry.register(payment_worker);
-    worker_registry.register(ReportWorker);
+    worker_registry.register_typed(email_worker);
+    worker_registry.register_typed(payment_worker);
+    worker_registry.register_typed(ReportWorker);
     let worker_registry = Arc::new(worker_registry);
 
     println!("📝 Demo 1: Basic Job Processing");
@@ -214,58 +248,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n📨 Enqueueing jobs...");
 
     // Email jobs (some will fail and retry)
-    let email_jobs = vec![
-        Job::new(
-            "send_email",
-            vec!["alice@example.com".to_string(), "Welcome!".to_string()],
-        ),
-        Job::new(
-            "send_email",
-            vec!["bob@example.com".to_string(), "Newsletter".to_string()],
-        ),
-        Job::new(
-            "send_email",
-            vec!["fail@example.com".to_string(), "Test retry".to_string()],
-        ), // Will retry
-        Job::new(
-            "send_email",
-            vec!["charlie@example.com".to_string(), "Promotion".to_string()],
-        ),
+    let email_payloads = [
+        ("alice@example.com", "Welcome!"),
+        ("bob@example.com", "Newsletter"),
+        ("fail@example.com", "Test retry"),
+        ("charlie@example.com", "Promotion"),
     ];
-
-    for job in email_jobs {
+    for (to, msg) in email_payloads {
+        let job = Job::new_typed(
+            "send_email",
+            &EmailArgs {
+                to: to.into(),
+                message: msg.into(),
+            },
+        )?;
         storage.enqueue(&job).await?;
     }
 
     // Payment jobs
-    let payment_jobs = vec![
-        Job::new(
-            "process_payment",
-            vec!["order_001".to_string(), "99.99".to_string()],
-        ),
-        Job::new(
-            "process_payment",
-            vec!["order_002".to_string(), "149.50".to_string()],
-        ),
-        Job::new(
-            "process_payment",
-            vec!["order_003".to_string(), "invalid_amount".to_string()],
-        ), // Will fail permanently
-        Job::new(
-            "process_payment",
-            vec!["order_004".to_string(), "75.25".to_string()],
-        ),
+    let payment_payloads = [
+        ("order_001", "99.99"),
+        ("order_002", "149.50"),
+        ("order_003", "invalid_amount"),
+        ("order_004", "75.25"),
     ];
-
-    for job in payment_jobs {
+    for (order_id, amount) in payment_payloads {
+        let job = Job::new_typed(
+            "process_payment",
+            &PaymentArgs {
+                order_id: order_id.into(),
+                amount: amount.into(),
+            },
+        )?;
         storage.enqueue(&job).await?;
     }
 
     // Report jobs
-    let report_job = Job::new(
+    let report_job = Job::new_typed(
         "generate_report",
-        vec!["sales".to_string(), "Q1_2024".to_string()],
-    );
+        &ReportArgs {
+            report_type: "sales".into(),
+            period: "Q1_2024".into(),
+        },
+    )?;
     storage.enqueue(&report_job).await?;
 
     println!("   ✓ Enqueued 9 jobs (4 emails, 4 payments, 1 report)");
@@ -277,13 +302,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check results
     let job_counts = storage.get_job_counts().await?;
     println!("\n📊 Job Processing Results:");
-    for (state, count) in &job_counts {
-        let state_name = match state {
-            qml_rs::JobState::Succeeded { .. } => "✅ Succeeded",
-            qml_rs::JobState::Failed { .. } => "❌ Failed",
-            qml_rs::JobState::Processing { .. } => "🔄 Processing",
-            qml_rs::JobState::AwaitingRetry { .. } => "⏳ Awaiting Retry",
-            qml_rs::JobState::Enqueued { .. } => "📥 Enqueued",
+    for (kind, count) in &job_counts {
+        let state_name = match kind {
+            qml_rs::JobStateKind::Succeeded => "✅ Succeeded",
+            qml_rs::JobStateKind::Failed => "❌ Failed",
+            qml_rs::JobStateKind::Processing => "🔄 Processing",
+            qml_rs::JobStateKind::AwaitingRetry => "⏳ Awaiting Retry",
+            qml_rs::JobStateKind::Enqueued => "📥 Enqueued",
             _ => "📝 Other",
         };
         println!("   {} {}", state_name, count);
@@ -327,23 +352,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n⏰ Scheduling jobs for future execution...");
 
     // Schedule an email for 2 seconds from now
-    let delayed_email = Job::new(
+    let delayed_email = Job::new_typed(
         "send_email",
-        vec![
-            "delayed@example.com".to_string(),
-            "Delayed message".to_string(),
-        ],
-    );
+        &EmailArgs {
+            to: "delayed@example.com".into(),
+            message: "Delayed message".into(),
+        },
+    )?;
     scheduler
         .schedule_job_in(delayed_email, Duration::seconds(2), "delayed_email")
         .await?;
     println!("   ✓ Scheduled email for 2 seconds from now");
 
     // Schedule a report for 3 seconds from now
-    let delayed_report = Job::new(
+    let delayed_report = Job::new_typed(
         "generate_report",
-        vec!["monthly".to_string(), "January".to_string()],
-    );
+        &ReportArgs {
+            report_type: "monthly".into(),
+            period: "January".into(),
+        },
+    )?;
     scheduler
         .schedule_job_in(delayed_report, Duration::seconds(3), "monthly_report")
         .await?;
@@ -356,14 +384,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check final results
     let final_counts = storage.get_job_counts().await?;
     println!("\n📊 Final Job Counts:");
-    for (state, count) in &final_counts {
-        let state_name = match state {
-            qml_rs::JobState::Succeeded { .. } => "✅ Succeeded",
-            qml_rs::JobState::Failed { .. } => "❌ Failed",
-            qml_rs::JobState::Scheduled { .. } => "📅 Scheduled",
-            qml_rs::JobState::Processing { .. } => "🔄 Processing",
-            qml_rs::JobState::AwaitingRetry { .. } => "⏳ Awaiting Retry",
-            qml_rs::JobState::Enqueued { .. } => "📥 Enqueued",
+    for (kind, count) in &final_counts {
+        let state_name = match kind {
+            qml_rs::JobStateKind::Succeeded => "✅ Succeeded",
+            qml_rs::JobStateKind::Failed => "❌ Failed",
+            qml_rs::JobStateKind::Scheduled => "📅 Scheduled",
+            qml_rs::JobStateKind::Processing => "🔄 Processing",
+            qml_rs::JobStateKind::AwaitingRetry => "⏳ Awaiting Retry",
+            qml_rs::JobStateKind::Enqueued => "📥 Enqueued",
             _ => "📝 Other",
         };
         println!("   {} {}", state_name, count);
@@ -392,37 +420,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📋 Job execution analysis:");
     for job in all_jobs {
+        let attempt = job.attempt;
         let status = match &job.state {
             qml_rs::JobState::Succeeded { total_duration, .. } => {
                 format!("✅ Succeeded in {}ms", total_duration)
             }
-            qml_rs::JobState::Failed {
-                exception,
-                retry_count,
-                ..
-            } => {
-                format!(
-                    "❌ Failed after {} attempts: {}",
-                    retry_count + 1,
-                    exception
-                )
+            qml_rs::JobState::Failed { exception, .. } => {
+                format!("❌ Failed after {} attempts: {}", attempt, exception)
             }
-            qml_rs::JobState::AwaitingRetry {
-                retry_count,
-                last_exception,
-                ..
-            } => {
-                format!("⏳ Retry #{} scheduled: {}", retry_count, last_exception)
+            qml_rs::JobState::AwaitingRetry { last_exception, .. } => {
+                format!("⏳ Retry after attempt #{}: {}", attempt, last_exception)
             }
             _ => "📝 Other state".to_string(),
         };
 
-        println!(
-            "   {} ({}): {}",
-            job.method,
-            job.arguments.join(", "),
-            status
-        );
+        println!("   {} ({}): {}", job.method, job.payload, status);
     }
 
     println!("\n🎉 Processing Engine Demo completed successfully!");

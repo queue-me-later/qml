@@ -1,4 +1,4 @@
-use axum::{Router, http::StatusCode, response::Html, routing::get};
+use axum::{Router, http::StatusCode, middleware, response::Html, routing::get};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -6,17 +6,44 @@ use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 
 use crate::dashboard::{
+    auth::{self, DashboardAuth},
     routes::create_router,
     service::DashboardService,
     websocket::{WebSocketManager, websocket_handler},
 };
-use crate::storage::Storage;
+use crate::storage::MonitoringApi;
+
+#[cfg(feature = "metrics")]
+use crate::processing::PrometheusMetrics;
+#[cfg(feature = "metrics")]
+use axum::{
+    extract::State as AxumState,
+    http::header::CONTENT_TYPE,
+    response::{IntoResponse, Response},
+};
 
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
     pub host: String,
     pub port: u16,
     pub statistics_update_interval: u64,
+    /// Optional authentication guard applied to every dashboard route.
+    ///
+    /// If `None` and the dashboard is bound to a non-loopback interface
+    /// (anything other than `localhost`, `127.0.0.1`, or `::1`),
+    /// [`DashboardServer::start`] refuses to start. This prevents the
+    /// common footgun of exposing an unauthenticated retry/delete API to
+    /// the network.
+    pub auth: Option<DashboardAuth>,
+    /// Optional Prometheus metrics handle. When set, the dashboard exposes
+    /// a `GET /metrics` endpoint returning the Prometheus text exposition
+    /// format over the shared [`PrometheusMetrics`] registry. The route
+    /// inherits the same auth guard as the rest of the dashboard — scrapers
+    /// that can't authenticate should scrape via a sidecar on the loopback.
+    ///
+    /// Requires the `metrics` cargo feature.
+    #[cfg(feature = "metrics")]
+    pub metrics: Option<Arc<PrometheusMetrics>>,
 }
 
 impl Default for DashboardConfig {
@@ -25,6 +52,9 @@ impl Default for DashboardConfig {
             host: "127.0.0.1".to_string(),
             port: 8080,
             statistics_update_interval: 5, // Update every 5 seconds
+            auth: None,
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
     }
 }
@@ -36,7 +66,7 @@ pub struct DashboardServer {
 }
 
 impl DashboardServer {
-    pub fn new(storage: Arc<dyn Storage>, config: DashboardConfig) -> Self {
+    pub fn new(storage: Arc<dyn MonitoringApi>, config: DashboardConfig) -> Self {
         let dashboard_service = Arc::new(DashboardService::new(storage));
         let websocket_manager = Arc::new(WebSocketManager::new(Arc::clone(&dashboard_service)));
 
@@ -49,6 +79,15 @@ impl DashboardServer {
 
     /// Start the dashboard server
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.config.auth.is_none() && !auth::is_loopback_host(&self.config.host) {
+            return Err(format!(
+                "refusing to start dashboard on non-loopback host '{}' without \
+                 DashboardConfig::auth — set an auth guard or bind to localhost",
+                self.config.host
+            )
+            .into());
+        }
+
         let addr: SocketAddr = format!("{}:{}", self.config.host, self.config.port).parse()?;
 
         // Create the main router
@@ -86,16 +125,37 @@ impl DashboardServer {
             .route("/queues", get(dashboard_ui))
             .route("/statistics", get(dashboard_ui));
 
-        // Combine all routers
-        Router::new()
+        let mut app = Router::new()
             .merge(api_router)
             .merge(ws_router)
-            .merge(ui_router)
-            .layer(
-                ServiceBuilder::new()
-                    .layer(CorsLayer::permissive()) // Allow all origins for development
-                    .into_inner(),
-            )
+            .merge(ui_router);
+
+        #[cfg(feature = "metrics")]
+        if let Some(metrics) = self.config.metrics.clone() {
+            let metrics_router = Router::new()
+                .route("/metrics", get(metrics_handler))
+                .with_state(metrics);
+            app = app.merge(metrics_router);
+        }
+
+        // DB4: same-origin guard on state-changing methods. Applied before
+        // auth so cross-site mutation attempts are rejected without leaking
+        // an auth challenge.
+        app = app.layer(middleware::from_fn(auth::csrf_guard));
+
+        // DB2: optional auth guard on every route.
+        if let Some(auth) = &self.config.auth {
+            app = app.layer(middleware::from_fn_with_state(
+                Arc::new(auth.clone()),
+                auth::require_auth,
+            ));
+        }
+
+        app.layer(
+            ServiceBuilder::new()
+                .layer(CorsLayer::permissive()) // Allow all origins for development
+                .into_inner(),
+        )
     }
 
     /// Get the WebSocket manager for external use
@@ -112,6 +172,25 @@ impl DashboardServer {
 /// Dashboard UI handler - serves the main HTML page
 async fn dashboard_ui() -> Result<Html<&'static str>, StatusCode> {
     Ok(Html(DASHBOARD_HTML))
+}
+
+/// Prometheus scrape handler. Encodes the registry as text exposition
+/// format on each request. Sits behind the same auth / CSRF layers as the
+/// rest of the dashboard; `GET` is a safe method so CSRF is a no-op.
+#[cfg(feature = "metrics")]
+async fn metrics_handler(AxumState(metrics): AxumState<Arc<PrometheusMetrics>>) -> Response {
+    match metrics.encode_text() {
+        Ok(body) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!("failed to encode prometheus metrics: {}", err);
+            (StatusCode::INTERNAL_SERVER_ERROR, "metrics encode failed").into_response()
+        }
+    }
 }
 
 /// Embedded HTML for the dashboard UI
@@ -509,3 +588,54 @@ const DASHBOARD_HTML: &str = r#"
 </body>
 </html>
 "#;
+
+#[cfg(all(test, feature = "metrics"))]
+mod metrics_route_tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    fn test_app(metrics: Arc<PrometheusMetrics>) -> Router {
+        Router::new()
+            .route("/metrics", get(metrics_handler))
+            .with_state(metrics)
+    }
+
+    #[tokio::test]
+    async fn metrics_route_returns_text_exposition() {
+        let metrics = PrometheusMetrics::new().expect("registry");
+        metrics.record_enqueued("default");
+
+        let app = test_app(metrics);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "unexpected content-type: {content_type}"
+        );
+        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(body.contains("qml_jobs_enqueued_total"));
+        assert!(body.contains("queue=\"default\""));
+    }
+}

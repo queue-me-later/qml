@@ -1,16 +1,23 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::{MemoryConfig, Storage, StorageError};
-use crate::core::{Job, JobState};
+use super::{MemoryConfig, MonitoringApi, Storage, StorageError};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Job lock information for MemoryStorage
 #[derive(Debug, Clone)]
 struct JobLock {
     worker_id: String,
     expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Generic named-lock entry used by `try_acquire_lock` / `release_lock`.
+#[derive(Debug, Clone)]
+struct NamedLock {
+    owner: String,
+    expires_at: DateTime<Utc>,
 }
 
 /// In-memory storage implementation for jobs
@@ -22,6 +29,9 @@ struct JobLock {
 pub struct MemoryStorage {
     jobs: RwLock<HashMap<String, Job>>,
     locks: Arc<Mutex<HashMap<String, JobLock>>>,
+    recurring: RwLock<HashMap<String, RecurringJob>>,
+    servers: RwLock<HashMap<String, ServerInfo>>,
+    named_locks: RwLock<HashMap<String, NamedLock>>,
     config: MemoryConfig,
 }
 
@@ -36,6 +46,9 @@ impl MemoryStorage {
         Self {
             jobs: RwLock::new(HashMap::new()),
             locks: Arc::new(Mutex::new(HashMap::new())),
+            recurring: RwLock::new(HashMap::new()),
+            servers: RwLock::new(HashMap::new()),
+            named_locks: RwLock::new(HashMap::new()),
             config,
         }
     }
@@ -62,21 +75,6 @@ impl MemoryStorage {
         } else {
             false
         }
-    }
-
-    /// Remove completed jobs if auto-cleanup is enabled
-    fn maybe_cleanup(&self) {
-        if !self.config.auto_cleanup {
-            return;
-        }
-
-        let mut jobs = self.jobs.write().unwrap();
-        jobs.retain(|_, job| {
-            !matches!(
-                job.state,
-                JobState::Succeeded { .. } | JobState::Deleted { .. }
-            )
-        });
     }
 
     /// Filter jobs by state
@@ -123,26 +121,7 @@ impl Default for MemoryStorage {
 }
 
 #[async_trait]
-impl Storage for MemoryStorage {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        // Check capacity before adding
-        if self.is_at_capacity() {
-            return Err(StorageError::capacity_exceeded(format!(
-                "Memory storage is at capacity ({} jobs)",
-                self.len()
-            )));
-        }
-
-        // Perform cleanup if enabled
-        self.maybe_cleanup();
-
-        // Store the job
-        let mut jobs = self.jobs.write().unwrap();
-        jobs.insert(job.id.clone(), job.clone());
-
-        Ok(())
-    }
-
+impl MonitoringApi for MemoryStorage {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         let jobs = self.jobs.read().unwrap();
         Ok(jobs.get(job_id).cloned())
@@ -196,29 +175,118 @@ impl Storage for MemoryStorage {
         }
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         let jobs = self.jobs.read().unwrap();
         let mut counts = HashMap::new();
 
         for job in jobs.values() {
-            let key = match &job.state {
-                JobState::Enqueued { .. } => JobState::enqueued(""),
-                JobState::Processing { .. } => JobState::processing("", ""),
-                JobState::Succeeded { .. } => JobState::succeeded(0, None),
-                JobState::Failed { .. } => JobState::failed("", None, 0),
-                JobState::Deleted { .. } => JobState::deleted(None),
-                JobState::Scheduled { .. } => JobState::scheduled(Utc::now(), ""),
-                JobState::AwaitingRetry { .. } => JobState::awaiting_retry(Utc::now(), 0, ""),
-            };
-            *counts.entry(key).or_insert(0) += 1;
+            *counts.entry(job.state.kind()).or_insert(0) += 1;
         }
 
         Ok(counts)
+    }
+}
+
+#[async_trait]
+impl Storage for MemoryStorage {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        // Check capacity before adding
+        if self.is_at_capacity() {
+            return Err(StorageError::capacity_exceeded(format!(
+                "Memory storage is at capacity ({} jobs)",
+                self.len()
+            )));
+        }
+
+        // Store the job. Expired-job cleanup is handled out-of-band by
+        // `CleanupWorker` via `delete_expired_jobs` — no per-enqueue sweep.
+        let mut jobs = self.jobs.write().unwrap();
+        jobs.insert(job.id.clone(), job.clone());
+
+        Ok(())
     }
 
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {
         let jobs = self.jobs.read().unwrap();
         Ok(Self::get_available_jobs_internal(&jobs, limit))
+    }
+
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let jobs = self.jobs.read().unwrap();
+        let mut due: Vec<Job> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::Scheduled { enqueue_at, .. } => *enqueue_at <= now,
+                _ => false,
+            })
+            .cloned()
+            .collect();
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let jobs = self.jobs.read().unwrap();
+        let mut due: Vec<Job> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::AwaitingRetry { retry_at, .. } => *retry_at <= now,
+                _ => false,
+            })
+            .cloned()
+            .collect();
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let mut locks = self.locks.lock().unwrap();
+
+        let mut recovered = 0;
+        for job in jobs.values_mut() {
+            let stale = matches!(
+                &job.state,
+                JobState::Processing { started_at, .. } if *started_at < stale_before
+            );
+            if !stale {
+                continue;
+            }
+
+            // Drop any lingering lock first so the new Enqueued state can
+            // actually be picked up by fetch_and_lock_job.
+            locks.remove(&job.id);
+            // Bypass `set_state` — `Processing → Enqueued` isn't in the
+            // allowlist (manual retry goes via Failed), but for stale
+            // recovery this is the correct transition.
+            job.state = JobState::enqueued(&job.queue);
+            recovered += 1;
+        }
+
+        Ok(recovered)
     }
 
     async fn fetch_and_lock_job(
@@ -237,10 +305,11 @@ impl Storage for MemoryStorage {
 
         for mut job in available_jobs {
             // Check if job matches queue filter
-            if let Some(queues) = queues {
-                if !queues.is_empty() && !queues.contains(&job.queue) {
-                    continue;
-                }
+            if let Some(queues) = queues
+                && !queues.is_empty()
+                && !queues.contains(&job.queue)
+            {
+                continue;
             }
 
             // Check if job is already locked
@@ -299,11 +368,11 @@ impl Storage for MemoryStorage {
     async fn release_job_lock(&self, job_id: &str, worker_id: &str) -> Result<bool, StorageError> {
         let mut locks = self.locks.lock().unwrap();
 
-        if let Some(lock) = locks.get(job_id) {
-            if lock.worker_id == worker_id {
-                locks.remove(job_id);
-                return Ok(true);
-            }
+        if let Some(lock) = locks.get(job_id)
+            && lock.worker_id == worker_id
+        {
+            locks.remove(job_id);
+            return Ok(true);
         }
 
         Ok(false)
@@ -328,6 +397,169 @@ impl Storage for MemoryStorage {
 
         Ok(jobs)
     }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        let mut map = self.recurring.write().unwrap();
+        map.insert(job.id.clone(), job.clone());
+        Ok(())
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        let mut map = self.recurring.write().unwrap();
+        Ok(map.remove(id).is_some())
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        let map = self.recurring.read().unwrap();
+        let mut out: Vec<RecurringJob> = map.values().cloned().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        // In-memory "atomic claim": bump `next_run_at` to a sentinel in the
+        // future before returning so a concurrent caller on the same
+        // storage instance won't re-fetch the same row. Two in-memory
+        // MemoryStorage instances are distinct storages anyway, so
+        // distributed coordination is N/A here.
+        let mut map = self.recurring.write().unwrap();
+        let mut due: Vec<RecurringJob> = map
+            .values()
+            .filter(|r| r.enabled && r.next_run_at <= now)
+            .cloned()
+            .collect();
+        due.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at));
+        due.truncate(limit);
+
+        // Park `next_run_at` far in the future so the same row isn't
+        // re-claimed before the caller advances + upserts it.
+        for r in &due {
+            if let Some(stored) = map.get_mut(&r.id) {
+                stored.next_run_at = now + chrono::Duration::days(3650);
+            }
+        }
+        Ok(due)
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let before = jobs.len();
+        jobs.retain(|_, job| match job.expires_at {
+            Some(ts) => ts > now,
+            None => true,
+        });
+        Ok(before - jobs.len())
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        let mut servers = self.servers.write().unwrap();
+        servers.insert(info.server_id.clone(), info.clone());
+        Ok(())
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let mut servers = self.servers.write().unwrap();
+        match servers.get_mut(server_id) {
+            Some(info) => {
+                info.last_heartbeat = now;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        let mut servers = self.servers.write().unwrap();
+        Ok(servers.remove(server_id).is_some())
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        let servers = self.servers.read().unwrap();
+        Ok(servers
+            .values()
+            .filter(|s| s.last_heartbeat < stale_before)
+            .cloned()
+            .collect())
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let mut locks = self.locks.lock().unwrap();
+
+        let mut reclaimed = 0;
+        for job in jobs.values_mut() {
+            let matches = matches!(
+                &job.state,
+                JobState::Processing { server_name, .. } if server_name == server_id
+            );
+            if !matches {
+                continue;
+            }
+
+            // Drop any lingering lock so fetch_and_lock_job can re-pick
+            // the job, then bypass `set_state` — `Processing → Enqueued`
+            // isn't in the user-facing allowlist, but peer reclaim is the
+            // same kind of out-of-band transition as S3's stale sweep.
+            locks.remove(&job.id);
+            job.state = JobState::enqueued(&job.queue);
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        let now = Utc::now();
+        let new_expires_at = now
+            + chrono::Duration::from_std(ttl).map_err(|e| {
+                StorageError::operation_failed("try_acquire_lock", format!("invalid ttl: {}", e))
+            })?;
+
+        let mut locks = self.named_locks.write().unwrap();
+        match locks.get(resource) {
+            Some(existing) if existing.expires_at > now && existing.owner != owner => {
+                // Held by someone else and still live.
+                Ok(false)
+            }
+            _ => {
+                // Free, expired, or same owner re-entrant — (re)acquire.
+                locks.insert(
+                    resource.to_string(),
+                    NamedLock {
+                        owner: owner.to_string(),
+                        expires_at: new_expires_at,
+                    },
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        let mut locks = self.named_locks.write().unwrap();
+        match locks.get(resource) {
+            Some(existing) if existing.owner == owner => {
+                locks.remove(resource);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 impl MemoryStorage {
@@ -346,7 +578,7 @@ mod tests {
     use chrono::Duration;
 
     fn create_test_job() -> Job {
-        Job::new("test_job", vec!["test_arg".to_string()])
+        Job::new("test_job", serde_json::json!(["test_arg".to_string()]))
     }
 
     #[tokio::test]
@@ -444,18 +676,14 @@ mod tests {
 
         let counts = storage.get_job_counts().await.unwrap();
 
-        // Check that we have the right number of different state types
-        assert!(counts.len() >= 2);
+        assert_eq!(counts.get(&JobStateKind::Enqueued).copied(), Some(2));
+        assert_eq!(counts.get(&JobStateKind::Processing).copied(), Some(1));
 
-        // Since we're grouping by state type, we should have some enqueued and processing
-        let has_enqueued = counts
-            .keys()
-            .any(|k| matches!(k, JobState::Enqueued { .. }));
-        let has_processing = counts
-            .keys()
-            .any(|k| matches!(k, JobState::Processing { .. }));
-        assert!(has_enqueued);
-        assert!(has_processing);
+        // Regression for B2: two calls against unchanged data must produce
+        // equal maps. Before JobStateKind, JobState's Hash impl dragged in
+        // per-call timestamps so this held only by accident.
+        let counts_again = storage.get_job_counts().await.unwrap();
+        assert_eq!(counts, counts_again);
     }
 
     #[tokio::test]
@@ -510,24 +738,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_storage_auto_cleanup() {
-        let config = MemoryConfig::new().with_max_jobs(3).with_auto_cleanup(true);
-        let storage = MemoryStorage::with_config(config);
+    async fn delete_expired_jobs_removes_only_expired() {
+        let storage = MemoryStorage::new();
 
-        let mut job1 = create_test_job();
-        job1.state = JobState::succeeded(100, None); // Will be cleaned up
+        let mut fresh = create_test_job();
+        fresh.state = JobState::succeeded(100, None);
+        fresh.expires_at = Some(Utc::now() + Duration::hours(1));
+        let fresh_id = fresh.id.clone();
 
-        let mut job2 = create_test_job();
-        job2.state = JobState::enqueued("default"); // Will remain
+        let mut stale = create_test_job();
+        stale.state = JobState::succeeded(100, None);
+        stale.expires_at = Some(Utc::now() - Duration::hours(1));
+        let stale_id = stale.id.clone();
 
-        let job3 = create_test_job(); // New job
+        let untouched = create_test_job();
+        let untouched_id = untouched.id.clone();
 
-        storage.enqueue(&job1).await.unwrap();
-        storage.enqueue(&job2).await.unwrap();
+        storage.enqueue(&fresh).await.unwrap();
+        storage.enqueue(&stale).await.unwrap();
+        storage.enqueue(&untouched).await.unwrap();
 
-        // This should trigger cleanup and succeed
-        assert!(storage.enqueue(&job3).await.is_ok());
-        assert_eq!(storage.len(), 2); // job1 should be cleaned up
+        let removed = storage.delete_expired_jobs(Utc::now()).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(storage.get(&fresh_id).await.unwrap().is_some());
+        assert!(storage.get(&stale_id).await.unwrap().is_none());
+        assert!(storage.get(&untouched_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn recurring_job_upsert_list_remove_roundtrip() {
+        use crate::core::RecurringJob;
+        let storage = MemoryStorage::new();
+
+        let r = RecurringJob::new(
+            "daily",
+            "0 0 9 * * *",
+            "report",
+            serde_json::json!(null),
+            "default",
+        )
+        .unwrap();
+        storage.upsert_recurring_job(&r).await.unwrap();
+
+        let listed = storage.list_recurring_jobs().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "daily");
+
+        assert!(storage.remove_recurring_job("daily").await.unwrap());
+        assert!(storage.list_recurring_jobs().await.unwrap().is_empty());
+        assert!(!storage.remove_recurring_job("daily").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fetch_due_recurring_jobs_returns_only_due_and_parks_next_run() {
+        use crate::core::RecurringJob;
+        let storage = MemoryStorage::new();
+
+        let mut due = RecurringJob::new(
+            "due",
+            "* * * * * *",
+            "tick",
+            serde_json::json!(null),
+            "default",
+        )
+        .unwrap();
+        due.next_run_at = Utc::now() - Duration::seconds(1);
+        storage.upsert_recurring_job(&due).await.unwrap();
+
+        let future = RecurringJob::new(
+            "future",
+            "0 0 0 1 1 * 2100",
+            "tick",
+            serde_json::json!(null),
+            "default",
+        )
+        .unwrap();
+        storage.upsert_recurring_job(&future).await.unwrap();
+
+        let claimed = storage
+            .fetch_due_recurring_jobs(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "due");
+
+        // A second call before the caller advances must not re-claim.
+        let again = storage
+            .fetch_due_recurring_jobs(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requeue_stranded_jobs_only_touches_stale_processing() {
+        // Regression test for S3: only jobs whose `Processing::started_at`
+        // is older than `stale_before` should be swept back to Enqueued.
+        let storage = MemoryStorage::new();
+
+        // Fresh Processing (1 second ago) — must NOT be recovered.
+        let mut fresh = create_test_job();
+        fresh.state = JobState::Processing {
+            started_at: Utc::now() - Duration::seconds(1),
+            worker_id: "w1".into(),
+            server_name: "s1".into(),
+        };
+        let fresh_id = fresh.id.clone();
+        storage.enqueue(&fresh).await.unwrap();
+
+        // Stale Processing (1 hour ago) — must be recovered.
+        let mut stranded = create_test_job();
+        stranded.state = JobState::Processing {
+            started_at: Utc::now() - Duration::hours(1),
+            worker_id: "dead".into(),
+            server_name: "dead-srv".into(),
+        };
+        let stranded_id = stranded.id.clone();
+        storage.enqueue(&stranded).await.unwrap();
+
+        // Unrelated Enqueued — must remain untouched.
+        let mut untouched = create_test_job();
+        untouched.state = JobState::enqueued("default");
+        let untouched_id = untouched.id.clone();
+        storage.enqueue(&untouched).await.unwrap();
+
+        let recovered = storage
+            .requeue_stranded_jobs(Utc::now() - Duration::minutes(5))
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1);
+
+        assert!(matches!(
+            storage.get(&fresh_id).await.unwrap().unwrap().state,
+            JobState::Processing { .. }
+        ));
+        assert!(matches!(
+            storage.get(&stranded_id).await.unwrap().unwrap().state,
+            JobState::Enqueued { .. }
+        ));
+        assert!(matches!(
+            storage.get(&untouched_id).await.unwrap().unwrap().state,
+            JobState::Enqueued { .. }
+        ));
     }
 
     #[tokio::test]
@@ -541,5 +893,106 @@ mod tests {
             result.unwrap_err(),
             StorageError::JobNotFound { .. }
         ));
+    }
+
+    // ---- D2 generic distributed lock tests ---------------------------
+
+    #[tokio::test]
+    async fn try_acquire_lock_free_resource_succeeds() {
+        let storage = MemoryStorage::new();
+        let acquired = storage
+            .try_acquire_lock("report", "owner-a", std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(acquired);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_lock_blocks_other_owner_until_expiry() {
+        let storage = MemoryStorage::new();
+        let ttl = std::time::Duration::from_millis(100);
+
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-a", ttl)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap(),
+            "second owner must be rejected while the lock is live"
+        );
+
+        // Wait past the TTL and retry — owner-b should now take over.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap(),
+            "expired lock must be takeable by a new owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_acquire_lock_is_reentrant_for_same_owner() {
+        let storage = MemoryStorage::new();
+        let ttl = std::time::Duration::from_secs(60);
+
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-a", ttl)
+                .await
+                .unwrap()
+        );
+        // Same owner re-acquires: allowed, refreshes TTL.
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-a", ttl)
+                .await
+                .unwrap(),
+            "same owner must be able to re-acquire (extend) a live lock"
+        );
+        // Another owner still blocked.
+        assert!(
+            !storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_lock_rejects_non_owner_and_releases_owner() {
+        let storage = MemoryStorage::new();
+        let ttl = std::time::Duration::from_secs(60);
+
+        storage
+            .try_acquire_lock("report", "owner-a", ttl)
+            .await
+            .unwrap();
+
+        // Non-owner release fails and leaves the lock held.
+        assert!(!storage.release_lock("report", "owner-b").await.unwrap());
+        assert!(
+            !storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap()
+        );
+
+        // Owner release succeeds and frees the lock.
+        assert!(storage.release_lock("report", "owner-a").await.unwrap());
+        assert!(
+            storage
+                .try_acquire_lock("report", "owner-b", ttl)
+                .await
+                .unwrap()
+        );
+        // Double-release returns false.
+        assert!(!storage.release_lock("report", "owner-a").await.unwrap());
     }
 }

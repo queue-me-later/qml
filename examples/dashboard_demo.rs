@@ -21,22 +21,46 @@ async fn create_sample_jobs(
 
     // Create various types of jobs to demonstrate different states
     let jobs = vec![
-        Job::new("send_email", vec!["user1@example.com".to_string()]),
-        Job::new("send_email", vec!["user2@example.com".to_string()]),
         Job::new(
-            "process_payment",
-            vec!["99.99".to_string(), "user001".to_string()],
+            "send_email",
+            serde_json::json!(["user1@example.com".to_string()]),
+        ),
+        Job::new(
+            "send_email",
+            serde_json::json!(["user2@example.com".to_string()]),
         ),
         Job::new(
             "process_payment",
-            vec!["25.50".to_string(), "user002".to_string()],
+            serde_json::json!(["99.99".to_string(), "user001".to_string()]),
         ),
-        Job::new("generate_report", vec!["sales_report".to_string()]),
-        Job::new("generate_report", vec!["user_activity".to_string()]),
-        Job::new("send_notification", vec!["Welcome message".to_string()]),
-        Job::new("backup_data", vec!["daily_backup".to_string()]),
-        Job::new("cleanup_temp", vec!["temp_files".to_string()]),
-        Job::new("send_email", vec!["user3@example.com".to_string()]),
+        Job::new(
+            "process_payment",
+            serde_json::json!(["25.50".to_string(), "user002".to_string()]),
+        ),
+        Job::new(
+            "generate_report",
+            serde_json::json!(["sales_report".to_string()]),
+        ),
+        Job::new(
+            "generate_report",
+            serde_json::json!(["user_activity".to_string()]),
+        ),
+        Job::new(
+            "send_notification",
+            serde_json::json!(["Welcome message".to_string()]),
+        ),
+        Job::new(
+            "backup_data",
+            serde_json::json!(["daily_backup".to_string()]),
+        ),
+        Job::new(
+            "cleanup_temp",
+            serde_json::json!(["temp_files".to_string()]),
+        ),
+        Job::new(
+            "send_email",
+            serde_json::json!(["user3@example.com".to_string()]),
+        ),
     ];
 
     // Enqueue all jobs
@@ -56,15 +80,21 @@ async fn add_more_jobs_periodically(storage: Arc<dyn Storage>) {
 
         // Create a variety of new jobs
         let new_jobs = vec![
-            Job::new("send_email", vec![format!("batch{}@example.com", counter)]),
+            Job::new(
+                "send_email",
+                serde_json::json!([format!("batch{}@example.com", counter)]),
+            ),
             Job::new(
                 "process_payment",
-                vec![
+                serde_json::json!([
                     format!("{:.2}", 50.0 + (fastrand::f64() * 200.0)),
                     format!("batch_user_{}", counter),
-                ],
+                ]),
             ),
-            Job::new("generate_report", vec![format!("report_{}", counter)]),
+            Job::new(
+                "generate_report",
+                serde_json::json!([format!("report_{}", counter)]),
+            ),
         ];
 
         for job in new_jobs {
@@ -105,9 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         host: "127.0.0.1".to_string(),
         port: 8080,
         statistics_update_interval: 3, // Update every 3 seconds for demo
+        auth: None,
     };
 
-    let dashboard = DashboardServer::new(Arc::clone(&storage), dashboard_config);
+    let dashboard = DashboardServer::new(storage.clone(), dashboard_config);
 
     info!("🖥️  Dashboard available at: http://127.0.0.1:8080");
     info!("📊 WebSocket updates every 3 seconds");

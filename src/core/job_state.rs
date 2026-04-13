@@ -5,6 +5,36 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Discriminant for [`JobState`] variants, suitable as a hashmap key.
+///
+/// Use this when you need to group or count jobs by their state without
+/// dragging along per-instance data like timestamps or error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum JobStateKind {
+    Enqueued,
+    Processing,
+    Succeeded,
+    Failed,
+    Deleted,
+    Scheduled,
+    AwaitingRetry,
+}
+
+impl JobStateKind {
+    /// Human-readable name of the state.
+    pub fn name(&self) -> &'static str {
+        match self {
+            JobStateKind::Enqueued => "Enqueued",
+            JobStateKind::Processing => "Processing",
+            JobStateKind::Succeeded => "Succeeded",
+            JobStateKind::Failed => "Failed",
+            JobStateKind::Deleted => "Deleted",
+            JobStateKind::Scheduled => "Scheduled",
+            JobStateKind::AwaitingRetry => "AwaitingRetry",
+        }
+    }
+}
+
 /// Represents the various states a job can be in during its lifecycle.
 ///
 /// Jobs progress through different states from creation to completion or failure.
@@ -47,8 +77,6 @@ pub enum JobState {
         exception: String,
         /// Stack trace if available
         stack_trace: Option<String>,
-        /// Number of retry attempts made
-        retry_count: u32,
     },
 
     /// Job has been deleted (soft delete)
@@ -75,25 +103,28 @@ pub enum JobState {
         scheduled_at: DateTime<Utc>,
         /// When the retry should be attempted
         retry_at: DateTime<Utc>,
-        /// Number of retry attempts made so far
-        retry_count: u32,
         /// Last exception that caused the retry
         last_exception: String,
     },
 }
 
 impl JobState {
+    /// Returns the kind (discriminant) of the current state.
+    pub fn kind(&self) -> JobStateKind {
+        match self {
+            JobState::Enqueued { .. } => JobStateKind::Enqueued,
+            JobState::Processing { .. } => JobStateKind::Processing,
+            JobState::Succeeded { .. } => JobStateKind::Succeeded,
+            JobState::Failed { .. } => JobStateKind::Failed,
+            JobState::Deleted { .. } => JobStateKind::Deleted,
+            JobState::Scheduled { .. } => JobStateKind::Scheduled,
+            JobState::AwaitingRetry { .. } => JobStateKind::AwaitingRetry,
+        }
+    }
+
     /// Returns the name of the current state as a string.
     pub fn name(&self) -> &'static str {
-        match self {
-            JobState::Enqueued { .. } => "Enqueued",
-            JobState::Processing { .. } => "Processing",
-            JobState::Succeeded { .. } => "Succeeded",
-            JobState::Failed { .. } => "Failed",
-            JobState::Deleted { .. } => "Deleted",
-            JobState::Scheduled { .. } => "Scheduled",
-            JobState::AwaitingRetry { .. } => "AwaitingRetry",
-        }
+        self.kind().name()
     }
 
     /// Checks if the job is in a final state (completed, failed, or deleted).
@@ -182,16 +213,11 @@ impl JobState {
     }
 
     /// Creates a new Failed state.
-    pub fn failed(
-        exception: impl Into<String>,
-        stack_trace: Option<String>,
-        retry_count: u32,
-    ) -> Self {
+    pub fn failed(exception: impl Into<String>, stack_trace: Option<String>) -> Self {
         JobState::Failed {
             failed_at: Utc::now(),
             exception: exception.into(),
             stack_trace,
-            retry_count,
         }
     }
 
@@ -213,15 +239,10 @@ impl JobState {
     }
 
     /// Creates a new AwaitingRetry state.
-    pub fn awaiting_retry(
-        retry_at: DateTime<Utc>,
-        retry_count: u32,
-        last_exception: impl Into<String>,
-    ) -> Self {
+    pub fn awaiting_retry(retry_at: DateTime<Utc>, last_exception: impl Into<String>) -> Self {
         JobState::AwaitingRetry {
             scheduled_at: Utc::now(),
             retry_at,
-            retry_count,
             last_exception: last_exception.into(),
         }
     }

@@ -7,8 +7,27 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use super::{PostgresConfig, Storage, StorageError};
-use crate::core::{Job, JobState};
+use super::{MonitoringApi, PostgresConfig, Storage, StorageError};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
+
+/// Default name of the jobs table. `PostgresConfig::table_name` defaults to
+/// this and can be overridden, but the recurring-jobs table is not
+/// configurable and always lives alongside it.
+const JOBS_TABLE_NAME: &str = "qml_jobs";
+
+/// Tables the current release expects under the configured schema.
+///
+/// Used by [`PostgresStorage::schema_is_current`] to decide whether an
+/// already-installed schema needs `install.sql` rerun for new tables.
+/// Keeping this list here (instead of probing `install.sql` at runtime)
+/// keeps the check O(1) per table and visible in code review when a table
+/// is added.
+const CURRENT_SCHEMA_TABLES: &[&str] = &[
+    JOBS_TABLE_NAME,
+    "qml_recurring_jobs",
+    "qml_servers",
+    "qml_locks",
+];
 
 /// PostgreSQL storage implementation for jobs
 ///
@@ -47,16 +66,54 @@ impl PostgresStorage {
         Ok(storage)
     }
 
-    /// Check if the schema and tables exist
+    /// Check if the schema and primary jobs table exist.
     ///
-    /// This method checks for the existence of the required schema and table
-    /// before attempting any operations. This is useful for detecting when
-    /// migrations need to be run.
+    /// This is the literal "has QML ever been installed here?" check. It
+    /// returns `true` as soon as the configured schema and `qml_jobs` table
+    /// are present, even if the database predates newer tables like
+    /// `qml_recurring_jobs`. Use [`schema_is_current`](Self::schema_is_current)
+    /// when you need to gate migrations on the *current* release's full
+    /// surface area.
     pub async fn schema_exists(&self) -> Result<bool, StorageError> {
-        // Check if schema exists
+        if !self.check_schema_present().await? {
+            return Ok(false);
+        }
+        self.table_exists(&self.config.table_name).await
+    }
+
+    /// Check whether every table the current release expects is already
+    /// installed.
+    ///
+    /// This is stricter than [`schema_exists`](Self::schema_exists): it
+    /// returns `false` when the main jobs table is present but newer tables
+    /// (e.g. `qml_recurring_jobs`, introduced after 1.0.1) are missing. That
+    /// lets `migrate_if_needed` trigger the idempotent `install.sql` on an
+    /// upgrade from 1.0.1 rather than treating the schema as already up to
+    /// date.
+    pub async fn schema_is_current(&self) -> Result<bool, StorageError> {
+        if !self.check_schema_present().await? {
+            return Ok(false);
+        }
+        for table in CURRENT_SCHEMA_TABLES {
+            if !self.table_exists(table).await? {
+                return Ok(false);
+            }
+        }
+        // Also verify the user-configured jobs table (which may differ from
+        // the default "qml_jobs" when with_table_name is used).
+        if self.config.table_name != JOBS_TABLE_NAME
+            && !self.table_exists(&self.config.table_name).await?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Check whether the configured schema itself exists.
+    async fn check_schema_present(&self) -> Result<bool, StorageError> {
         let schema_query =
             "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)";
-        let schema_exists = sqlx::query_scalar::<_, bool>(schema_query)
+        sqlx::query_scalar::<_, bool>(schema_query)
             .bind(&self.config.schema_name)
             .fetch_one(&self.pool)
             .await
@@ -64,26 +121,26 @@ impl PostgresStorage {
                 operation: "schema_check".to_string(),
                 message: format!("Failed to check schema existence: {}", e),
                 source: Some(Box::new(e)),
-            })?;
+            })
+    }
 
-        if !schema_exists {
-            return Ok(false);
-        }
-
-        // Check if table exists
-        let table_query = "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)";
-        let table_exists = sqlx::query_scalar::<_, bool>(table_query)
+    /// Check whether a specific table exists under the configured schema.
+    async fn table_exists(&self, table_name: &str) -> Result<bool, StorageError> {
+        let table_query = "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                           WHERE table_schema = $1 AND table_name = $2)";
+        sqlx::query_scalar::<_, bool>(table_query)
             .bind(&self.config.schema_name)
-            .bind(&self.config.table_name)
+            .bind(table_name)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::OperationFailed {
                 operation: "table_check".to_string(),
-                message: format!("Failed to check table existence: {}", e),
+                message: format!(
+                    "Failed to check table existence for '{}': {}",
+                    table_name, e
+                ),
                 source: Some(Box::new(e)),
-            })?;
-
-        Ok(table_exists)
+            })
     }
 
     /// Helper method to detect if a database error is schema-related
@@ -227,22 +284,27 @@ impl PostgresStorage {
 
     /// Migrate with automatic schema detection
     ///
-    /// This is a convenience method that combines schema detection and migration.
-    /// It will only run migrations if the schema doesn't exist or is incomplete.
+    /// This is a convenience method that combines schema detection and
+    /// migration. It runs `install.sql` whenever the schema is absent *or*
+    /// out of date relative to the current release — e.g. upgrading a
+    /// 1.0.1 database to 2.0, where `qml_jobs` exists but
+    /// `qml_recurring_jobs` does not yet. `install.sql` uses
+    /// `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE FUNCTION`, so
+    /// rerunning it against an already-populated database is safe.
     pub async fn migrate_if_needed(&self) -> Result<bool, StorageError> {
-        match self.schema_exists().await {
+        match self.schema_is_current().await {
             Ok(true) => {
-                tracing::debug!("Schema exists, skipping migration");
+                tracing::debug!("Schema is current, skipping migration");
                 Ok(false)
             }
             Ok(false) => {
-                tracing::info!("Schema not found, running migrations...");
+                tracing::info!("Schema missing or out of date, running install.sql...");
                 self.migrate().await?;
                 Ok(true)
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to check schema existence, attempting migration anyway: {}",
+                    "Failed to check schema currency, attempting migration anyway: {}",
                     e
                 );
                 self.migrate().await?;
@@ -272,12 +334,7 @@ impl PostgresStorage {
     ) -> Result<(String, serde_json::Value, serde_json::Value), StorageError> {
         let state_name = Self::job_state_to_name(&job.state);
         let state_data = Self::job_state_to_data(&job.state)?;
-        let arguments =
-            serde_json::to_value(&job.arguments).map_err(|e| StorageError::SerializationError {
-                message: format!("Failed to serialize job arguments: {}", e),
-            })?;
-
-        Ok((state_name, state_data, arguments))
+        Ok((state_name, state_data, job.payload.clone()))
     }
 
     /// Convert database row to Job
@@ -294,17 +351,11 @@ impl PostgresStorage {
                     message: format!("Failed to get method name: {}", e),
                 })?;
 
-        let arguments_json: serde_json::Value =
+        let payload: serde_json::Value =
             row.try_get("arguments")
                 .map_err(|e| StorageError::DeserializationError {
-                    message: format!("Failed to get arguments: {}", e),
+                    message: format!("Failed to get payload: {}", e),
                 })?;
-
-        let arguments: Vec<String> = serde_json::from_value(arguments_json).map_err(|e| {
-            StorageError::DeserializationError {
-                message: format!("Failed to deserialize arguments: {}", e),
-            }
-        })?;
 
         let created_at: DateTime<Utc> =
             row.try_get("created_at")
@@ -342,6 +393,12 @@ impl PostgresStorage {
                     message: format!("Failed to get max_retries: {}", e),
                 })?;
 
+        let current_retries: i32 =
+            row.try_get("current_retries")
+                .map_err(|e| StorageError::DeserializationError {
+                    message: format!("Failed to get current_retries: {}", e),
+                })?;
+
         let metadata_json: Option<serde_json::Value> =
             row.try_get("metadata")
                 .map_err(|e| StorageError::DeserializationError {
@@ -368,20 +425,28 @@ impl PostgresStorage {
                     message: format!("Failed to get timeout_seconds: {}", e),
                 })?;
 
+        let expires_at: Option<DateTime<Utc>> =
+            row.try_get("expires_at")
+                .map_err(|e| StorageError::DeserializationError {
+                    message: format!("Failed to get expires_at: {}", e),
+                })?;
+
         let state = Self::data_to_job_state(&state_name, &state_data)?;
 
         Ok(Job {
             id: id.to_string(),
             method: method_name,
-            arguments,
+            payload,
             created_at,
             state,
             queue: queue_name,
             priority,
             max_retries: max_retries as u32,
+            attempt: current_retries.max(0) as u32,
             metadata,
             job_type,
             timeout_seconds: timeout_seconds.map(|t| t as u64),
+            expires_at,
         })
     }
 
@@ -430,64 +495,79 @@ impl PostgresStorage {
     fn table_name(&self) -> String {
         self.config.full_table_name()
     }
+
+    /// Fully-qualified name of the recurring-jobs table. Hard-coded to
+    /// `qml_recurring_jobs` under the configured schema — there's no
+    /// config knob for it yet because there's only one copy per install.
+    fn recurring_table_name(&self) -> String {
+        format!("{}.qml_recurring_jobs", self.config.schema_name)
+    }
+
+    /// Fully-qualified name of the server-registry table used by the
+    /// heartbeat/dead-server machinery (D1).
+    fn servers_table_name(&self) -> String {
+        format!("{}.qml_servers", self.config.schema_name)
+    }
+
+    /// Fully-qualified name of the generic distributed-lock table (D2).
+    fn locks_table_name(&self) -> String {
+        format!("{}.qml_locks", self.config.schema_name)
+    }
+
+    /// Materialize a row from `qml_servers` into a [`ServerInfo`].
+    fn row_to_server_info(row: &sqlx::postgres::PgRow) -> Result<ServerInfo, StorageError> {
+        let err = |field: &str, e: sqlx::Error| StorageError::DeserializationError {
+            message: format!("Failed to get {}: {}", field, e),
+        };
+        let worker_count: i32 = row
+            .try_get("worker_count")
+            .map_err(|e| err("worker_count", e))?;
+        Ok(ServerInfo {
+            server_id: row.try_get("server_id").map_err(|e| err("server_id", e))?,
+            server_name: row
+                .try_get("server_name")
+                .map_err(|e| err("server_name", e))?,
+            started_at: row
+                .try_get("started_at")
+                .map_err(|e| err("started_at", e))?,
+            last_heartbeat: row
+                .try_get("last_heartbeat")
+                .map_err(|e| err("last_heartbeat", e))?,
+            worker_count: worker_count.max(0) as u32,
+            queues: row.try_get("queues").map_err(|e| err("queues", e))?,
+        })
+    }
+
+    /// Materialize a row from `qml_recurring_jobs` into a [`RecurringJob`].
+    fn row_to_recurring(row: &sqlx::postgres::PgRow) -> Result<RecurringJob, StorageError> {
+        let err = |field: &str, e: sqlx::Error| StorageError::DeserializationError {
+            message: format!("Failed to get {}: {}", field, e),
+        };
+        Ok(RecurringJob {
+            id: row.try_get("id").map_err(|e| err("id", e))?,
+            cron: row.try_get("cron").map_err(|e| err("cron", e))?,
+            method: row.try_get("method").map_err(|e| err("method", e))?,
+            payload: row.try_get("payload").map_err(|e| err("payload", e))?,
+            queue: row.try_get("queue").map_err(|e| err("queue", e))?,
+            next_run_at: row
+                .try_get("next_run_at")
+                .map_err(|e| err("next_run_at", e))?,
+            last_run_at: row
+                .try_get("last_run_at")
+                .map_err(|e| err("last_run_at", e))?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| err("created_at", e))?,
+            updated_at: row
+                .try_get("updated_at")
+                .map_err(|e| err("updated_at", e))?,
+            enabled: row.try_get("enabled").map_err(|e| err("enabled", e))?,
+        })
+    }
 }
 
 #[async_trait]
-impl Storage for PostgresStorage {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        let (state_name, state_data, arguments) = Self::job_to_row_values(job)?;
-        let metadata = if job.metadata.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                StorageError::SerializationError {
-                    message: format!("Failed to serialize metadata: {}", e),
-                }
-            })?)
-        };
-
-        let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
-            message: format!("Invalid job ID format: {}", e),
-        })?;
-
-        let query = format!(
-            r#"
-            INSERT INTO {} (
-                id, method_name, arguments, created_at, state_name, state_data,
-                queue_name, priority, max_retries, current_retries, metadata,
-                job_type, timeout_seconds
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            "#,
-            self.table_name()
-        );
-
-        // Use handle_schema_error to wrap the database operation
-        self.handle_schema_error(
-            || async {
-                sqlx::query(&query)
-                    .bind(job_id)
-                    .bind(&job.method)
-                    .bind(&arguments)
-                    .bind(job.created_at)
-                    .bind(&state_name)
-                    .bind(&state_data)
-                    .bind(&job.queue)
-                    .bind(job.priority)
-                    .bind(job.max_retries as i32)
-                    .bind(0i32) // current_retries starts at 0
-                    .bind(&metadata)
-                    .bind(&job.job_type)
-                    .bind(job.timeout_seconds.map(|t| t as i32))
-                    .execute(&self.pool)
-                    .await
-            },
-            "enqueue",
-        )
-        .await?;
-
-        Ok(())
-    }
-
+impl MonitoringApi for PostgresStorage {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         let job_uuid = Uuid::from_str(job_id).map_err(|e| StorageError::InvalidJobData {
             message: format!("Invalid job ID format: {}", e),
@@ -496,7 +576,7 @@ impl Storage for PostgresStorage {
         let query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE id = $1
             "#,
@@ -542,8 +622,9 @@ impl Storage for PostgresStorage {
             r#"
             UPDATE {}
             SET method_name = $2, arguments = $3, state_name = $4, state_data = $5,
-                queue_name = $6, priority = $7, max_retries = $8, metadata = $9,
-                job_type = $10, timeout_seconds = $11, updated_at = NOW()
+                queue_name = $6, priority = $7, max_retries = $8, current_retries = $9,
+                metadata = $10, job_type = $11, timeout_seconds = $12, expires_at = $13,
+                updated_at = NOW()
             WHERE id = $1
             "#,
             self.table_name()
@@ -558,9 +639,11 @@ impl Storage for PostgresStorage {
             .bind(&job.queue)
             .bind(job.priority)
             .bind(job.max_retries as i32)
+            .bind(job.attempt as i32)
             .bind(metadata)
             .bind(&job.job_type)
             .bind(job.timeout_seconds.map(|t| t as i32))
+            .bind(job.expires_at)
             .execute(&self.pool)
             .await
             .map_err(|e| StorageError::OperationError {
@@ -603,7 +686,7 @@ impl Storage for PostgresStorage {
         let mut query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             "#,
             self.table_name()
@@ -658,7 +741,7 @@ impl Storage for PostgresStorage {
         Ok(jobs)
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         let query = format!(
             "SELECT state_name, COUNT(*) as count FROM {} GROUP BY state_name",
             self.table_name()
@@ -686,29 +769,86 @@ impl Storage for PostgresStorage {
                         message: format!("Failed to get count from count query: {}", e),
                     })?;
 
-            // Create a dummy state for the count lookup
-            let dummy_state = match state_name.as_str() {
-                "enqueued" => JobState::enqueued("default"),
-                "processing" => JobState::processing("dummy", "dummy"),
-                "succeeded" => JobState::succeeded(0, None),
-                "failed" => JobState::failed("dummy", None, 0),
-                "deleted" => JobState::deleted(None),
-                "scheduled" => JobState::scheduled(Utc::now(), "dummy"),
-                "awaiting_retry" => JobState::awaiting_retry(Utc::now(), 0, "dummy"),
+            let kind = match state_name.as_str() {
+                "enqueued" => JobStateKind::Enqueued,
+                "processing" => JobStateKind::Processing,
+                "succeeded" => JobStateKind::Succeeded,
+                "failed" => JobStateKind::Failed,
+                "deleted" => JobStateKind::Deleted,
+                "scheduled" => JobStateKind::Scheduled,
+                "awaiting_retry" => JobStateKind::AwaitingRetry,
                 _ => continue, // Skip unknown states
             };
 
-            counts.insert(dummy_state, count as usize);
+            counts.insert(kind, count as usize);
         }
 
         Ok(counts)
+    }
+}
+
+#[async_trait]
+impl Storage for PostgresStorage {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        let (state_name, state_data, arguments) = Self::job_to_row_values(job)?;
+        let metadata = if job.metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&job.metadata).map_err(|e| {
+                StorageError::SerializationError {
+                    message: format!("Failed to serialize metadata: {}", e),
+                }
+            })?)
+        };
+
+        let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
+            message: format!("Invalid job ID format: {}", e),
+        })?;
+
+        let query = format!(
+            r#"
+            INSERT INTO {} (
+                id, method_name, arguments, created_at, state_name, state_data,
+                queue_name, priority, max_retries, current_retries, metadata,
+                job_type, timeout_seconds, expires_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            "#,
+            self.table_name()
+        );
+
+        // Use handle_schema_error to wrap the database operation
+        self.handle_schema_error(
+            || async {
+                sqlx::query(&query)
+                    .bind(job_id)
+                    .bind(&job.method)
+                    .bind(&arguments)
+                    .bind(job.created_at)
+                    .bind(&state_name)
+                    .bind(&state_data)
+                    .bind(&job.queue)
+                    .bind(job.priority)
+                    .bind(job.max_retries as i32)
+                    .bind(job.attempt as i32)
+                    .bind(&metadata)
+                    .bind(&job.job_type)
+                    .bind(job.timeout_seconds.map(|t| t as i32))
+                    .bind(job.expires_at)
+                    .execute(&self.pool)
+                    .await
+            },
+            "enqueue",
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {
         let mut query = format!(
             r#"
             SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name IN ('enqueued', 'scheduled', 'awaiting_retry')
             AND (
@@ -743,124 +883,178 @@ impl Storage for PostgresStorage {
         Ok(jobs)
     }
 
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT id, method_name, arguments, created_at, state_name, state_data,
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
+            FROM {}
+            WHERE state_name = 'scheduled'
+              AND (state_data->>'enqueue_at')::timestamptz <= $1
+            ORDER BY priority DESC, created_at ASC
+            LIMIT $2
+            "#,
+            self.table_name()
+        );
+
+        let rows = sqlx::query(&query)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to fetch due scheduled jobs: {}", e),
+            })?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            jobs.push(Self::row_to_job(&row)?);
+        }
+        Ok(jobs)
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT id, method_name, arguments, created_at, state_name, state_data,
+                   queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
+            FROM {}
+            WHERE state_name = 'awaiting_retry'
+              AND (state_data->>'retry_at')::timestamptz <= $1
+            ORDER BY priority DESC, created_at ASC
+            LIMIT $2
+            "#,
+            self.table_name()
+        );
+
+        let rows = sqlx::query(&query)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to fetch due retry jobs: {}", e),
+            })?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            jobs.push(Self::row_to_job(&row)?);
+        }
+        Ok(jobs)
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        // Single UPDATE: flips every stale Processing row back to Enqueued.
+        // `jsonb_build_object` synthesizes a fresh Enqueued state_data from
+        // the job's own `queue_name` column; `enqueued_at` is ISO-8601 so it
+        // round-trips through serde_json::from_value into chrono::DateTime.
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET state_name = 'enqueued',
+                state_data = jsonb_build_object(
+                    'enqueued_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                    'queue', queue_name
+                ),
+                locked_by = NULL,
+                locked_at = NULL,
+                lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE state_name = 'processing'
+              AND (state_data->>'started_at')::timestamptz < $1
+            "#,
+            table = self.table_name()
+        );
+
+        let result = sqlx::query(&query)
+            .bind(stale_before)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to requeue stranded jobs: {}", e),
+            })?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
     async fn fetch_and_lock_job(
         &self,
         worker_id: &str,
         queues: Option<&[String]>,
     ) -> Result<Option<Job>, StorageError> {
-        let mut transaction =
-            self.pool
-                .begin()
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to start transaction: {}", e),
-                })?;
+        // Build the new Processing state first so we can bind it directly —
+        // no need to read the row back, mutate it in Rust, then write it.
+        let processing_state = JobState::Processing {
+            worker_id: worker_id.to_string(),
+            started_at: chrono::Utc::now(),
+            server_name: "postgres-storage".to_string(),
+        };
+        let new_state_name = Self::job_state_to_name(&processing_state);
+        let new_state_data = Self::job_state_to_data(&processing_state)?;
 
-        // Use SELECT FOR UPDATE SKIP LOCKED for atomic job fetching
-        let mut query = format!(
+        // Single UPDATE ... RETURNING: the inner SELECT claims one eligible
+        // row with FOR UPDATE SKIP LOCKED, the outer UPDATE flips its state,
+        // and RETURNING hands back the full row so we can hydrate the Job.
+        // Collapsing the old transaction + separate UPDATE saves a round-trip
+        // and removes a window where the row is locked but not yet marked.
+        let queue_filter = match queues {
+            Some(qs) if !qs.is_empty() => {
+                let placeholders: Vec<String> =
+                    (3..3 + qs.len()).map(|i| format!("${}", i)).collect();
+                format!(" AND queue_name = ANY(ARRAY[{}])", placeholders.join(","))
+            }
+            _ => String::new(),
+        };
+
+        let query = format!(
             r#"
-            SELECT id, method_name, arguments, created_at, state_name, state_data,
-                   queue_name, priority, max_retries, metadata, job_type, timeout_seconds
-            FROM {}
-            WHERE state_name IN ('enqueued', 'retrying')
-        "#,
-            self.table_name()
+            UPDATE {table}
+            SET state_name = $1, state_data = $2, updated_at = NOW()
+            WHERE id = (
+                SELECT id FROM {table}
+                WHERE state_name IN ('enqueued', 'awaiting_retry')
+                  {queue_filter}
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING id, method_name, arguments, created_at, state_name, state_data,
+                      queue_name, priority, max_retries, current_retries, metadata,
+                      job_type, timeout_seconds, expires_at
+            "#,
+            table = self.table_name(),
+            queue_filter = queue_filter,
         );
 
-        // Add queue filtering if specified
-        if let Some(queues) = queues {
-            if !queues.is_empty() {
-                let queue_placeholders: Vec<String> =
-                    (1..=queues.len()).map(|i| format!("${}", i)).collect();
-                query.push_str(&format!(
-                    " AND queue_name = ANY(ARRAY[{}])",
-                    queue_placeholders.join(",")
-                ));
-            }
-        }
-
-        // Order by priority and creation time, then lock and skip locked rows
-        query.push_str(" ORDER BY priority DESC, created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1");
-
-        let mut sqlx_query = sqlx::query(&query);
-
-        // Bind queue names if provided
-        if let Some(queues) = queues {
-            for queue in queues {
+        let mut sqlx_query = sqlx::query(&query)
+            .bind(&new_state_name)
+            .bind(&new_state_data);
+        if let Some(qs) = queues {
+            for queue in qs {
                 sqlx_query = sqlx_query.bind(queue);
             }
         }
 
-        let row = sqlx_query
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|e| StorageError::OperationError {
+        let row = sqlx_query.fetch_optional(&self.pool).await.map_err(|e| {
+            StorageError::OperationError {
                 message: format!("Failed to fetch and lock job: {}", e),
-            })?;
+            }
+        })?;
 
-        if let Some(row) = row {
-            let mut job = Self::row_to_job(&row)?;
-
-            // Mark as processing and add worker metadata
-            job.state = JobState::Processing {
-                worker_id: worker_id.to_string(),
-                started_at: chrono::Utc::now(),
-                server_name: "postgres-storage".to_string(),
-            };
-
-            // Update the job in the same transaction
-            let (state_name, state_data, _arguments) = Self::job_to_row_values(&job)?;
-            let metadata = if job.metadata.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                    StorageError::SerializationError {
-                        message: format!("Failed to serialize metadata: {}", e),
-                    }
-                })?)
-            };
-
-            let update_query = format!(
-                r#"
-                UPDATE {}
-                SET state_name = $2, state_data = $3, metadata = $4, updated_at = NOW()
-                WHERE id = $1
-            "#,
-                self.table_name()
-            );
-
-            let job_uuid = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
-                message: format!("Invalid job ID format: {}", e),
-            })?;
-
-            sqlx::query(&update_query)
-                .bind(job_uuid)
-                .bind(state_name)
-                .bind(state_data)
-                .bind(metadata)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to update job state: {}", e),
-                })?;
-
-            transaction
-                .commit()
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to commit transaction: {}", e),
-                })?;
-
-            Ok(Some(job))
-        } else {
-            // No available jobs
-            transaction
-                .commit()
-                .await
-                .map_err(|e| StorageError::OperationError {
-                    message: format!("Failed to commit transaction: {}", e),
-                })?;
-            Ok(None)
+        match row {
+            Some(row) => Ok(Some(Self::row_to_job(&row)?)),
+            None => Ok(None),
         }
     }
 
@@ -929,6 +1123,313 @@ impl Storage for PostgresStorage {
 
         Ok(jobs)
     }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        let table = self.recurring_table_name();
+        let query = format!(
+            r#"
+            INSERT INTO {table} (
+                id, cron, method, payload, queue, next_run_at,
+                last_run_at, created_at, updated_at, enabled
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                cron = EXCLUDED.cron,
+                method = EXCLUDED.method,
+                payload = EXCLUDED.payload,
+                queue = EXCLUDED.queue,
+                next_run_at = EXCLUDED.next_run_at,
+                last_run_at = EXCLUDED.last_run_at,
+                updated_at = EXCLUDED.updated_at,
+                enabled = EXCLUDED.enabled
+            "#
+        );
+        sqlx::query(&query)
+            .bind(&job.id)
+            .bind(&job.cron)
+            .bind(&job.method)
+            .bind(&job.payload)
+            .bind(&job.queue)
+            .bind(job.next_run_at)
+            .bind(job.last_run_at)
+            .bind(job.created_at)
+            .bind(job.updated_at)
+            .bind(job.enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to upsert recurring job: {}", e),
+            })?;
+        Ok(())
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        let query = format!("DELETE FROM {} WHERE id = $1", self.recurring_table_name());
+        let result = sqlx::query(&query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to delete recurring job: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT id, cron, method, payload, queue, next_run_at,
+                   last_run_at, created_at, updated_at, enabled
+            FROM {}
+            ORDER BY id
+            "#,
+            self.recurring_table_name()
+        );
+        let rows = sqlx::query(&query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to list recurring jobs: {}", e),
+            })?;
+        rows.iter().map(Self::row_to_recurring).collect()
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        // Claim rows in a transaction: inner SELECT with FOR UPDATE SKIP
+        // LOCKED picks eligible recurring templates; outer UPDATE parks
+        // next_run_at far in the future so a peer poller won't reclaim
+        // them before the caller advances + upserts the real next_run_at.
+        let table = self.recurring_table_name();
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET next_run_at = $1 + INTERVAL '3650 days'
+            WHERE id IN (
+                SELECT id FROM {table}
+                WHERE enabled = TRUE AND next_run_at <= $1
+                ORDER BY next_run_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $2
+            )
+            RETURNING id, cron, method, payload, queue, next_run_at,
+                      last_run_at, created_at, updated_at, enabled
+            "#
+        );
+        let rows = sqlx::query(&query)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to fetch due recurring jobs: {}", e),
+            })?;
+
+        // The UPDATE parked the next_run_at to now + 3650d — restore the
+        // originally-due value in the returned structs so the caller can
+        // make forward-progress decisions from the true firing time.
+        // (The DB row stays parked until the caller upserts the advanced
+        // row.)
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let mut r = Self::row_to_recurring(row)?;
+            r.next_run_at = now;
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let query = format!(
+            "DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at < $1",
+            self.table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to delete expired jobs: {}", e),
+            })?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        let query = format!(
+            r#"
+            INSERT INTO {table} (
+                server_id, server_name, started_at, last_heartbeat, worker_count, queues
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (server_id) DO UPDATE SET
+                server_name = EXCLUDED.server_name,
+                started_at = EXCLUDED.started_at,
+                last_heartbeat = EXCLUDED.last_heartbeat,
+                worker_count = EXCLUDED.worker_count,
+                queues = EXCLUDED.queues
+            "#,
+            table = self.servers_table_name()
+        );
+        sqlx::query(&query)
+            .bind(&info.server_id)
+            .bind(&info.server_name)
+            .bind(info.started_at)
+            .bind(info.last_heartbeat)
+            .bind(info.worker_count as i32)
+            .bind(&info.queues)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to register server: {}", e),
+            })?;
+        Ok(())
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "UPDATE {} SET last_heartbeat = $2 WHERE server_id = $1",
+            self.servers_table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(server_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to heartbeat server: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        let query = format!(
+            "DELETE FROM {} WHERE server_id = $1",
+            self.servers_table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(server_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to deregister server: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        let query = format!(
+            r#"
+            SELECT server_id, server_name, started_at, last_heartbeat, worker_count, queues
+            FROM {}
+            WHERE last_heartbeat < $1
+            "#,
+            self.servers_table_name()
+        );
+        let rows = sqlx::query(&query)
+            .bind(stale_before)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to list dead servers: {}", e),
+            })?;
+        rows.iter().map(Self::row_to_server_info).collect()
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        // Same shape as requeue_stranded_jobs but filtered on
+        // `state_data->>'server_name' = $1` instead of a staleness cutoff.
+        // Matches every Processing job attributed to this dead peer and
+        // flips it back to Enqueued so it can be re-picked by any live
+        // worker.
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET state_name = 'enqueued',
+                state_data = jsonb_build_object(
+                    'enqueued_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                    'queue', queue_name
+                ),
+                locked_by = NULL,
+                locked_at = NULL,
+                lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE state_name = 'processing'
+              AND state_data->>'server_name' = $1
+            "#,
+            table = self.table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(server_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to reclaim jobs from server: {}", e),
+            })?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        // Insert-or-refresh in one round-trip. The `ON CONFLICT DO UPDATE
+        // WHERE` predicate ensures the update only fires when the existing
+        // lock is expired OR already owned by this caller (re-entrant
+        // extend). If the predicate fails, no row is returned and we
+        // know the lock is held live by someone else.
+        let ttl_secs = ttl.as_secs_f64();
+        let locks_table = self.locks_table_name();
+        let query = format!(
+            r#"
+            INSERT INTO {table} (resource, owner, acquired_at, expires_at)
+            VALUES ($1, $2, NOW(), NOW() + make_interval(secs => $3))
+            ON CONFLICT (resource) DO UPDATE
+            SET owner = EXCLUDED.owner,
+                acquired_at = EXCLUDED.acquired_at,
+                expires_at = EXCLUDED.expires_at
+            WHERE {table}.expires_at < NOW() OR {table}.owner = EXCLUDED.owner
+            RETURNING resource
+            "#,
+            table = locks_table
+        );
+        let row: Option<(String,)> = sqlx::query_as(&query)
+            .bind(resource)
+            .bind(owner)
+            .bind(ttl_secs)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to acquire lock: {}", e),
+            })?;
+        Ok(row.is_some())
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        let locks_table = self.locks_table_name();
+        let query = format!(
+            "DELETE FROM {table} WHERE resource = $1 AND owner = $2",
+            table = locks_table
+        );
+        let result = sqlx::query(&query)
+            .bind(resource)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to release lock: {}", e),
+            })?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 #[cfg(test)]
@@ -965,7 +1466,7 @@ mod tests {
 
         // Test that we can instantiate the config without errors
         // This indirectly tests that our functions are available and don't cause compilation issues
-        assert_eq!(config.auto_migrate, false);
+        assert!(!config.auto_migrate);
         assert!(!config.database_url.is_empty());
 
         // Test direct access to the is_schema_error function to ensure it's available

@@ -24,7 +24,7 @@
 //!
 //! # tokio_test::block_on(async {
 //! let storage = Arc::new(MemoryStorage::new());
-//! let job = Job::new("process_data", vec!["input.csv".to_string()]);
+//! let job = Job::new("process_data", serde_json::json!({ "file": "input.csv" }));
 //! storage.enqueue(&job).await.unwrap();
 //! # });
 //! ```
@@ -73,9 +73,8 @@
 //! #[async_trait]
 //! impl Worker for EmailWorker {
 //!     async fn execute(&self, job: &Job, _context: &WorkerContext) -> Result<WorkerResult, QmlError> {
-//!         let email = &job.arguments[0];
+//!         let email = job.payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
 //!         println!("Sending email to: {}", email);
-//!         // Email sending logic here
 //!         Ok(WorkerResult::success(None, 0))
 //!     }
 //!
@@ -114,7 +113,11 @@
 //! ## 📊 **Dashboard & Monitoring**
 //!
 //! ### Real-time Web Dashboard
-//! ```rust
+//!
+//! Requires the `dashboard` cargo feature (off by default):
+//! `qml-rs = { version = "…", features = ["dashboard"] }`.
+//!
+//! ```ignore
 //! use qml_rs::{DashboardServer, MemoryStorage};
 //! use std::sync::Arc;
 //!
@@ -123,7 +126,7 @@
 //! let dashboard = DashboardServer::new(storage, Default::default());
 //!
 //! // Start dashboard on http://localhost:8080
-//! // dashboard.start("0.0.0.0:8080").await?;
+//! // dashboard.start().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -157,6 +160,68 @@
 //! # });
 //! ```
 //!
+//! ## ⏰ **Recurring Jobs**
+//!
+//! Register cron-scheduled templates with
+//! [`BackgroundJobServer::schedule_recurring`]. The built-in
+//! [`RecurringJobPoller`] wakes periodically, materializes each due template
+//! into a regular [`Job`], and advances its `next_run_at`. Templates
+//! persist in storage, so restarts and multi-server deployments don't lose
+//! schedule state — a claim-and-park discipline across backends ensures no
+//! two servers fire the same tick.
+//!
+//! ```rust
+//! use qml_rs::{BackgroundJobServer, MemoryStorage, ServerConfig, WorkerRegistry};
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let storage = Arc::new(MemoryStorage::new());
+//! let registry = Arc::new(WorkerRegistry::new());
+//! let server = BackgroundJobServer::new(
+//!     ServerConfig::new("srv-1"),
+//!     storage,
+//!     registry,
+//! );
+//!
+//! // Cron expression uses the `cron` crate's 6-field format:
+//! // `sec min hour day-of-month month day-of-week`.
+//! server
+//!     .schedule_recurring(
+//!         "daily-report",
+//!         "0 0 9 * * *",
+//!         "generate_report",
+//!         serde_json::json!({ "kind": "daily" }),
+//!         "default",
+//!     )
+//!     .await?;
+//! // ... later ...
+//! server.remove_recurring("daily-report").await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## 🧹 **Automatic Expiration**
+//!
+//! Final-state jobs (`Succeeded` and permanently-`Failed`) are stamped with
+//! `expires_at` by [`JobProcessor`] on transition. A background
+//! [`CleanupWorker`] sweeps expired rows on a fixed interval so the hot
+//! enqueue path stays O(1). Defaults: `succeeded_ttl = 24h`,
+//! `failed_ttl = 7 days`, sweep every minute — all configurable on
+//! [`ServerConfig`].
+//!
+//! ```rust
+//! use chrono::Duration;
+//! use qml_rs::ServerConfig;
+//!
+//! let config = ServerConfig::new("srv-1")
+//!     .succeeded_ttl(Duration::hours(12))
+//!     .failed_ttl(Duration::days(14))
+//!     .cleanup_interval(Duration::minutes(5));
+//! ```
+//!
+//! Both `enable_recurring` and `enable_cleanup` default to `true`; flip
+//! them off if you want to run the poller or sweep out-of-process.
+//!
 //! ## 🔄 **Job States & Lifecycle**
 //!
 //! Jobs progress through well-defined states:
@@ -173,7 +238,7 @@
 //! ```rust
 //! use qml_rs::{Job, JobState};
 //!
-//! let mut job = Job::new("process_payment", vec!["order_123".to_string()]);
+//! let mut job = Job::new("process_payment", serde_json::json!({ "order": "order_123" }));
 //!
 //! // Job starts as Enqueued
 //! assert!(matches!(job.state, JobState::Enqueued { .. }));
@@ -258,7 +323,7 @@
 //! #[tokio::test]
 //! async fn test_job_processing() {
 //!     let storage = MemoryStorage::new();
-//!     let job = Job::new("test_job", vec!["arg1".to_string()]);
+//!     let job = Job::new("test_job", serde_json::json!({ "arg": "arg1" }));
 //!
 //!     storage.enqueue(&job).await.unwrap();
 //!     let retrieved = storage.get(&job.id).await.unwrap().unwrap();
@@ -278,7 +343,7 @@
 //!
 //!     // Create 100 jobs concurrently
 //!     let jobs: Vec<_> = (0..100).map(|i| {
-//!         Job::new("concurrent_job", vec![i.to_string()])
+//!         Job::new("concurrent_job", serde_json::json!({ "i": i }))
 //!     }).collect();
 //!
 //!     let futures: Vec<_> = jobs.iter().map(|job| {
@@ -357,22 +422,31 @@
 //! [examples]:
 
 pub mod core;
+#[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod error;
 pub mod processing;
 pub mod storage;
 
 // Re-export main types for convenience
-pub use core::{Job, JobState};
+pub use core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
+#[cfg(feature = "dashboard")]
 pub use dashboard::{
-    DashboardConfig, DashboardServer, DashboardService, JobStatistics, QueueStatistics,
+    DashboardAuth, DashboardConfig, DashboardServer, DashboardService, JobStatistics,
+    QueueStatistics,
 };
 pub use error::{QmlError, Result};
 pub use processing::{
-    BackgroundJobServer, JobActivator, JobProcessor, JobScheduler, RetryPolicy, RetryStrategy,
-    ServerConfig, Worker, WorkerConfig, WorkerContext, WorkerRegistry, WorkerResult,
+    BackgroundJobServer, CleanupWorker, JobMiddleware, JobProcessor, JobScheduler, Next,
+    RecurringJobPoller, RetryPolicy, RetryStrategy, ServerConfig, StateChangeHook,
+    TracingMiddleware, TypedWorker, TypedWorkerAdapter, Worker, WorkerConfig, WorkerContext,
+    WorkerRegistry, WorkerResult,
 };
-pub use storage::{MemoryStorage, Storage, StorageConfig, StorageError, StorageInstance};
+#[cfg(feature = "metrics")]
+pub use processing::{PrometheusMetrics, PrometheusMiddleware};
+pub use storage::{
+    MemoryStorage, MonitoringApi, Storage, StorageConfig, StorageError, StorageInstance,
+};
 
 #[cfg(feature = "redis")]
 pub use storage::{RedisConfig, RedisStorage};

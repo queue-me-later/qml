@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use redis::{AsyncCommands, Client, RedisResult, aio::ConnectionManager};
 use serde_json;
 use std::collections::HashMap;
 use tokio::time::timeout;
 
-use super::{RedisConfig, Storage, StorageError};
-use crate::core::{Job, JobState};
+use super::{MonitoringApi, RedisConfig, Storage, StorageError};
+use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Redis storage implementation for jobs
 ///
@@ -90,6 +90,34 @@ impl RedisStorage {
     /// Get the Redis key for all jobs set
     fn all_jobs_key(&self) -> String {
         format!("{}:all", self.config.key_prefix)
+    }
+
+    /// Hash key holding a single recurring-job template.
+    fn recurring_key(&self, id: &str) -> String {
+        format!("{}:recurring:{}", self.config.key_prefix, id)
+    }
+
+    /// Sorted-set of recurring-job ids keyed by `next_run_at` (epoch ms).
+    /// Used as a due-time index so `ZRANGEBYSCORE` can pull only due rows.
+    fn recurring_index_key(&self) -> String {
+        format!("{}:recurring:index", self.config.key_prefix)
+    }
+
+    /// Key for a single server-registry entry (JSON blob).
+    fn server_key(&self, server_id: &str) -> String {
+        format!("{}:server:{}", self.config.key_prefix, server_id)
+    }
+
+    /// Set of all live server_ids. Used to iterate for dead-server scans.
+    fn servers_index_key(&self) -> String {
+        format!("{}:servers", self.config.key_prefix)
+    }
+
+    /// Redis key for a single generic named-lock entry (D2). The value
+    /// is the owner string; TTL is enforced by Redis PX so expired keys
+    /// disappear automatically.
+    fn named_lock_key(&self, resource: &str) -> String {
+        format!("{}:lock:{}", self.config.key_prefix, resource)
     }
 
     /// Convert job state to a string for indexing
@@ -206,26 +234,7 @@ impl RedisStorage {
 }
 
 #[async_trait]
-impl Storage for RedisStorage {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        let mut conn = self.get_connection().await?;
-        let job_key = self.job_key(&job.id);
-
-        // Serialize the job
-        let job_json = serde_json::to_string(job).map_err(|e| {
-            StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
-        })?;
-
-        // Store the job
-        self.with_timeout::<_, ()>(conn.set(&job_key, job_json))
-            .await?;
-
-        // Update indices
-        self.update_job_indices(job, None).await?;
-
-        Ok(())
-    }
-
+impl MonitoringApi for RedisStorage {
     async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
         let mut conn = self.get_connection().await?;
         let job_key = self.job_key(job_id);
@@ -338,7 +347,7 @@ impl Storage for RedisStorage {
         }
     }
 
-    async fn get_job_counts(&self) -> Result<HashMap<JobState, usize>, StorageError> {
+    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
         let mut conn = self.get_connection().await?;
         let counts_key = self.job_counts_key();
 
@@ -347,21 +356,43 @@ impl Storage for RedisStorage {
         let mut counts = HashMap::new();
         for (state_str, count) in raw_counts {
             if count > 0 {
-                let state = match state_str.as_str() {
-                    "enqueued" => JobState::enqueued(""),
-                    "processing" => JobState::processing("", ""),
-                    "succeeded" => JobState::succeeded(0, None),
-                    "failed" => JobState::failed("", None, 0),
-                    "deleted" => JobState::deleted(None),
-                    "scheduled" => JobState::scheduled(Utc::now(), ""),
-                    "awaiting_retry" => JobState::awaiting_retry(Utc::now(), 0, ""),
+                let kind = match state_str.as_str() {
+                    "enqueued" => JobStateKind::Enqueued,
+                    "processing" => JobStateKind::Processing,
+                    "succeeded" => JobStateKind::Succeeded,
+                    "failed" => JobStateKind::Failed,
+                    "deleted" => JobStateKind::Deleted,
+                    "scheduled" => JobStateKind::Scheduled,
+                    "awaiting_retry" => JobStateKind::AwaitingRetry,
                     _ => continue,
                 };
-                counts.insert(state, count as usize);
+                counts.insert(kind, count as usize);
             }
         }
 
         Ok(counts)
+    }
+}
+
+#[async_trait]
+impl Storage for RedisStorage {
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
+        let mut conn = self.get_connection().await?;
+        let job_key = self.job_key(&job.id);
+
+        // Serialize the job
+        let job_json = serde_json::to_string(job).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
+        })?;
+
+        // Store the job
+        self.with_timeout::<_, ()>(conn.set(&job_key, job_json))
+            .await?;
+
+        // Update indices
+        self.update_job_indices(job, None).await?;
+
+        Ok(())
     }
 
     async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {
@@ -380,16 +411,113 @@ impl Storage for RedisStorage {
                 // Double-check availability (in case of race conditions)
                 if Self::is_job_available(&job) {
                     jobs.push(job);
-                    if let Some(limit) = limit {
-                        if jobs.len() >= limit {
-                            break;
-                        }
+                    if let Some(limit) = limit
+                        && jobs.len() >= limit
+                    {
+                        break;
                     }
                 }
             }
         }
 
         Ok(jobs)
+    }
+
+    async fn fetch_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // NOTE: this iterates the scheduled state set and filters client-side.
+        // A future optimization is to maintain a ZSET scored by enqueue_at so
+        // ZRANGEBYSCORE can push the time predicate to Redis directly.
+        let mut conn = self.get_connection().await?;
+        let state_key = self.state_index_key("scheduled");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&state_key)).await?;
+
+        let mut due = Vec::new();
+        for job_id in job_ids {
+            if let Some(job) = self.get(&job_id).await?
+                && let JobState::Scheduled { enqueue_at, .. } = &job.state
+                && *enqueue_at <= now
+            {
+                due.push(job);
+            }
+        }
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn fetch_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // NOTE: same client-side filter tradeoff as fetch_due_scheduled_jobs.
+        let mut conn = self.get_connection().await?;
+        let state_key = self.state_index_key("awaiting_retry");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&state_key)).await?;
+
+        let mut due = Vec::new();
+        for job_id in job_ids {
+            if let Some(job) = self.get(&job_id).await?
+                && let JobState::AwaitingRetry { retry_at, .. } = &job.state
+                && *retry_at <= now
+            {
+                due.push(job);
+            }
+        }
+
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        // Iterate the processing state set, transition every stale job back
+        // to Enqueued. Done Rust-side (not Lua) because we need to
+        // round-trip through `serde_json` to build the new JobState cleanly
+        // — the Lua script path in fetch_and_lock_job is pragmatic but
+        // fragile, and this is a cold startup sweep so perf isn't critical.
+        let mut conn = self.get_connection().await?;
+        let processing_key = self.state_index_key("processing");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&processing_key)).await?;
+
+        let mut recovered = 0;
+        for job_id in job_ids {
+            let Some(mut job) = self.get(&job_id).await? else {
+                continue;
+            };
+            let stale = matches!(
+                &job.state,
+                JobState::Processing { started_at, .. } if *started_at < stale_before
+            );
+            if !stale {
+                continue;
+            }
+
+            // Bypass `Job::set_state` — `Processing → Enqueued` isn't in
+            // the normal allowlist, but stale recovery is a legitimate
+            // out-of-band transition.
+            job.state = JobState::enqueued(&job.queue);
+            self.update(&job).await?;
+            recovered += 1;
+        }
+
+        Ok(recovered)
     }
 
     async fn fetch_and_lock_job(
@@ -423,34 +551,39 @@ impl Storage for RedisStorage {
                 return nil
             end
             
-            -- Parse job to check if it's still available
+            -- Parse job to check if it's still available. JobState is
+            -- externally tagged by serde, so the variant surfaces as a single
+            -- key on job.state (e.g. Enqueued, AwaitingRetry). Any job whose
+            -- variant is not Enqueued or AwaitingRetry is not eligible.
             local job = cjson.decode(job_data)
-            if job.state.type ~= 'enqueued' and job.state.type ~= 'retrying' then
-                -- Job is no longer available, remove from available set
+            if not (job.state.Enqueued or job.state.AwaitingRetry) then
                 redis.call('ZREM', available_key, job_id)
                 return nil
             end
-            
-            -- Mark job as processing
+
+            -- Mark job as processing, matching the externally-tagged layout
+            -- so Rust can deserialize it back into JobState::Processing.
             job.state = {
-                type = 'processing',
-                worker_id = worker_id,
-                started_at = current_time
+                Processing = {
+                    worker_id = worker_id,
+                    started_at = current_time,
+                    server_name = 'redis-storage'
+                }
             }
             job.updated_at = current_time
-            
+
             -- Update job in Redis
             redis.call('SET', job_key, cjson.encode(job))
-            
+
             -- Remove from available jobs and update indices
             redis.call('ZREM', available_key, job_id)
             redis.call('SREM', 'qml:state:enqueued', job_id)
-            redis.call('SREM', 'qml:state:retrying', job_id)
+            redis.call('SREM', 'qml:state:awaiting_retry', job_id)
             redis.call('SADD', 'qml:state:processing', job_id)
-            
+
             -- Update counters
             redis.call('HINCRBY', 'qml:counts', 'enqueued', -1)
-            redis.call('HINCRBY', 'qml:counts', 'retrying', -1)
+            redis.call('HINCRBY', 'qml:counts', 'awaiting_retry', -1)
             redis.call('HINCRBY', 'qml:counts', 'processing', 1)
             
             return job_data
@@ -556,6 +689,330 @@ impl Storage for RedisStorage {
 
         Ok(jobs)
     }
+
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.recurring_key(&job.id);
+        let json = serde_json::to_string(job).map_err(|e| {
+            StorageError::serialization_with_source(
+                "Failed to serialize recurring job",
+                Box::new(e),
+            )
+        })?;
+        self.with_timeout::<_, ()>(conn.set(&key, json)).await?;
+        let score = job.next_run_at.timestamp_millis() as f64;
+        self.with_timeout::<_, ()>(conn.zadd(self.recurring_index_key(), &job.id, score))
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.recurring_key(id);
+        let removed: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+        let _: i32 = self
+            .with_timeout::<_, i32>(conn.zrem(self.recurring_index_key(), id))
+            .await?;
+        Ok(removed > 0)
+    }
+
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.zrange(self.recurring_index_key(), 0, -1))
+            .await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let key = self.recurring_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            if let Some(s) = json {
+                let r: RecurringJob = serde_json::from_str(&s).map_err(|e| {
+                    StorageError::serialization_with_source(
+                        "Failed to parse recurring job",
+                        Box::new(e),
+                    )
+                })?;
+                out.push(r);
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn fetch_due_recurring_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RecurringJob>, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let index = self.recurring_index_key();
+        let now_ms = now.timestamp_millis() as f64;
+        // Pull candidate ids; use ZRANGEBYSCORE for due windows.
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.zrangebyscore_limit(
+                &index,
+                f64::NEG_INFINITY,
+                now_ms,
+                0,
+                limit as isize,
+            ))
+            .await?;
+
+        let mut claimed = Vec::new();
+        // Park sentinel: far-future score so peers won't reclaim before
+        // the caller advances + upserts.
+        let park_ms = (now + chrono::Duration::days(3650)).timestamp_millis() as f64;
+        for id in ids {
+            // Acquire a per-id claim lock (SET NX) so two pollers don't
+            // both materialize the same firing.
+            let claim_key = format!("{}:recurring:claim:{}", self.config.key_prefix, id);
+            let claimed_ok: Option<String> = self
+                .with_timeout::<_, Option<String>>(
+                    redis::cmd("SET")
+                        .arg(&claim_key)
+                        .arg("1")
+                        .arg("NX")
+                        .arg("EX")
+                        .arg(60i64)
+                        .query_async(&mut conn),
+                )
+                .await?;
+            if claimed_ok.is_none() {
+                continue;
+            }
+
+            let key = self.recurring_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else { continue };
+            let r: RecurringJob = serde_json::from_str(&s).map_err(|e| {
+                StorageError::serialization_with_source(
+                    "Failed to parse recurring job",
+                    Box::new(e),
+                )
+            })?;
+            if !r.enabled || r.next_run_at > now {
+                continue;
+            }
+            // Park in the index so peer pollers skip it; `r.next_run_at`
+            // on the returned template is still the true firing time
+            // because the sentinel only lives in the ZSET index.
+            self.with_timeout::<_, ()>(conn.zadd(&index, &id, park_ms))
+                .await?;
+            claimed.push(r);
+            if claimed.len() >= limit {
+                break;
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        // Redis backends also set native TTL via update_job_indices, but
+        // `expires_at` on the Job is the authoritative clock because it
+        // gives the CleanupWorker a uniform cross-backend deadline.
+        let mut conn = self.get_connection().await?;
+        let all_key = self.all_jobs_key();
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.smembers(&all_key))
+            .await?;
+
+        let mut removed = 0usize;
+        for id in ids {
+            let key = self.job_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else { continue };
+            let job: Job = match serde_json::from_str(&s) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            let expired = match job.expires_at {
+                Some(ts) => ts < now,
+                None => false,
+            };
+            if !expired {
+                continue;
+            }
+            self.remove_job_indices(&id, &job).await?;
+            let _: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.server_key(&info.server_id);
+        let index = self.servers_index_key();
+        let json = serde_json::to_string(info).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize ServerInfo", Box::new(e))
+        })?;
+        self.with_timeout::<_, ()>(conn.set(&key, json)).await?;
+        self.with_timeout::<_, ()>(conn.sadd(&index, &info.server_id))
+            .await?;
+        Ok(())
+    }
+
+    async fn heartbeat_server(
+        &self,
+        server_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.server_key(server_id);
+        let json: Option<String> = self
+            .with_timeout::<_, Option<String>>(conn.get(&key))
+            .await?;
+        let Some(s) = json else {
+            return Ok(false);
+        };
+        let mut info: ServerInfo = serde_json::from_str(&s).map_err(|e| {
+            StorageError::serialization_with_source("Failed to parse ServerInfo", Box::new(e))
+        })?;
+        info.last_heartbeat = now;
+        let updated = serde_json::to_string(&info).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize ServerInfo", Box::new(e))
+        })?;
+        self.with_timeout::<_, ()>(conn.set(&key, updated)).await?;
+        Ok(true)
+    }
+
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let key = self.server_key(server_id);
+        let index = self.servers_index_key();
+        let deleted: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+        let _: i32 = self
+            .with_timeout::<_, i32>(conn.srem(&index, server_id))
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn list_dead_servers(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Vec<ServerInfo>, StorageError> {
+        let mut conn = self.get_connection().await?;
+        let index = self.servers_index_key();
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.smembers(&index))
+            .await?;
+
+        let mut dead = Vec::new();
+        for id in ids {
+            let key = self.server_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else {
+                // Stale index entry — drop it to keep the set bounded.
+                let _: i32 = self.with_timeout::<_, i32>(conn.srem(&index, &id)).await?;
+                continue;
+            };
+            let info: ServerInfo = match serde_json::from_str(&s) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            if info.last_heartbeat < stale_before {
+                dead.push(info);
+            }
+        }
+        Ok(dead)
+    }
+
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
+        // Mirror `requeue_stranded_jobs`: walk the processing state set and
+        // transition each job whose `server_name` matches back to Enqueued.
+        // Idempotent — a second call sees no matches and returns 0.
+        let mut conn = self.get_connection().await?;
+        let processing_key = self.state_index_key("processing");
+        let job_ids: Vec<String> = self.with_timeout(conn.smembers(&processing_key)).await?;
+
+        let mut reclaimed = 0;
+        for job_id in job_ids {
+            let Some(mut job) = self.get(&job_id).await? else {
+                continue;
+            };
+            let owned = matches!(
+                &job.state,
+                JobState::Processing { server_name, .. } if server_name == server_id
+            );
+            if !owned {
+                continue;
+            }
+            // Bypass `Job::set_state` — Processing → Enqueued isn't in the
+            // normal allowlist, but peer reclaim is a legitimate out-of-band
+            // transition, same as the stranded-job sweep.
+            job.state = JobState::enqueued(&job.queue);
+            self.update(&job).await?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    async fn try_acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, StorageError> {
+        // One Lua script to cover all three cases:
+        //   - free (GET returns nil — either never set or PX expired)
+        //   - same owner re-entrant extend (GET == ARGV[1])
+        //   - held by someone else (fail)
+        // Redis auto-expires via PX, so we don't need to stamp our own
+        // expires_at.
+        let ttl_ms = ttl.as_millis() as u64;
+        let script = redis::Script::new(
+            r#"
+            local cur = redis.call('GET', KEYS[1])
+            if cur == false or cur == ARGV[1] then
+                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                return 1
+            else
+                return 0
+            end
+            "#,
+        );
+        let key = self.named_lock_key(resource);
+        let mut conn = self.get_connection().await?;
+        let acquired: i64 = self
+            .with_timeout(
+                script
+                    .key(&key)
+                    .arg(owner)
+                    .arg(ttl_ms)
+                    .invoke_async(&mut conn),
+            )
+            .await?;
+        Ok(acquired == 1)
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
+        // Owner-checked DEL via Lua so a stale caller whose lock has
+        // already been taken over by another owner cannot accidentally
+        // release the new holder's lock.
+        let script = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            else
+                return 0
+            end
+            "#,
+        );
+        let key = self.named_lock_key(resource);
+        let mut conn = self.get_connection().await?;
+        let deleted: i64 = self
+            .with_timeout(script.key(&key).arg(owner).invoke_async(&mut conn))
+            .await?;
+        Ok(deleted == 1)
+    }
 }
 
 #[cfg(test)]
@@ -574,14 +1031,11 @@ mod tests {
 
     async fn create_test_storage() -> Option<RedisStorage> {
         // Try to create a test storage, return None if Redis is not available
-        match RedisStorage::with_config(test_redis_config()).await {
-            Ok(storage) => Some(storage),
-            Err(_) => None, // Redis not available, skip tests
-        }
+        RedisStorage::with_config(test_redis_config()).await.ok()
     }
 
     fn create_test_job() -> Job {
-        Job::new("test_job", vec!["test_arg".to_string()])
+        Job::new("test_job", serde_json::json!(["test_arg".to_string()]))
     }
 
     #[tokio::test]

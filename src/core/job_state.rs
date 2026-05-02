@@ -161,6 +161,15 @@ impl JobState {
             (Processing { .. }, Succeeded { .. }) => true,
             (Processing { .. }, Failed { .. }) => true,
             (Processing { .. }, Deleted { .. }) => true,
+            // The retry path used to require a two-step
+            // `Processing → Failed → AwaitingRetry`, with the
+            // intermediate `Failed` never reaching storage. That was
+            // fragile — a panic between the two `set_state` calls
+            // left the in-memory job in a state callers couldn't
+            // distinguish from a real terminal failure. Allow the
+            // direct transition so `JobProcessor::handle_job_retry`
+            // can be a single hop.
+            (Processing { .. }, AwaitingRetry { .. }) => true,
 
             // From Scheduled
             (Scheduled { .. }, Enqueued { .. }) => true,

@@ -21,23 +21,46 @@ impl Default for StorageConfig {
     }
 }
 
-/// Configuration for in-memory storage
+/// Configuration for in-memory storage.
+///
+/// Earlier revisions carried `auto_cleanup` / `cleanup_interval` knobs
+/// here, but those were dead — `MemoryStorage` never read them, and
+/// final-state expiration is owned out-of-band by
+/// [`crate::processing::CleanupWorker`] which sweeps `expires_at` set
+/// by `JobProcessor`. The fields and their builders are kept as
+/// deprecated no-ops for one release so existing callers compile, but
+/// they don't influence runtime behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryConfig {
     /// Maximum number of jobs to keep in memory
     pub max_jobs: Option<usize>,
-    /// Whether to enable auto-cleanup of completed jobs
+    /// **Deprecated.** Was a knob for in-process auto-cleanup, but
+    /// `MemoryStorage` never observed it and never will — cleanup is
+    /// owned by the cross-backend `CleanupWorker`. Kept to avoid
+    /// breaking downstream serializations that mention it. Will be
+    /// removed in the next major release.
+    #[deprecated(
+        note = "auto_cleanup is a no-op; CleanupWorker handles expiration. Will be removed."
+    )]
     pub auto_cleanup: bool,
-    /// Interval for cleanup operations
+    /// **Deprecated.** Same story as `auto_cleanup` — kept as a
+    /// compatibility shim. Will be removed.
+    #[deprecated(
+        note = "cleanup_interval is a no-op; configure CleanupWorker via ServerConfig instead."
+    )]
     pub cleanup_interval: Option<Duration>,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
+        // The deprecated fields are still initialized so the struct
+        // round-trips through serde for callers that have serialized
+        // old configs to disk.
+        #[allow(deprecated)]
         Self {
             max_jobs: Some(10_000),
             auto_cleanup: true,
-            cleanup_interval: Some(Duration::from_secs(300)), // 5 minutes
+            cleanup_interval: Some(Duration::from_secs(300)),
         }
     }
 }
@@ -60,15 +83,29 @@ impl MemoryConfig {
         self
     }
 
-    /// Enable auto-cleanup of completed jobs
+    /// **Deprecated.** No-op — see the field-level note on
+    /// [`MemoryConfig::auto_cleanup`].
+    #[deprecated(
+        note = "auto_cleanup is a no-op; CleanupWorker handles expiration. Will be removed."
+    )]
     pub fn with_auto_cleanup(mut self, enabled: bool) -> Self {
-        self.auto_cleanup = enabled;
+        #[allow(deprecated)]
+        {
+            self.auto_cleanup = enabled;
+        }
         self
     }
 
-    /// Set the cleanup interval
+    /// **Deprecated.** No-op — see the field-level note on
+    /// [`MemoryConfig::cleanup_interval`].
+    #[deprecated(
+        note = "cleanup_interval is a no-op; configure CleanupWorker via ServerConfig instead."
+    )]
     pub fn with_cleanup_interval(mut self, interval: Duration) -> Self {
-        self.cleanup_interval = Some(interval);
+        #[allow(deprecated)]
+        {
+            self.cleanup_interval = Some(interval);
+        }
         self
     }
 }
@@ -393,7 +430,12 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_memory_config_default() {
+        // The deprecated `auto_cleanup` / `cleanup_interval` fields
+        // still need to default to a value because the struct has to
+        // round-trip through serde without dropping them. The runtime
+        // ignores them either way.
         let config = MemoryConfig::default();
         assert_eq!(config.max_jobs, Some(10_000));
         assert!(config.auto_cleanup);
@@ -401,7 +443,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_memory_config_builder() {
+        // Same back-compat shim as `test_memory_config_default`: the
+        // builders are deprecated no-ops but must still set the fields
+        // they take so old serialized configs round-trip cleanly.
         let config = MemoryConfig::new()
             .with_max_jobs(5_000)
             .with_auto_cleanup(false)

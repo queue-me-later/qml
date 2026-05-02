@@ -33,6 +33,11 @@ axum = { version = "0.8.4", features = ["ws"], optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6.6", features = ["cors", "fs"], optional = true }
 futures-util = { version = "0.3", optional = true }
+# Replace hand-rolled base64 / constant-time-eq in dashboard/auth.rs with
+# audited implementations. `subtle` is a drop-in for the constant-time
+# comparison; `base64` (engine API) replaces the bespoke decoder.
+base64 = { version = "0.22", optional = true }
+subtle = { version = "2.6", optional = true }
 
 # PostgreSQL storage support
 sqlx = { version = "0.8", features = [
@@ -63,7 +68,14 @@ postgres = ["sqlx"]
 redis = ["dep:redis"]
 # Built-in HTTP dashboard (axum + tower + WebSocket UI). Off by default so
 # headless workers don't pay the compile cost of pulling in axum/tower.
-dashboard = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
+dashboard = [
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:futures-util",
+    "dep:base64",
+    "dep:subtle",
+]
 # Prometheus metrics: provides a `PrometheusMetrics` registry + a
 # `PrometheusMiddleware` for the F1 middleware stack, plus a `/metrics`
 # route on the dashboard when combined with the `dashboard` feature.

@@ -343,19 +343,11 @@ impl JobProcessor {
             return self.fail_job_permanently(job, error, None).await;
         }
 
-        // Save the pre-retry state for the state-change hook. The state
-        // machine forces a two-step transition (Processing → Failed →
-        // AwaitingRetry), but the intermediate `Failed` is an artifact
-        // that never hits storage — observers should see one logical
-        // transition from whatever we were in directly to AwaitingRetry.
+        // Save the pre-retry state for the state-change hook so
+        // observers see one logical transition (whatever-we-were-in →
+        // AwaitingRetry), not the intermediate Failed step that
+        // earlier revisions had to dance through.
         let pre_retry_state = job.state.clone();
-
-        // First transition to Failed state (intermediate, not hooked)
-        let failed_state = JobState::failed(error.clone(), None);
-        if let Err(e) = job.set_state(failed_state) {
-            error!("Failed to set job state to Failed: {}", e);
-            return Err(e);
-        }
 
         // Calculate retry time — the retry policy counts attempts starting from
         // 1, and `job.attempt` already reflects the just-completed attempt, so
@@ -364,16 +356,19 @@ impl JobProcessor {
             .or_else(|| self.retry_policy.calculate_retry_time(job.attempt))
             .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(60));
 
-        // Then transition to AwaitingRetry
+        // One-shot transition. The state machine permits
+        // `Processing → AwaitingRetry` directly (added when this code
+        // was simplified), so we no longer need the
+        // `Processing → Failed → AwaitingRetry` two-step which was
+        // fragile against a panic landing on the intermediate Failed.
         let retry_state = JobState::awaiting_retry(retry_time, &error);
-
         if let Err(e) = job.set_state(retry_state) {
             error!("Failed to set job state to AwaitingRetry: {}", e);
             return Err(e);
         }
 
         // Fire the hook with the saved pre-retry state so observers see
-        // the logical transition, not the intermediate Failed step.
+        // the logical transition.
         self.fire_state_change_hook(job, &pre_retry_state);
 
         // Update in storage

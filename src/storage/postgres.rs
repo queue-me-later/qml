@@ -145,22 +145,23 @@ impl PostgresStorage {
             })
     }
 
-    /// Helper method to detect if a database error is schema-related
+    /// Detect whether a database error is "schema is missing" — i.e.
+    /// the kind that auto-migrate should handle by re-running
+    /// `install.sql`.
     ///
-    /// This method analyzes database errors to determine if they're caused by
-    /// missing schema or tables, which indicates migrations need to be run.
+    /// SQLSTATE alone is sufficient. The previous implementation also
+    /// matched the error message text (`"does not exist"` etc.), but
+    /// that's locale-dependent: a Postgres server with
+    /// `lc_messages = de_DE.UTF-8` returns "Existiert nicht" and the
+    /// string fallback silently breaks. Codes 42P01 (undefined_table)
+    /// and 3F000 (invalid_schema_name) are stable across locales and
+    /// already cover the scenarios `handle_schema_error` cares about.
     pub(crate) fn is_schema_error(error: &sqlx::Error) -> bool {
         match error {
             sqlx::Error::Database(db_err) => {
                 let code = db_err.code().unwrap_or_default();
-                let message = db_err.message().to_lowercase();
-
-                // PostgreSQL error codes for missing schema/table
-                code == "42P01" || // undefined_table
-                code == "3F000" || // invalid_schema_name
-                message.contains("does not exist") ||
-                message.contains("relation") && message.contains("does not exist") ||
-                message.contains("schema") && message.contains("does not exist")
+                code == "42P01" /* undefined_table */
+                    || code == "3F000" /* invalid_schema_name */
             }
             _ => false,
         }

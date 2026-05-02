@@ -38,6 +38,8 @@ async fn shutdown_token_fires_returns_start_cleanly() {
         auth: None,
         #[cfg(feature = "metrics")]
         metrics: None,
+        #[cfg(feature = "metrics")]
+        metrics_skip_auth: false,
     };
 
     let server = Arc::new(DashboardServer::new(storage, config));
@@ -74,6 +76,8 @@ async fn external_cancellation_token_propagates() {
         auth: None,
         #[cfg(feature = "metrics")]
         metrics: None,
+        #[cfg(feature = "metrics")]
+        metrics_skip_auth: false,
     };
 
     let server = Arc::new(DashboardServer::new(storage, config));
@@ -149,6 +153,8 @@ async fn shutdown_returns_even_when_periodic_task_is_wedged() {
         auth: None,
         #[cfg(feature = "metrics")]
         metrics: None,
+        #[cfg(feature = "metrics")]
+        metrics_skip_auth: false,
     };
 
     let server = Arc::new(DashboardServer::new(storage, config));

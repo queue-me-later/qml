@@ -38,13 +38,26 @@ pub struct DashboardConfig {
     pub auth: Option<DashboardAuth>,
     /// Optional Prometheus metrics handle. When set, the dashboard exposes
     /// a `GET /metrics` endpoint returning the Prometheus text exposition
-    /// format over the shared [`PrometheusMetrics`] registry. The route
-    /// inherits the same auth guard as the rest of the dashboard — scrapers
-    /// that can't authenticate should scrape via a sidecar on the loopback.
+    /// format over the shared [`PrometheusMetrics`] registry.
+    ///
+    /// By default the route inherits the same auth guard as the rest of
+    /// the dashboard. Toggle [`metrics_skip_auth`](Self::metrics_skip_auth)
+    /// to true to expose `/metrics` without authentication — useful when
+    /// a Prometheus scraper can't speak Basic/Bearer and the dashboard
+    /// is bound to a loopback or otherwise-firewalled interface.
     ///
     /// Requires the `metrics` cargo feature.
     #[cfg(feature = "metrics")]
     pub metrics: Option<Arc<PrometheusMetrics>>,
+    /// When true, the `/metrics` route is mounted *outside* the auth
+    /// middleware so Prometheus scrapers can read it without
+    /// credentials. The CSRF guard is unaffected (and a no-op for
+    /// `GET` regardless). Defaults to false — opt in explicitly.
+    ///
+    /// Only meaningful when [`metrics`](Self::metrics) is `Some` and
+    /// the `metrics` cargo feature is enabled.
+    #[cfg(feature = "metrics")]
+    pub metrics_skip_auth: bool,
 }
 
 impl Default for DashboardConfig {
@@ -56,6 +69,8 @@ impl Default for DashboardConfig {
             auth: None,
             #[cfg(feature = "metrics")]
             metrics: None,
+            #[cfg(feature = "metrics")]
+            metrics_skip_auth: false,
         }
     }
 }
@@ -190,30 +205,58 @@ impl DashboardServer {
             .route("/queues", get(dashboard_ui))
             .route("/statistics", get(dashboard_ui));
 
-        let mut app = Router::new()
+        // Routes that *always* sit under the auth guard.
+        let mut guarded = Router::new()
             .merge(api_router)
             .merge(ws_router)
             .merge(ui_router);
 
+        // The /metrics route can land on either the guarded router (the
+        // default — inherits auth) or a separate unguarded router when
+        // `metrics_skip_auth` is set. Hold it in an Option so the auth
+        // layering below stays linear.
         #[cfg(feature = "metrics")]
-        if let Some(metrics) = self.config.metrics.clone() {
-            let metrics_router = Router::new()
+        let metrics_router = self.config.metrics.clone().map(|metrics| {
+            Router::new()
                 .route("/metrics", get(metrics_handler))
-                .with_state(metrics);
-            app = app.merge(metrics_router);
+                .with_state(metrics)
+        });
+
+        #[cfg(feature = "metrics")]
+        let unguarded_metrics_router = match &metrics_router {
+            Some(_) if self.config.metrics_skip_auth => metrics_router.clone(),
+            _ => None,
+        };
+
+        #[cfg(feature = "metrics")]
+        if let Some(metrics_router) = metrics_router.clone() {
+            // If skip-auth is off, fold metrics into the guarded set so
+            // auth applies just like every other route.
+            if !self.config.metrics_skip_auth {
+                guarded = guarded.merge(metrics_router);
+            }
         }
 
         // DB4: same-origin guard on state-changing methods. Applied before
         // auth so cross-site mutation attempts are rejected without leaking
         // an auth challenge.
-        app = app.layer(middleware::from_fn(auth::csrf_guard));
+        guarded = guarded.layer(middleware::from_fn(auth::csrf_guard));
 
-        // DB2: optional auth guard on every route.
+        // DB2: optional auth guard on every guarded route.
         if let Some(auth) = &self.config.auth {
-            app = app.layer(middleware::from_fn_with_state(
+            guarded = guarded.layer(middleware::from_fn_with_state(
                 Arc::new(auth.clone()),
                 auth::require_auth,
             ));
+        }
+
+        // Stitch the unguarded /metrics route in *after* the auth
+        // layer if `metrics_skip_auth` is set, so it bypasses the
+        // auth middleware entirely.
+        let mut app = guarded;
+        #[cfg(feature = "metrics")]
+        if let Some(unguarded) = unguarded_metrics_router {
+            app = app.merge(unguarded);
         }
 
         app.layer(
@@ -702,5 +745,100 @@ mod metrics_route_tests {
         let body = std::str::from_utf8(&body_bytes).unwrap();
         assert!(body.contains("qml_jobs_enqueued_total"));
         assert!(body.contains("queue=\"default\""));
+    }
+
+    /// Build the full DashboardServer router and exercise it with
+    /// `tower::ServiceExt::oneshot`. Verifies that
+    /// `metrics_skip_auth = true` lets `/metrics` through without
+    /// credentials while the rest of the routes still demand them.
+    async fn server_router(config: DashboardConfig) -> Router {
+        use crate::storage::MemoryStorage;
+        let storage = Arc::new(MemoryStorage::new());
+        let server = DashboardServer::new(storage, config);
+        server.create_app().await
+    }
+
+    #[tokio::test]
+    async fn metrics_route_inherits_auth_when_skip_auth_is_false() {
+        let metrics = PrometheusMetrics::new().expect("registry");
+        let config = DashboardConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            statistics_update_interval: 60,
+            auth: Some(crate::dashboard::auth::DashboardAuth::Basic {
+                username: "u".to_string(),
+                password: "p".to_string(),
+            }),
+            metrics: Some(metrics),
+            metrics_skip_auth: false,
+        };
+
+        let app = server_router(config).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "default config should require auth on /metrics"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_route_skips_auth_when_skip_auth_is_true() {
+        let metrics = PrometheusMetrics::new().expect("registry");
+        let config = DashboardConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            statistics_update_interval: 60,
+            auth: Some(crate::dashboard::auth::DashboardAuth::Basic {
+                username: "u".to_string(),
+                password: "p".to_string(),
+            }),
+            metrics: Some(metrics),
+            metrics_skip_auth: true,
+        };
+
+        let app = server_router(config).await;
+
+        // /metrics is reachable without credentials.
+        let metrics_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics_resp.status(),
+            StatusCode::OK,
+            "metrics_skip_auth=true should let /metrics through without credentials"
+        );
+
+        // Other routes still demand auth.
+        let api_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            api_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "metrics_skip_auth must not weaken non-/metrics routes"
+        );
     }
 }

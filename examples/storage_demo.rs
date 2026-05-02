@@ -24,9 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📦 Demo 2: Memory Storage (Custom Configuration)");
     println!("-------------------------------------------------");
 
-    let memory_config = MemoryConfig::new()
-        .with_max_jobs(1000)
-        .with_auto_cleanup(true);
+    let memory_config = MemoryConfig::new().with_max_jobs(1000);
     let custom_memory_storage = StorageInstance::memory_with_config(memory_config);
     demo_storage_operations(&custom_memory_storage, "Memory Storage (Custom)").await?;
     println!();

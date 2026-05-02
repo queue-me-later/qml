@@ -6,8 +6,11 @@
 use qml_rs::storage::MemoryConfig;
 
 #[test]
+#[allow(deprecated)]
 fn test_memory_config_no_panic() {
-    // Test Memory config (should always work)
+    // Test Memory config (should always work). `auto_cleanup` is a
+    // deprecated no-op but the field must still default (back-compat
+    // serde round-trip).
     let memory_config = MemoryConfig::default();
     assert_eq!(memory_config.max_jobs, Some(10_000));
     assert!(memory_config.auto_cleanup);

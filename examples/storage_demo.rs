@@ -162,8 +162,9 @@ async fn demo_storage_operations(
     println!("     ✓ Found {} jobs total", all_jobs.len());
 
     // List jobs by state
-    let enqueued_state = JobState::enqueued("default");
-    let enqueued_jobs = storage.list(Some(&enqueued_state), None, None).await?;
+    let enqueued_jobs = storage
+        .list(Some(JobStateKind::Enqueued), None, None)
+        .await?;
     println!("     ✓ Found {} enqueued jobs", enqueued_jobs.len());
 
     // Get job counts

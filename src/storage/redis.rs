@@ -122,14 +122,20 @@ impl RedisStorage {
 
     /// Convert job state to a string for indexing
     fn state_to_string(state: &JobState) -> String {
-        match state {
-            JobState::Enqueued { .. } => "enqueued".to_string(),
-            JobState::Processing { .. } => "processing".to_string(),
-            JobState::Succeeded { .. } => "succeeded".to_string(),
-            JobState::Failed { .. } => "failed".to_string(),
-            JobState::Deleted { .. } => "deleted".to_string(),
-            JobState::Scheduled { .. } => "scheduled".to_string(),
-            JobState::AwaitingRetry { .. } => "awaiting_retry".to_string(),
+        Self::kind_to_state_name(state.kind()).to_string()
+    }
+
+    /// Convert a [`JobStateKind`] discriminant to the lowercase string
+    /// used in the `qml:state:<name>` index keys and the counts hash.
+    fn kind_to_state_name(kind: JobStateKind) -> &'static str {
+        match kind {
+            JobStateKind::Enqueued => "enqueued",
+            JobStateKind::Processing => "processing",
+            JobStateKind::Succeeded => "succeeded",
+            JobStateKind::Failed => "failed",
+            JobStateKind::Deleted => "deleted",
+            JobStateKind::Scheduled => "scheduled",
+            JobStateKind::AwaitingRetry => "awaiting_retry",
         }
     }
 
@@ -657,15 +663,14 @@ impl MonitoringApi for RedisStorage {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {
         let mut conn = self.get_connection().await?;
 
-        let job_ids: Vec<String> = if let Some(state) = state_filter {
-            let state_str = Self::state_to_string(state);
-            let state_key = self.state_index_key(&state_str);
+        let job_ids: Vec<String> = if let Some(kind) = state_filter {
+            let state_key = self.state_index_key(Self::kind_to_state_name(kind));
             self.with_timeout(conn.smembers(&state_key)).await?
         } else {
             let all_jobs_key = self.all_jobs_key();
@@ -1566,9 +1571,8 @@ mod tests {
         assert_eq!(all_jobs.len(), 3);
 
         // Test list by state
-        let enqueued_state = JobState::enqueued("test");
         let enqueued_jobs = storage
-            .list(Some(&enqueued_state), None, None)
+            .list(Some(JobStateKind::Enqueued), None, None)
             .await
             .unwrap();
         assert_eq!(enqueued_jobs.len(), 1);

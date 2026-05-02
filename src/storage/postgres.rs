@@ -526,14 +526,20 @@ impl PostgresStorage {
 
     /// Convert JobState to state name string
     fn job_state_to_name(state: &JobState) -> String {
-        match state {
-            JobState::Enqueued { .. } => "enqueued".to_string(),
-            JobState::Processing { .. } => "processing".to_string(),
-            JobState::Succeeded { .. } => "succeeded".to_string(),
-            JobState::Failed { .. } => "failed".to_string(),
-            JobState::Deleted { .. } => "deleted".to_string(),
-            JobState::Scheduled { .. } => "scheduled".to_string(),
-            JobState::AwaitingRetry { .. } => "awaiting_retry".to_string(),
+        Self::job_state_kind_to_name(state.kind()).to_string()
+    }
+
+    /// Convert a [`JobStateKind`] discriminant to the corresponding lowercase
+    /// `state_name` column value used in `qml_jobs`.
+    fn job_state_kind_to_name(kind: JobStateKind) -> &'static str {
+        match kind {
+            JobStateKind::Enqueued => "enqueued",
+            JobStateKind::Processing => "processing",
+            JobStateKind::Succeeded => "succeeded",
+            JobStateKind::Failed => "failed",
+            JobStateKind::Deleted => "deleted",
+            JobStateKind::Scheduled => "scheduled",
+            JobStateKind::AwaitingRetry => "awaiting_retry",
         }
     }
 
@@ -851,7 +857,7 @@ impl MonitoringApi for PostgresStorage {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {
@@ -866,27 +872,27 @@ impl MonitoringApi for PostgresStorage {
 
         let mut param_count = 0;
 
-        if let Some(_state) = state_filter {
+        if state_filter.is_some() {
             param_count += 1;
             query.push_str(&format!(" WHERE state_name = ${}", param_count));
         }
 
         query.push_str(" ORDER BY created_at DESC");
 
-        if let Some(_limit) = limit {
+        if limit.is_some() {
             param_count += 1;
             query.push_str(&format!(" LIMIT ${}", param_count));
         }
 
-        if let Some(_offset) = offset {
+        if offset.is_some() {
             param_count += 1;
             query.push_str(&format!(" OFFSET ${}", param_count));
         }
 
         let mut sqlx_query = sqlx::query(&query);
 
-        if let Some(state) = state_filter {
-            sqlx_query = sqlx_query.bind(Self::job_state_to_name(state));
+        if let Some(kind) = state_filter {
+            sqlx_query = sqlx_query.bind(Self::job_state_kind_to_name(kind));
         }
 
         if let Some(limit_val) = limit {

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
+use crate::core::{Job, JobStateKind, RecurringJob, ServerInfo};
 
 pub mod config;
 pub mod database_init;
@@ -823,9 +823,16 @@ pub trait MonitoringApi: Send + Sync {
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
 
     /// List jobs with optional filtering and pagination.
+    ///
+    /// `state_filter` is a [`JobStateKind`] discriminant — every backend
+    /// already filters by discriminant only. The earlier signature took
+    /// `Option<&JobState>` and required callers (notably the dashboard
+    /// router) to construct throwaway `JobState` values with bogus inner
+    /// fields just to pick a variant. The fields were silently ignored
+    /// but the type system couldn't say so.
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError>;
@@ -882,7 +889,7 @@ impl MonitoringApi for StorageInstance {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {

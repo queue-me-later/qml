@@ -77,10 +77,10 @@ impl MemoryStorage {
         }
     }
 
-    /// Filter jobs by state
-    fn filter_jobs_by_state(jobs: &HashMap<String, Job>, state: &JobState) -> Vec<Job> {
+    /// Filter jobs by state discriminant.
+    fn filter_jobs_by_state(jobs: &HashMap<String, Job>, kind: JobStateKind) -> Vec<Job> {
         jobs.values()
-            .filter(|job| std::mem::discriminant(&job.state) == std::mem::discriminant(state))
+            .filter(|job| job.state.kind() == kind)
             .cloned()
             .collect()
     }
@@ -161,14 +161,14 @@ impl MonitoringApi for MemoryStorage {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {
         let jobs = self.jobs.read().unwrap();
 
-        let mut filtered_jobs: Vec<Job> = if let Some(state) = state_filter {
-            Self::filter_jobs_by_state(&jobs, state)
+        let mut filtered_jobs: Vec<Job> = if let Some(kind) = state_filter {
+            Self::filter_jobs_by_state(&jobs, kind)
         } else {
             jobs.values().cloned().collect()
         };
@@ -728,9 +728,8 @@ mod tests {
         assert_eq!(all_jobs.len(), 3);
 
         // Test list by state
-        let enqueued_state = JobState::enqueued("default");
         let enqueued_jobs = storage
-            .list(Some(&enqueued_state), None, None)
+            .list(Some(JobStateKind::Enqueued), None, None)
             .await
             .unwrap();
         assert_eq!(enqueued_jobs.len(), 1);

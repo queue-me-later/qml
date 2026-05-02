@@ -199,10 +199,13 @@ impl DashboardService {
     }
 
     /// Get jobs by state (limited sample)
-    pub async fn get_jobs_by_state(&self, state: JobState) -> Result<Vec<JobDetails>, QmlError> {
+    pub async fn get_jobs_by_state(
+        &self,
+        kind: crate::core::JobStateKind,
+    ) -> Result<Vec<JobDetails>, QmlError> {
         let jobs = self
             .storage
-            .list(Some(&state), Some(100), None)
+            .list(Some(kind), Some(100), None)
             .await
             .map_err(|e| QmlError::StorageError {
                 message: e.to_string(),

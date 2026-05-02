@@ -288,6 +288,17 @@ pub trait Storage: MonitoringApi + Send + Sync {
     /// job twice. Returns the claimed jobs already in their post-transition
     /// (`Enqueued`) state.
     ///
+    /// **Caller contract — important:** the storage engine has already
+    /// persisted the `Enqueued` transition by the time this call returns.
+    /// Callers must NOT call [`MonitoringApi::update`] (or any other write
+    /// path) on the returned jobs to "save" the transition — the persisted
+    /// row already reflects it. The intended usage is to consume the
+    /// returned jobs as observations only (e.g. for logging/metrics) and
+    /// let the regular worker fetch path pick them up via
+    /// [`fetch_and_lock_job`]. Re-writing them is harmless on Postgres and
+    /// the in-memory backend (the state is the same), but on Redis it
+    /// re-runs index churn for no reason.
+    ///
     /// Backends implement this as:
     /// - **Postgres**: `UPDATE ... WHERE state_name = 'scheduled' AND
     ///   <due predicate> RETURNING *` with `FOR UPDATE SKIP LOCKED`.
@@ -302,8 +313,9 @@ pub trait Storage: MonitoringApi + Send + Sync {
     ) -> Result<Vec<Job>, StorageError>;
 
     /// Atomically claim due retry jobs and transition them to `Enqueued`.
-    /// Same contract as [`claim_due_scheduled_jobs`] but for jobs in the
-    /// `AwaitingRetry` state.
+    /// Same contract as [`claim_due_scheduled_jobs`] (including the
+    /// "do-not-`update()`-the-returned-jobs" caller contract) but for jobs
+    /// in the `AwaitingRetry` state.
     async fn claim_due_retry_jobs(
         &self,
         now: DateTime<Utc>,
@@ -348,6 +360,22 @@ pub trait Storage: MonitoringApi + Send + Sync {
     /// * `Ok(Some(job))` - Job was successfully fetched and locked
     /// * `Ok(None)` - No jobs are available for processing
     /// * `Err(StorageError)` - Storage operation failed
+    ///
+    /// ## Backend caveats
+    ///
+    /// **Redis**: when `queues` is `Some` and non-empty, the Lua script
+    /// scans up to **1024 candidates** ordered by score from the global
+    /// available ZSET, returning the first whose `queue` matches the
+    /// filter. If your deployment can have more than 1024 ineligible-
+    /// queue jobs queued ahead of an eligible one, queue-scoped workers
+    /// can transiently return `Ok(None)` even though work for them
+    /// exists. The cap is bounded for predictability under Redis's
+    /// `lua-time-limit`; per-queue ZSETs (a future change) will make the
+    /// scan exact.
+    ///
+    /// **Postgres** and **Memory**: no such cap — the queue filter is
+    /// pushed down to the engine (SQL `WHERE queue_name = ANY(...)` on
+    /// Postgres) and applied exactly.
     ///
     /// ## Examples
     /// ```rust

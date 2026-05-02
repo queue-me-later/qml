@@ -132,7 +132,7 @@ impl DashboardServer {
         // Start periodic statistics updates with cancellation plumbed
         // through. The handle is awaited after the HTTP server exits so the
         // task can't outlive this call.
-        let periodic_handle = self
+        let mut periodic_handle = self
             .websocket_manager
             .start_periodic_updates(self.config.statistics_update_interval, cancel.clone())
             .await;
@@ -149,7 +149,24 @@ impl DashboardServer {
         // Ensure the periodic task observes shutdown even if axum::serve
         // exited because of an error rather than the token firing.
         cancel.cancel();
-        let _ = periodic_handle.await;
+
+        // Bound the wait. The periodic task should exit on the next
+        // `tokio::select!` poll once `cancel` fires, but
+        // `get_server_statistics()` can in principle stall indefinitely
+        // against an unhealthy backend. If it doesn't unwind in 5s,
+        // abort it and move on — better than blocking the caller's
+        // shutdown sequence.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut periodic_handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    "Dashboard periodic-updates task did not exit within 5s of \
+                     cancellation; aborting"
+                );
+                periodic_handle.abort();
+                let _ = periodic_handle.await;
+            }
+        }
 
         serve_result?;
         Ok(())

@@ -79,7 +79,7 @@ impl JobScheduler {
 
             if let Err(e) = self
                 .process_due_jobs("scheduled", |storage, now, limit| async move {
-                    storage.fetch_due_scheduled_jobs(now, limit).await
+                    storage.claim_due_scheduled_jobs(now, limit).await
                 })
                 .await
             {
@@ -88,7 +88,7 @@ impl JobScheduler {
 
             if let Err(e) = self
                 .process_due_jobs("retry", |storage, now, limit| async move {
-                    storage.fetch_due_retry_jobs(now, limit).await
+                    storage.claim_due_retry_jobs(now, limit).await
                 })
                 .await
             {
@@ -97,10 +97,14 @@ impl JobScheduler {
         }
     }
 
-    /// Drain a single category of due jobs into the `Enqueued` state. `fetch`
-    /// selects whether we pull from the scheduled or retry index; the rest of
-    /// the pipeline is identical.
-    async fn process_due_jobs<F, Fut>(&self, kind: &str, fetch: F) -> Result<()>
+    /// Drain a single category of due jobs into the `Enqueued` state.
+    ///
+    /// `claim` is a backend-specific atomic primitive — it both selects due
+    /// jobs and transitions them to `Enqueued` in one operation, so two
+    /// schedulers running against the same backend can't both promote the
+    /// same job. The scheduler used to do the transition itself with a
+    /// follow-up `update`; that pattern was racy under multi-server.
+    async fn process_due_jobs<F, Fut>(&self, kind: &str, claim: F) -> Result<()>
     where
         F: FnOnce(Arc<dyn Storage>, DateTime<Utc>, usize) -> Fut,
         Fut: Future<Output = std::result::Result<Vec<Job>, StorageError>>,
@@ -108,37 +112,20 @@ impl JobScheduler {
         debug!("Checking for {} jobs ready for execution", kind);
 
         let now = Utc::now();
-        let ready_jobs = fetch(self.storage.clone(), now, self.batch_size)
+        let claimed_jobs = claim(self.storage.clone(), now, self.batch_size)
             .await
             .map_err(|e| QmlError::StorageError {
-                message: format!("Failed to fetch due {} jobs: {}", kind, e),
+                message: format!("Failed to claim due {} jobs: {}", kind, e),
             })?;
 
-        debug!(
-            "Found {} {} jobs ready for execution",
-            ready_jobs.len(),
-            kind
-        );
-
-        self.enqueue_due_jobs(ready_jobs, kind).await;
-        Ok(())
-    }
-
-    /// Transition a batch of due jobs into the Enqueued state.
-    async fn enqueue_due_jobs(&self, jobs: Vec<Job>, kind: &str) {
-        for mut job in jobs {
-            info!("Enqueueing {} job: {}", kind, job.id);
-
-            let enqueued_state = JobState::enqueued(&job.queue);
-            if let Err(e) = job.set_state(enqueued_state) {
-                error!("Failed to set job state to Enqueued: {}", e);
-                continue;
-            }
-
-            if let Err(e) = self.storage.update(&job).await {
-                error!("Failed to update job in storage: {}", e);
-            }
+        if !claimed_jobs.is_empty() {
+            info!(
+                "Promoted {} {} job(s) to Enqueued",
+                claimed_jobs.len(),
+                kind
+            );
         }
+        Ok(())
     }
 
     /// Schedule a job for future execution
@@ -219,10 +206,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Process scheduled jobs
+        // Process scheduled jobs (claim_due_scheduled_jobs does the
+        // Scheduled → Enqueued transition atomically inside storage).
         scheduler
             .process_due_jobs("scheduled", |storage, now, limit| async move {
-                storage.fetch_due_scheduled_jobs(now, limit).await
+                storage.claim_due_scheduled_jobs(now, limit).await
             })
             .await
             .unwrap();
@@ -280,7 +268,7 @@ mod tests {
         let scheduler = JobScheduler::new(storage.clone());
         scheduler
             .process_due_jobs("scheduled", |storage, now, limit| async move {
-                storage.fetch_due_scheduled_jobs(now, limit).await
+                storage.claim_due_scheduled_jobs(now, limit).await
             })
             .await
             .unwrap();
@@ -314,6 +302,59 @@ mod tests {
         let due = storage.fetch_due_retry_jobs(Utc::now(), 100).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, due_id);
+    }
+
+    #[tokio::test]
+    async fn claim_due_scheduled_jobs_returns_enqueued_state_atomically() {
+        // Regression for I9: claim_due_scheduled_jobs is the contract that
+        // multi-server schedulers rely on to avoid double-promotion. Verify
+        // it transitions Scheduled → Enqueued in a single call (no follow-up
+        // update needed) and that a second call observes none of the
+        // already-claimed jobs.
+        let storage = Arc::new(MemoryStorage::new());
+
+        let mut due_ids = Vec::new();
+        for _ in 0..5 {
+            let mut job = Job::new("noop", serde_json::Value::Null);
+            job.set_state(JobState::scheduled(
+                Utc::now() - Duration::seconds(5),
+                "past",
+            ))
+            .unwrap();
+            due_ids.push(job.id.clone());
+            storage.enqueue(&job).await.unwrap();
+        }
+
+        let claimed = storage
+            .claim_due_scheduled_jobs(Utc::now(), 100)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 5, "all 5 due jobs must be claimed");
+        for job in &claimed {
+            assert!(
+                matches!(job.state, JobState::Enqueued { .. }),
+                "claim returns jobs already in Enqueued state, got {:?}",
+                job.state
+            );
+        }
+
+        // Second call must return zero — the storage already transitioned
+        // those jobs out of Scheduled. This is what protects multi-server
+        // deployments from double-enqueue.
+        let again = storage
+            .claim_due_scheduled_jobs(Utc::now(), 100)
+            .await
+            .unwrap();
+        assert!(
+            again.is_empty(),
+            "second claim must not re-pick already-promoted jobs"
+        );
+
+        // And the underlying rows are observably Enqueued.
+        for id in &due_ids {
+            let job = storage.get(id).await.unwrap().unwrap();
+            assert!(matches!(job.state, JobState::Enqueued { .. }));
+        }
     }
 
     #[tokio::test]

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::dashboard::service::{DashboardService, ServerStatistics};
@@ -191,8 +193,19 @@ impl WebSocketManager {
         self.connections.read().await.len()
     }
 
-    /// Start periodic statistics broadcast
-    pub async fn start_periodic_updates(&self, interval_seconds: u64) {
+    /// Start periodic statistics broadcast.
+    ///
+    /// Returns a [`JoinHandle`] for the spawned task and exits cleanly when
+    /// `cancel` fires. The caller (typically [`crate::dashboard::DashboardServer`]) is expected
+    /// to await the handle on shutdown so the task doesn't outlive the
+    /// server's runtime — the previous version was a detached `tokio::spawn`
+    /// that ran forever and held an `Arc<DashboardService>` keeping storage
+    /// alive across drops.
+    pub async fn start_periodic_updates(
+        &self,
+        interval_seconds: u64,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
         let broadcast_sender = self.broadcast_sender.clone();
         let dashboard_service = Arc::clone(&self.dashboard_service);
 
@@ -201,16 +214,20 @@ impl WebSocketManager {
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_seconds));
 
             loop {
-                interval.tick().await;
-
-                if let Ok(stats) = dashboard_service.get_server_statistics().await {
-                    let msg = DashboardMessage::StatisticsUpdate { data: stats };
-                    let _ = broadcast_sender.send(msg);
-                } else {
-                    tracing::error!("Failed to get statistics for periodic update");
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Ok(stats) = dashboard_service.get_server_statistics().await {
+                            let msg = DashboardMessage::StatisticsUpdate { data: stats };
+                            let _ = broadcast_sender.send(msg);
+                        } else {
+                            tracing::error!("Failed to get statistics for periodic update");
+                        }
+                    }
                 }
             }
-        });
+        })
     }
 }
 

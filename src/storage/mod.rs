@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
+use crate::core::{Job, JobStateKind, RecurringJob, ServerInfo};
 
 pub mod config;
 pub mod database_init;
@@ -279,6 +279,49 @@ pub trait Storage: MonitoringApi + Send + Sync {
         limit: usize,
     ) -> Result<Vec<Job>, StorageError>;
 
+    /// Atomically claim due scheduled jobs and transition them to
+    /// `Enqueued`.
+    ///
+    /// Unlike [`fetch_due_scheduled_jobs`], this method performs the
+    /// `Scheduled → Enqueued` transition inside the storage engine so two
+    /// schedulers running against the same backend cannot promote the same
+    /// job twice. Returns the claimed jobs already in their post-transition
+    /// (`Enqueued`) state.
+    ///
+    /// **Caller contract — important:** the storage engine has already
+    /// persisted the `Enqueued` transition by the time this call returns.
+    /// Callers must NOT call [`MonitoringApi::update`] (or any other write
+    /// path) on the returned jobs to "save" the transition — the persisted
+    /// row already reflects it. The intended usage is to consume the
+    /// returned jobs as observations only (e.g. for logging/metrics) and
+    /// let the regular worker fetch path pick them up via
+    /// [`fetch_and_lock_job`]. Re-writing them is harmless on Postgres and
+    /// the in-memory backend (the state is the same), but on Redis it
+    /// re-runs index churn for no reason.
+    ///
+    /// Backends implement this as:
+    /// - **Postgres**: `UPDATE ... WHERE state_name = 'scheduled' AND
+    ///   <due predicate> RETURNING *` with `FOR UPDATE SKIP LOCKED`.
+    /// - **Redis**: a Lua script that decodes each candidate, checks the
+    ///   time predicate, and performs the SET + index swaps in one
+    ///   invocation.
+    /// - **Memory**: a single critical section under the jobs write lock.
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Atomically claim due retry jobs and transition them to `Enqueued`.
+    /// Same contract as [`claim_due_scheduled_jobs`] (including the
+    /// "do-not-`update()`-the-returned-jobs" caller contract) but for jobs
+    /// in the `AwaitingRetry` state.
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
     /// Recover jobs stranded in the `Processing` state by a previous server
     /// instance.
     ///
@@ -317,6 +360,22 @@ pub trait Storage: MonitoringApi + Send + Sync {
     /// * `Ok(Some(job))` - Job was successfully fetched and locked
     /// * `Ok(None)` - No jobs are available for processing
     /// * `Err(StorageError)` - Storage operation failed
+    ///
+    /// ## Backend caveats
+    ///
+    /// **Redis**: when `queues` is `Some` and non-empty, the Lua script
+    /// scans up to **1024 candidates** ordered by score from the global
+    /// available ZSET, returning the first whose `queue` matches the
+    /// filter. If your deployment can have more than 1024 ineligible-
+    /// queue jobs queued ahead of an eligible one, queue-scoped workers
+    /// can transiently return `Ok(None)` even though work for them
+    /// exists. The cap is bounded for predictability under Redis's
+    /// `lua-time-limit`; per-queue ZSETs (a future change) will make the
+    /// scan exact.
+    ///
+    /// **Postgres** and **Memory**: no such cap — the queue filter is
+    /// pushed down to the engine (SQL `WHERE queue_name = ANY(...)` on
+    /// Postgres) and applied exactly.
     ///
     /// ## Examples
     /// ```rust
@@ -748,18 +807,20 @@ impl StorageInstance {
 
 /// Dashboard-facing subset of storage operations.
 ///
-/// [`MonitoringApi`] carves out the five methods the Axum dashboard and its
+/// [`MonitoringApi`] carves out the methods the Axum dashboard and its
 /// [`DashboardService`](crate::dashboard::DashboardService) actually touch
-/// (`get`, `update`, `delete`, `list`, `get_job_counts`) so that dashboard
-/// tests can be written against a ~100-line fake instead of a full
-/// [`Storage`] backend. Every real [`Storage`] implementation is also a
-/// [`MonitoringApi`], so callers holding an `Arc<dyn Storage>` can pass it
-/// anywhere an `Arc<dyn MonitoringApi>` is expected via trait upcasting.
+/// (`get`, `update`, `update_if_state`, `delete`, `list`, `get_job_counts`)
+/// so that dashboard tests can be written against a small fake instead of
+/// a full [`Storage`] backend. Every real [`Storage`] implementation is
+/// also a [`MonitoringApi`], so callers holding an `Arc<dyn Storage>` can
+/// pass it anywhere an `Arc<dyn MonitoringApi>` is expected via trait
+/// upcasting.
 ///
-/// The trait deliberately includes `update` and `delete` even though they
-/// mutate state — the dashboard needs them for its retry-job and delete-job
-/// actions, and pretending they're read-only would force callers back onto
-/// the full [`Storage`] trait and defeat the testing payoff.
+/// The trait deliberately includes mutating methods even though it's
+/// scoped at observation/operations — the dashboard needs them for its
+/// retry-job and delete-job actions, and pretending they're read-only
+/// would force callers back onto the full [`Storage`] trait and defeat
+/// the testing payoff.
 #[async_trait]
 pub trait MonitoringApi: Send + Sync {
     /// Retrieve a job by its unique identifier.
@@ -768,13 +829,38 @@ pub trait MonitoringApi: Send + Sync {
     /// Update an existing job's state and metadata.
     async fn update(&self, job: &Job) -> Result<(), StorageError>;
 
+    /// Compare-and-swap variant of [`update`].
+    ///
+    /// Writes `job` only if the persisted row's state currently matches
+    /// `expected`. Returns `Ok(true)` when the update was applied,
+    /// `Ok(false)` when the state had moved on (a stomp was avoided),
+    /// and `Err(JobNotFound)` when no row exists for the id.
+    ///
+    /// Use this when a caller has read the job, decided to transition it
+    /// based on what it observed, and might race with a worker or a peer
+    /// dashboard. The dashboard "retry" button is the canonical example —
+    /// without CAS, a slow second retry could overwrite a `Processing`
+    /// state that a worker had already taken on after the first retry.
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError>;
+
     /// Remove a job from storage (soft or hard delete).
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
 
     /// List jobs with optional filtering and pagination.
+    ///
+    /// `state_filter` is a [`JobStateKind`] discriminant — every backend
+    /// already filters by discriminant only. The earlier signature took
+    /// `Option<&JobState>` and required callers (notably the dashboard
+    /// router) to construct throwaway `JobState` values with bogus inner
+    /// fields just to pick a variant. The fields were silently ignored
+    /// but the type system couldn't say so.
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError>;
@@ -805,6 +891,20 @@ impl MonitoringApi for StorageInstance {
         }
     }
 
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.update_if_state(job, expected).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.update_if_state(job, expected).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.update_if_state(job, expected).await,
+        }
+    }
+
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
         match self {
             StorageInstance::Memory(storage) => storage.delete(job_id).await,
@@ -817,7 +917,7 @@ impl MonitoringApi for StorageInstance {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {
@@ -890,6 +990,36 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.fetch_due_retry_jobs(now, limit).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+        }
+    }
+
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.claim_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.claim_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.claim_due_scheduled_jobs(now, limit).await
+            }
+        }
+    }
+
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.claim_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.claim_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.claim_due_retry_jobs(now, limit).await,
         }
     }
 

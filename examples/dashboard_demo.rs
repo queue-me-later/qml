@@ -130,12 +130,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create sample jobs
     create_sample_jobs(Arc::clone(&storage)).await?;
 
-    // Create and start dashboard server
+    // Create and start dashboard server. `..Default::default()` keeps the
+    // example resilient to additive fields on `DashboardConfig` — e.g. the
+    // `metrics` field gated on the `metrics` feature would otherwise force
+    // an `#[cfg(feature = "metrics")]` arm here.
     let dashboard_config = DashboardConfig {
         host: "127.0.0.1".to_string(),
         port: 8080,
         statistics_update_interval: 3, // Update every 3 seconds for demo
         auth: None,
+        ..Default::default()
     };
 
     let dashboard = DashboardServer::new(storage.clone(), dashboard_config);

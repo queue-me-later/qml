@@ -122,14 +122,20 @@ impl RedisStorage {
 
     /// Convert job state to a string for indexing
     fn state_to_string(state: &JobState) -> String {
-        match state {
-            JobState::Enqueued { .. } => "enqueued".to_string(),
-            JobState::Processing { .. } => "processing".to_string(),
-            JobState::Succeeded { .. } => "succeeded".to_string(),
-            JobState::Failed { .. } => "failed".to_string(),
-            JobState::Deleted { .. } => "deleted".to_string(),
-            JobState::Scheduled { .. } => "scheduled".to_string(),
-            JobState::AwaitingRetry { .. } => "awaiting_retry".to_string(),
+        Self::kind_to_state_name(state.kind()).to_string()
+    }
+
+    /// Convert a [`JobStateKind`] discriminant to the lowercase string
+    /// used in the `qml:state:<name>` index keys and the counts hash.
+    fn kind_to_state_name(kind: JobStateKind) -> &'static str {
+        match kind {
+            JobStateKind::Enqueued => "enqueued",
+            JobStateKind::Processing => "processing",
+            JobStateKind::Succeeded => "succeeded",
+            JobStateKind::Failed => "failed",
+            JobStateKind::Deleted => "deleted",
+            JobStateKind::Scheduled => "scheduled",
+            JobStateKind::AwaitingRetry => "awaiting_retry",
         }
     }
 
@@ -188,25 +194,17 @@ impl RedisStorage {
                 .await?;
         }
 
-        // Set TTL for completed/failed jobs if configured
-        match job.state {
-            JobState::Succeeded { .. } => {
-                if let Some(ttl) = self.config.completed_job_ttl {
-                    let job_key = self.job_key(&job.id);
-                    self.with_timeout::<_, ()>(conn.expire(&job_key, ttl.as_secs() as i64))
-                        .await?;
-                }
-            }
-            JobState::Failed { .. } => {
-                if let Some(ttl) = self.config.failed_job_ttl {
-                    let job_key = self.job_key(&job.id);
-                    self.with_timeout::<_, ()>(conn.expire(&job_key, ttl.as_secs() as i64))
-                        .await?;
-                }
-            }
-            _ => {}
-        }
-
+        // Expiration of final-state jobs is owned by `CleanupWorker` via
+        // `Storage::delete_expired_jobs`, which sweeps `expires_at` set by
+        // `JobProcessor` on transition. Native Redis EXPIRE used to also
+        // be set here, which raced the sweep: when the native TTL fired
+        // first, the job key disappeared but its index entries
+        // (qml:state:succeeded, qml:all, qml:counts) lived on forever
+        // because nothing observed the expiration. Stick with the
+        // out-of-band sweep — one expiration source, one consistent index.
+        // (`RedisConfig::completed_job_ttl` / `failed_job_ttl` remain on the
+        // public config for backward compatibility but no longer affect
+        // index lifecycle.)
         Ok(())
     }
 
@@ -230,6 +228,157 @@ impl RedisStorage {
             .await?;
 
         Ok(())
+    }
+
+    /// Atomically claim due jobs out of a time-gated state (`scheduled` or
+    /// `awaiting_retry`) and transition them to `Enqueued`.
+    ///
+    /// `from_state_str` / `from_state_variant` / `time_field` parameterize
+    /// over Scheduled vs AwaitingRetry — the variant key in the externally-
+    /// tagged JSON layout, the index key, and the time field name on the
+    /// state. The whole select-decode-transition-update happens inside one
+    /// Lua invocation so a peer scheduler can't see a job after it's been
+    /// claimed here.
+    ///
+    /// Note: the available-set score uses `priority` only — chrono ISO
+    /// timestamps don't lex-sort correctly to a Redis float in Lua without
+    /// a non-trivial parse. Same-priority FIFO ordering is therefore
+    /// approximate for newly-promoted jobs; it's accurate as long as the
+    /// claim batch is small.
+    ///
+    /// Timestamp format: `now` is rendered as RFC3339 with microsecond
+    /// precision (`SecondsFormat::Micros`) and the `Z` suffix — the same
+    /// shape chrono's serde adapter produces for `DateTime<Utc>` and the
+    /// shape Postgres's `to_jsonb(NOW())` produces (modulo `Z` vs
+    /// `+00:00`, which both parse). All three sources share microsecond
+    /// precision so lexicographic comparison of the time field stays
+    /// chronological across backends.
+    async fn claim_due_jobs_lua(
+        &self,
+        from_state_str: &str,
+        from_state_variant: &str,
+        time_field: &str,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // Defensive: bail on a zero limit without round-tripping to Redis.
+        // The trait permits `limit: usize`; callers (currently the
+        // scheduler) pass a positive batch size, but a future caller
+        // mistakenly passing 0 would otherwise issue an SMEMBERS for
+        // nothing.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get_connection().await?;
+
+        let lua_script = r#"
+            local from_state_key = KEYS[1]
+            local to_state_key = KEYS[2]
+            local available_key = KEYS[3]
+            local job_key_prefix = KEYS[4]
+            local counts_key = KEYS[5]
+            local from_state_name = ARGV[1]
+            local from_state_variant = ARGV[2]
+            local time_field = ARGV[3]
+            local now_iso = ARGV[4]
+            local limit = tonumber(ARGV[5])
+
+            local candidate_ids = redis.call('SMEMBERS', from_state_key)
+
+            -- Collect due candidates with their priority and creation time.
+            local due = {}
+            for _, job_id in ipairs(candidate_ids) do
+                local job_key = job_key_prefix .. job_id
+                local job_data = redis.call('GET', job_key)
+                if not job_data then
+                    -- Index drift: id in state set but no job blob. Clean up.
+                    redis.call('SREM', from_state_key, job_id)
+                else
+                    local job = cjson.decode(job_data)
+                    local outer = job.state[from_state_variant]
+                    if outer and outer[time_field] and outer[time_field] <= now_iso then
+                        table.insert(due, {
+                            id = job_id,
+                            priority = job.priority or 0,
+                            created_at = job.created_at or '',
+                            parsed = job
+                        })
+                    end
+                end
+            end
+
+            -- Order by priority desc, then created_at asc — matches the SQL
+            -- backend's ORDER BY clause. ISO timestamps with consistent
+            -- format sort lexicographically the same as chronologically.
+            table.sort(due, function(a, b)
+                if a.priority ~= b.priority then return a.priority > b.priority end
+                return a.created_at < b.created_at
+            end)
+
+            local claimed = {}
+            local n = math.min(limit, #due)
+            for i = 1, n do
+                local entry = due[i]
+                local job = entry.parsed
+
+                job.state = {
+                    Enqueued = {
+                        enqueued_at = now_iso,
+                        queue = job.queue
+                    }
+                }
+                job.updated_at = now_iso
+
+                local new_data = cjson.encode(job)
+                local job_key = job_key_prefix .. entry.id
+                redis.call('SET', job_key, new_data)
+                redis.call('SREM', from_state_key, entry.id)
+                redis.call('SADD', to_state_key, entry.id)
+                redis.call('ZADD', available_key, tostring(entry.priority), entry.id)
+                redis.call('HINCRBY', counts_key, from_state_name, -1)
+                redis.call('HINCRBY', counts_key, 'enqueued', 1)
+                table.insert(claimed, new_data)
+            end
+
+            return claimed
+        "#;
+
+        let from_state_key = self.state_index_key(from_state_str);
+        let to_state_key = self.state_index_key("enqueued");
+        let available_key = self.available_jobs_key();
+        let job_key_prefix = format!("{}:jobs:", self.config.key_prefix);
+        let counts_key = self.job_counts_key();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+        let result: Vec<String> = redis::Script::new(lua_script)
+            .key(&from_state_key)
+            .key(&to_state_key)
+            .key(&available_key)
+            .key(&job_key_prefix)
+            .key(&counts_key)
+            .arg(from_state_str)
+            .arg(from_state_variant)
+            .arg(time_field)
+            .arg(&now_iso)
+            .arg(limit as i64)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to claim due {} jobs: {}", from_state_str, e),
+                source: Some(Box::new(e)),
+            })?;
+
+        let mut jobs = Vec::with_capacity(result.len());
+        for json in result {
+            let job: Job = serde_json::from_str(&json).map_err(|e| {
+                StorageError::serialization_with_source(
+                    format!("Failed to parse claimed {} job", from_state_str),
+                    Box::new(e),
+                )
+            })?;
+            jobs.push(job);
+        }
+        Ok(jobs)
     }
 }
 
@@ -256,30 +405,254 @@ impl MonitoringApi for RedisStorage {
     }
 
     async fn update(&self, job: &Job) -> Result<(), StorageError> {
-        let job_key = self.job_key(&job.id);
+        // Atomic update in a single Lua call: read the persisted blob to
+        // discover the *current* state (no TOCTOU), then write the new
+        // blob plus the index swap and counter math in one invocation.
+        //
+        // The earlier shape was a separate `get()` + `set()` pair in Rust
+        // with five non-transactional follow-up index commands, which:
+        //   1. Two concurrent updaters reading the same `old_state` would
+        //      both decrement the same old-state counter (drift).
+        //   2. A reader between the SET and the index commands could see a
+        //      job whose `state` field claimed e.g. `Processing` but whose
+        //      state-set membership and counts still said `Enqueued`.
+        //
+        // KEYS:
+        //   1. job key (full)
+        //   2. state index prefix
+        //   3. all_jobs key
+        //   4. available ZSET
+        //   5. counts hash
+        //
+        // ARGV:
+        //   1. new state name (lowercase, e.g. "enqueued")
+        //   2. new full job JSON to write
+        //   3. new score for the available ZSET, or "" if not available
+        //   4. new state availability flag ("1" if available, else "0")
+        //
+        // Returns "missing" if no job exists at the key, "ok" otherwise.
+        let lua_script = r#"
+            local job_key = KEYS[1]
+            local state_key_prefix = KEYS[2]
+            local all_jobs_key = KEYS[3]
+            local available_key = KEYS[4]
+            local counts_key = KEYS[5]
+            local new_state_name = ARGV[1]
+            local new_blob = ARGV[2]
+            local new_score = ARGV[3]
+            local new_available = ARGV[4]
 
-        // Get the current job to check if it exists and get old state
-        let current_job = self.get(&job.id).await?;
-        let old_state = current_job.as_ref().map(|j| &j.state);
+            local current = redis.call('GET', job_key)
+            if not current then
+                return 'missing'
+            end
 
-        if current_job.is_none() {
-            return Err(StorageError::job_not_found(job.id.clone()));
-        }
+            -- Determine old state from the persisted blob — atomically,
+            -- since this Lua run is the only thing touching the key while
+            -- it executes.
+            local old_job = cjson.decode(current)
+            local old_variant
+            for k, _ in pairs(old_job.state) do
+                old_variant = k
+                break
+            end
+            local old_state_name
+            if old_variant == 'AwaitingRetry' then
+                old_state_name = 'awaiting_retry'
+            else
+                old_state_name = string.lower(old_variant or '')
+            end
+
+            local job_id = old_job.id
+
+            redis.call('SET', job_key, new_blob)
+            redis.call('SADD', all_jobs_key, job_id)
+
+            if old_state_name ~= new_state_name then
+                redis.call('SREM', state_key_prefix .. old_state_name, job_id)
+                redis.call('SADD', state_key_prefix .. new_state_name, job_id)
+                redis.call('HINCRBY', counts_key, old_state_name, -1)
+                redis.call('HINCRBY', counts_key, new_state_name, 1)
+            end
+
+            if new_available == '1' then
+                redis.call('ZADD', available_key, tonumber(new_score), job_id)
+            else
+                redis.call('ZREM', available_key, job_id)
+            end
+
+            return 'ok'
+        "#;
 
         let mut conn = self.get_connection().await?;
-
-        // Serialize and store the updated job
-        let job_json = serde_json::to_string(job).map_err(|e| {
+        let new_blob = serde_json::to_string(job).map_err(|e| {
             StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
         })?;
 
-        self.with_timeout::<_, ()>(conn.set(&job_key, job_json))
-            .await?;
+        let job_key = self.job_key(&job.id);
+        let state_key_prefix = format!("{}:state:", self.config.key_prefix);
+        let all_jobs_key = self.all_jobs_key();
+        let available_key = self.available_jobs_key();
+        let counts_key = self.job_counts_key();
 
-        // Update indices
-        self.update_job_indices(job, old_state).await?;
+        let new_state_name = Self::state_to_string(&job.state);
+        let (new_score, new_available) = if Self::is_job_available(job) {
+            let score =
+                job.priority as f64 + (job.created_at.timestamp_millis() as f64 / 1_000_000.0);
+            (score.to_string(), "1")
+        } else {
+            (String::new(), "0")
+        };
 
-        Ok(())
+        let result: String = redis::Script::new(lua_script)
+            .key(&job_key)
+            .key(&state_key_prefix)
+            .key(&all_jobs_key)
+            .key(&available_key)
+            .key(&counts_key)
+            .arg(&new_state_name)
+            .arg(&new_blob)
+            .arg(&new_score)
+            .arg(new_available)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to update job: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
+        match result.as_str() {
+            "ok" => Ok(()),
+            "missing" => Err(StorageError::job_not_found(job.id.clone())),
+            other => Err(StorageError::OperationError {
+                message: format!("Unexpected update response: {}", other),
+                source: None,
+            }),
+        }
+    }
+
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        // Compare-and-swap in a single Lua call: GET the current job
+        // blob, decode, check the externally-tagged variant key against
+        // `expected`, and SET the new blob plus index updates only if
+        // it matches.
+        //
+        // KEYS[1] = job key (full)
+        // KEYS[2] = state index prefix
+        // KEYS[3] = available ZSET
+        // KEYS[4] = counts hash
+        // ARGV[1] = expected variant string ("Enqueued" / "Failed" / …)
+        // ARGV[2] = new variant string (for index swap)
+        // ARGV[3] = new full job JSON to write
+        // ARGV[4] = new score for the available ZSET (string), or "" if
+        //           the new state is not available
+        // ARGV[5] = new state availability flag ("1" if available, else "0")
+        //
+        // Returns:
+        //   "missing"   — no job at the key
+        //   "mismatch"  — job exists but state didn't match
+        //   "ok"        — applied
+        let lua_script = r#"
+            local job_key = KEYS[1]
+            local state_key_prefix = KEYS[2]
+            local available_key = KEYS[3]
+            local counts_key = KEYS[4]
+            local expected_variant = ARGV[1]
+            local new_variant = ARGV[2]
+            local new_blob = ARGV[3]
+            local new_score = ARGV[4]
+            local new_available = ARGV[5]
+
+            local current = redis.call('GET', job_key)
+            if not current then
+                return 'missing'
+            end
+            local job = cjson.decode(current)
+            if not job.state[expected_variant] then
+                return 'mismatch'
+            end
+
+            local old_variant = expected_variant
+
+            redis.call('SET', job_key, new_blob)
+            if old_variant ~= new_variant then
+                local lower_old = string.lower(old_variant)
+                local lower_new = string.lower(new_variant)
+                -- AwaitingRetry is stored as 'awaiting_retry' in the state
+                -- index key. The other variants are simple snake_case of the
+                -- camel-case variant name; for AwaitingRetry the lowercase
+                -- alone gives us 'awaitingretry' which is wrong.
+                if old_variant == 'AwaitingRetry' then lower_old = 'awaiting_retry' end
+                if new_variant == 'AwaitingRetry' then lower_new = 'awaiting_retry' end
+                redis.call('SREM', state_key_prefix .. lower_old, job.id)
+                redis.call('SADD', state_key_prefix .. lower_new, job.id)
+                redis.call('HINCRBY', counts_key, lower_old, -1)
+                redis.call('HINCRBY', counts_key, lower_new, 1)
+            end
+
+            if new_available == '1' then
+                redis.call('ZADD', available_key, tonumber(new_score), job.id)
+            else
+                redis.call('ZREM', available_key, job.id)
+            end
+
+            return 'ok'
+        "#;
+
+        let mut conn = self.get_connection().await?;
+        let new_blob = serde_json::to_string(job).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
+        })?;
+
+        let job_key = self.job_key(&job.id);
+        let state_key_prefix = format!("{}:state:", self.config.key_prefix);
+        let available_key = self.available_jobs_key();
+        let counts_key = self.job_counts_key();
+
+        let new_kind = job.state.kind();
+        let new_variant = new_kind.name();
+        let expected_variant = expected.name();
+
+        // Match update_job_indices' score formula so the available ZSET
+        // remains consistent with the rest of the codebase.
+        let (new_score, new_available) = if Self::is_job_available(job) {
+            let score =
+                job.priority as f64 + (job.created_at.timestamp_millis() as f64 / 1_000_000.0);
+            (score.to_string(), "1")
+        } else {
+            (String::new(), "0")
+        };
+
+        let result: String = redis::Script::new(lua_script)
+            .key(&job_key)
+            .key(&state_key_prefix)
+            .key(&available_key)
+            .key(&counts_key)
+            .arg(expected_variant)
+            .arg(new_variant)
+            .arg(&new_blob)
+            .arg(&new_score)
+            .arg(new_available)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to update_if_state job: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
+        match result.as_str() {
+            "ok" => Ok(true),
+            "mismatch" => Ok(false),
+            "missing" => Err(StorageError::job_not_found(job.id.clone())),
+            other => Err(StorageError::OperationError {
+                message: format!("Unexpected update_if_state response: {}", other),
+                source: None,
+            }),
+        }
     }
 
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
@@ -306,15 +679,14 @@ impl MonitoringApi for RedisStorage {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {
         let mut conn = self.get_connection().await?;
 
-        let job_ids: Vec<String> = if let Some(state) = state_filter {
-            let state_str = Self::state_to_string(state);
-            let state_key = self.state_index_key(&state_str);
+        let job_ids: Vec<String> = if let Some(kind) = state_filter {
+            let state_key = self.state_index_key(Self::kind_to_state_name(kind));
             self.with_timeout(conn.smembers(&state_key)).await?
         } else {
             let all_jobs_key = self.all_jobs_key();
@@ -399,10 +771,18 @@ impl Storage for RedisStorage {
         let mut conn = self.get_connection().await?;
         let available_key = self.available_jobs_key();
 
-        // Get job IDs ordered by score (priority and creation time)
-        let count = limit.unwrap_or(-1_isize as usize) as isize;
+        // Get job IDs ordered by score (priority and creation time).
+        // ZREVRANGE uses inclusive indices: -1 means "the last element",
+        // i.e. "to the end". The earlier formulation
+        // `(-1_isize as usize) as isize` round-tripped to -1 then
+        // subtracted 1, giving -2 — which excludes the *last* element of
+        // the set, so a limit-less call lost one entry off the end.
+        let end_index: isize = match limit {
+            Some(n) => (n as isize) - 1,
+            None => -1,
+        };
         let job_ids: Vec<String> = self
-            .with_timeout(conn.zrevrange(&available_key, 0, count - 1))
+            .with_timeout(conn.zrevrange(&available_key, 0, end_index))
             .await?;
 
         let mut jobs = Vec::new();
@@ -483,6 +863,24 @@ impl Storage for RedisStorage {
         Ok(due)
     }
 
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        self.claim_due_jobs_lua("scheduled", "Scheduled", "enqueue_at", now, limit)
+            .await
+    }
+
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        self.claim_due_jobs_lua("awaiting_retry", "AwaitingRetry", "retry_at", now, limit)
+            .await
+    }
+
     async fn requeue_stranded_jobs(
         &self,
         stale_before: DateTime<Utc>,
@@ -523,83 +921,158 @@ impl Storage for RedisStorage {
     async fn fetch_and_lock_job(
         &self,
         worker_id: &str,
-        _queues: Option<&[String]>,
+        queues: Option<&[String]>,
     ) -> Result<Option<Job>, StorageError> {
         let mut conn = self.get_connection().await?;
 
-        // Lua script for atomic job fetching and locking
+        // Lua script for atomic job fetching and locking.
+        //
+        // KEYS:
+        //   1. available jobs ZSET key (full)
+        //   2. job key prefix (e.g. "qml:jobs:") — concatenated with the
+        //      job id to form the full job key
+        //   3. state index key prefix (e.g. "qml:state:") — concatenated
+        //      with the state name (e.g. "enqueued") to form the full key
+        //   4. counts hash key (full)
+        //
+        // ARGV:
+        //   1. worker_id
+        //   2. now_iso — RFC3339 timestamp string for both
+        //      JobState::Processing.started_at and Job.updated_at. Passed
+        //      from Rust so the JSON timestamps round-trip through
+        //      `chrono::DateTime<Utc>` cleanly (cjson can't format dates).
+        //   3. queue filter as a JSON array, or "" for no filter
+        //   4. candidate cap — upper bound on entries scanned from the
+        //      available ZSET. Without a queue filter we only need 1.
+        //      With a filter we may need to scan past ineligible jobs.
         let lua_script = r#"
             local available_key = KEYS[1]
+            local job_key_prefix = KEYS[2]
+            local state_key_prefix = KEYS[3]
+            local counts_key = KEYS[4]
             local worker_id = ARGV[1]
-            local current_time = tonumber(ARGV[2])
-            
-            -- Get the job with highest priority (lowest score)
-            local job_ids = redis.call('ZRANGEBYSCORE', available_key, '-inf', '+inf', 'LIMIT', 0, 1)
-            
-            if #job_ids == 0 then
-                return nil  -- No jobs available
-            end
-            
-            local job_id = job_ids[1]
-            local job_key = 'qml:job:' .. job_id
-            
-            -- Get the job data
-            local job_data = redis.call('GET', job_key)
-            if not job_data then
-                -- Job was deleted, remove from available set
-                redis.call('ZREM', available_key, job_id)
-                return nil
-            end
-            
-            -- Parse job to check if it's still available. JobState is
-            -- externally tagged by serde, so the variant surfaces as a single
-            -- key on job.state (e.g. Enqueued, AwaitingRetry). Any job whose
-            -- variant is not Enqueued or AwaitingRetry is not eligible.
-            local job = cjson.decode(job_data)
-            if not (job.state.Enqueued or job.state.AwaitingRetry) then
-                redis.call('ZREM', available_key, job_id)
-                return nil
+            local now_iso = ARGV[2]
+            local queue_filter_json = ARGV[3]
+            local cap = tonumber(ARGV[4])
+
+            local filter_set = nil
+            if queue_filter_json ~= '' then
+                local arr = cjson.decode(queue_filter_json)
+                if #arr > 0 then
+                    filter_set = {}
+                    for _, q in ipairs(arr) do
+                        filter_set[q] = true
+                    end
+                end
             end
 
-            -- Mark job as processing, matching the externally-tagged layout
-            -- so Rust can deserialize it back into JobState::Processing.
-            job.state = {
-                Processing = {
-                    worker_id = worker_id,
-                    started_at = current_time,
-                    server_name = 'redis-storage'
-                }
-            }
-            job.updated_at = current_time
+            -- Pull a candidate batch ordered by score DESC (highest priority
+            -- first). Score is built in update_job_indices as
+            -- `priority + created_at_ms / 1e6` so higher score = higher
+            -- priority, with creation time breaking priority ties.
+            local candidates = redis.call(
+                'ZREVRANGEBYSCORE', available_key, '+inf', '-inf',
+                'LIMIT', 0, cap
+            )
 
-            -- Update job in Redis
-            redis.call('SET', job_key, cjson.encode(job))
+            for _, job_id in ipairs(candidates) do
+                local job_key = job_key_prefix .. job_id
+                local job_data = redis.call('GET', job_key)
+                if not job_data then
+                    -- Job was deleted; clean up the available set.
+                    redis.call('ZREM', available_key, job_id)
+                else
+                    -- JobState is externally tagged by serde, so the variant
+                    -- surfaces as a single key on job.state.
+                    local job = cjson.decode(job_data)
+                    local from_enqueued = job.state.Enqueued ~= nil
+                    local from_retry = job.state.AwaitingRetry ~= nil
+                    if not (from_enqueued or from_retry) then
+                        -- Stale entry in the available set; remove and move on.
+                        redis.call('ZREM', available_key, job_id)
+                    else
+                        local matches = (filter_set == nil) or filter_set[job.queue]
+                        if matches then
+                            local old_state_name
+                            if from_enqueued then
+                                old_state_name = 'enqueued'
+                            else
+                                old_state_name = 'awaiting_retry'
+                            end
 
-            -- Remove from available jobs and update indices
-            redis.call('ZREM', available_key, job_id)
-            redis.call('SREM', 'qml:state:enqueued', job_id)
-            redis.call('SREM', 'qml:state:awaiting_retry', job_id)
-            redis.call('SADD', 'qml:state:processing', job_id)
+                            -- Mark job as processing, matching the
+                            -- externally-tagged layout so Rust can
+                            -- deserialize it back into JobState::Processing.
+                            -- Timestamps are passed as ISO strings because
+                            -- chrono's serde format is RFC3339 — feeding raw
+                            -- millis here would break deserialization.
+                            job.state = {
+                                Processing = {
+                                    worker_id = worker_id,
+                                    started_at = now_iso,
+                                    server_name = 'redis-storage'
+                                }
+                            }
+                            job.updated_at = now_iso
 
-            -- Update counters
-            redis.call('HINCRBY', 'qml:counts', 'enqueued', -1)
-            redis.call('HINCRBY', 'qml:counts', 'awaiting_retry', -1)
-            redis.call('HINCRBY', 'qml:counts', 'processing', 1)
-            
-            return job_data
+                            local new_job_data = cjson.encode(job)
+                            redis.call('SET', job_key, new_job_data)
+                            redis.call('ZREM', available_key, job_id)
+                            redis.call('SREM', state_key_prefix .. old_state_name, job_id)
+                            redis.call('SADD', state_key_prefix .. 'processing', job_id)
+                            redis.call('HINCRBY', counts_key, old_state_name, -1)
+                            redis.call('HINCRBY', counts_key, 'processing', 1)
+
+                            return new_job_data
+                        end
+                    end
+                end
+            end
+
+            return nil
         "#;
 
         let available_key = self.available_jobs_key();
-        let current_time = chrono::Utc::now().timestamp_millis();
+        let job_key_prefix = format!("{}:jobs:", self.config.key_prefix);
+        let state_key_prefix = format!("{}:state:", self.config.key_prefix);
+        let counts_key = self.job_counts_key();
+        let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+        // Bound how far the script will scan when filtering by queue. Without
+        // a filter we only need 1. With a filter, we may have to skip over
+        // ineligible-queue jobs to find one that matches; cap the scan to
+        // keep the script bounded. 1024 is well within Redis's default
+        // lua-time-limit and large enough to be effectively "all" for most
+        // realistic backlogs.
+        let cap = match queues {
+            Some(qs) if !qs.is_empty() => 1024,
+            _ => 1,
+        };
+
+        let queue_filter = match queues {
+            Some(qs) if !qs.is_empty() => serde_json::to_string(qs).map_err(|e| {
+                StorageError::serialization_with_source(
+                    "Failed to serialize queue filter",
+                    Box::new(e),
+                )
+            })?,
+            _ => String::new(),
+        };
 
         let result: Option<String> = redis::Script::new(lua_script)
             .key(&available_key)
+            .key(&job_key_prefix)
+            .key(&state_key_prefix)
+            .key(&counts_key)
             .arg(worker_id)
-            .arg(current_time)
+            .arg(&now_iso)
+            .arg(&queue_filter)
+            .arg(cap)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| StorageError::OperationError {
                 message: format!("Failed to fetch and lock job: {}", e),
+                source: Some(Box::new(e)),
             })?;
 
         if let Some(job_json) = result {
@@ -664,6 +1137,7 @@ impl Storage for RedisStorage {
             .await
             .map_err(|e| StorageError::OperationError {
                 message: format!("Failed to release job lock: {}", e),
+                source: Some(Box::new(e)),
             })?;
 
         Ok(result == 1)
@@ -673,7 +1147,7 @@ impl Storage for RedisStorage {
         &self,
         worker_id: &str,
         limit: Option<usize>,
-        _queues: Option<&[String]>,
+        queues: Option<&[String]>,
     ) -> Result<Vec<Job>, StorageError> {
         let mut jobs = Vec::new();
         let fetch_limit = limit.unwrap_or(10).min(50); // Cap at 50 jobs for Redis
@@ -681,7 +1155,7 @@ impl Storage for RedisStorage {
         // For Redis, fetch jobs one by one to ensure proper atomic locking
         // This could be optimized with a more complex Lua script if needed
         for _ in 0..fetch_limit {
-            match self.fetch_and_lock_job(worker_id, _queues).await? {
+            match self.fetch_and_lock_job(worker_id, queues).await? {
                 Some(job) => jobs.push(job),
                 None => break, // No more available jobs
             }
@@ -1113,9 +1587,8 @@ mod tests {
         assert_eq!(all_jobs.len(), 3);
 
         // Test list by state
-        let enqueued_state = JobState::enqueued("test");
         let enqueued_jobs = storage
-            .list(Some(&enqueued_state), None, None)
+            .list(Some(JobStateKind::Enqueued), None, None)
             .await
             .unwrap();
         assert_eq!(enqueued_jobs.len(), 1);

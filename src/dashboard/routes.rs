@@ -8,7 +8,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::core::JobState;
 use crate::dashboard::service::{
     DashboardService, JobDetails, JobStatistics, QueueStatistics, ServerStatistics,
 };
@@ -233,19 +232,21 @@ async fn health_check() -> Json<ApiResponse<&'static str>> {
     Json(ApiResponse::success("Dashboard service is running"))
 }
 
-/// Helper function to parse job state from string
-fn parse_job_state(state_str: &str) -> Option<JobState> {
-    // For filtering purposes, create dummy states with minimal data
+/// Parse a job state filter string from the URL query into the typed
+/// [`JobStateKind`] discriminant. Returning `JobStateKind` (rather than
+/// constructing a throwaway `JobState` with bogus inner fields just to
+/// pick a variant) keeps the discarded data discardable at the type
+/// level — `Storage::list` only ever filtered by discriminant anyway.
+fn parse_job_state(state_str: &str) -> Option<crate::core::JobStateKind> {
+    use crate::core::JobStateKind;
     match state_str.to_lowercase().as_str() {
-        "enqueued" => Some(JobState::enqueued("default")),
-        "processing" => Some(JobState::processing("worker", "server")),
-        "succeeded" => Some(JobState::succeeded(0, None)),
-        "failed" => Some(JobState::failed("error", None)),
-        "scheduled" => Some(JobState::scheduled(chrono::Utc::now(), "reason")),
-        "awaiting_retry" | "awaitingretry" => {
-            Some(JobState::awaiting_retry(chrono::Utc::now(), "error"))
-        }
-        "deleted" => Some(JobState::deleted(None)),
+        "enqueued" => Some(JobStateKind::Enqueued),
+        "processing" => Some(JobStateKind::Processing),
+        "succeeded" => Some(JobStateKind::Succeeded),
+        "failed" => Some(JobStateKind::Failed),
+        "scheduled" => Some(JobStateKind::Scheduled),
+        "awaiting_retry" | "awaitingretry" => Some(JobStateKind::AwaitingRetry),
+        "deleted" => Some(JobStateKind::Deleted),
         _ => None,
     }
 }

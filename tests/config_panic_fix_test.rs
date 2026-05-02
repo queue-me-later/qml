@@ -22,13 +22,18 @@ fn test_memory_config_no_panic() {
 fn test_redis_config_no_panic() {
     use qml_rs::storage::RedisConfig;
 
-    // This should NOT panic even without REDIS_URL environment variable
+    // This should NOT panic even without REDIS_URL environment variable.
+    // Compute the expected URL the same way `Default::default()` does so
+    // the test passes whether or not REDIS_URL is exported in the
+    // surrounding environment.
+    let expected_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let redis_config = RedisConfig::default();
-    assert_eq!(redis_config.url, "redis://localhost:6379");
+    assert_eq!(redis_config.url, expected_url);
     assert_eq!(redis_config.pool_size, 10);
     assert_eq!(redis_config.key_prefix, "qml");
     println!(
-        "✅ RedisConfig::default() works without REDIS_URL: {}",
+        "✅ RedisConfig::default() works: url = {}",
         redis_config.url
     );
 }
@@ -38,16 +43,17 @@ fn test_redis_config_no_panic() {
 fn test_postgres_config_no_panic() {
     use qml_rs::storage::PostgresConfig;
 
-    // This should NOT panic even without DATABASE_URL environment variable
+    // This should NOT panic even without DATABASE_URL environment
+    // variable. Mirror the env-aware default so the test is stable
+    // under both `cargo test` and `DATABASE_URL=… cargo test`.
+    let expected_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://postgres:password@localhost:5432/qml".to_string());
     let postgres_config = PostgresConfig::default();
-    assert_eq!(
-        postgres_config.database_url,
-        "postgresql://postgres:password@localhost:5432/qml"
-    );
+    assert_eq!(postgres_config.database_url, expected_url);
     assert_eq!(postgres_config.max_connections, 20);
     assert_eq!(postgres_config.schema_name, "qml");
     println!(
-        "✅ PostgresConfig::default() works without DATABASE_URL: {}",
+        "✅ PostgresConfig::default() works: url = {}",
         postgres_config.database_url
     );
 }

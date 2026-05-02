@@ -2,6 +2,7 @@ use axum::{Router, http::StatusCode, middleware, response::Html, routing::get};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 
@@ -63,6 +64,14 @@ pub struct DashboardServer {
     config: DashboardConfig,
     dashboard_service: Arc<DashboardService>,
     websocket_manager: Arc<WebSocketManager>,
+    /// Cancellation token wired into both `axum::serve(...).with_graceful_shutdown`
+    /// and the websocket periodic-updates task. [`shutdown`](Self::shutdown)
+    /// fires it; both the HTTP server and the periodic task observe it and
+    /// exit cleanly. Without this, the previous code's `tokio::spawn` for
+    /// periodic updates ran forever (no cancellation, no JoinHandle), and
+    /// `axum::serve` blocked indefinitely so embedding the dashboard in a
+    /// larger app's shutdown sequence wasn't possible.
+    shutdown: CancellationToken,
 }
 
 impl DashboardServer {
@@ -74,11 +83,38 @@ impl DashboardServer {
             config,
             dashboard_service,
             websocket_manager,
+            shutdown: CancellationToken::new(),
         }
     }
 
-    /// Start the dashboard server
+    /// Returns a clone of the internal shutdown token so callers can fire it
+    /// from their own runtime hooks (e.g. `tokio::signal::ctrl_c`) or wire
+    /// it into a parent `BackgroundJobServer`'s shutdown sequence.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Trigger graceful shutdown of an active [`start`](Self::start) call.
+    /// The HTTP listener stops accepting new connections, in-flight requests
+    /// drain, and the periodic-updates task exits.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// Start the dashboard server. Runs until [`shutdown`](Self::shutdown)
+    /// (or any clone of [`shutdown_token`](Self::shutdown_token)) fires, or
+    /// until the listener errors.
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.run_until_cancelled(self.shutdown.clone()).await
+    }
+
+    /// Like [`start`](Self::start) but exits cleanly when `cancel` fires.
+    /// Use this when embedding the dashboard alongside other services that
+    /// share a single cancellation source.
+    pub async fn run_until_cancelled(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.config.auth.is_none() && !auth::is_loopback_host(&self.config.host) {
             return Err(format!(
                 "refusing to start dashboard on non-loopback host '{}' without \
@@ -93,17 +129,46 @@ impl DashboardServer {
         // Create the main router
         let app = self.create_app().await;
 
-        // Start periodic statistics updates
-        self.websocket_manager
-            .start_periodic_updates(self.config.statistics_update_interval)
+        // Start periodic statistics updates with cancellation plumbed
+        // through. The handle is awaited after the HTTP server exits so the
+        // task can't outlive this call.
+        let mut periodic_handle = self
+            .websocket_manager
+            .start_periodic_updates(self.config.statistics_update_interval, cancel.clone())
             .await;
 
         tracing::info!("Starting QML Dashboard server on http://{}", addr);
         tracing::info!("Dashboard available at: http://{}", addr);
 
         let listener = TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        let serve_cancel = cancel.clone();
+        let serve_result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serve_cancel.cancelled().await })
+            .await;
 
+        // Ensure the periodic task observes shutdown even if axum::serve
+        // exited because of an error rather than the token firing.
+        cancel.cancel();
+
+        // Bound the wait. The periodic task should exit on the next
+        // `tokio::select!` poll once `cancel` fires, but
+        // `get_server_statistics()` can in principle stall indefinitely
+        // against an unhealthy backend. If it doesn't unwind in 5s,
+        // abort it and move on — better than blocking the caller's
+        // shutdown sequence.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut periodic_handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    "Dashboard periodic-updates task did not exit within 5s of \
+                     cancellation; aborting"
+                );
+                periodic_handle.abort();
+                let _ = periodic_handle.await;
+            }
+        }
+
+        serve_result?;
         Ok(())
     }
 

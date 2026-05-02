@@ -77,10 +77,10 @@ impl MemoryStorage {
         }
     }
 
-    /// Filter jobs by state
-    fn filter_jobs_by_state(jobs: &HashMap<String, Job>, state: &JobState) -> Vec<Job> {
+    /// Filter jobs by state discriminant.
+    fn filter_jobs_by_state(jobs: &HashMap<String, Job>, kind: JobStateKind) -> Vec<Job> {
         jobs.values()
-            .filter(|job| std::mem::discriminant(&job.state) == std::mem::discriminant(state))
+            .filter(|job| job.state.kind() == kind)
             .cloned()
             .collect()
     }
@@ -138,6 +138,22 @@ impl MonitoringApi for MemoryStorage {
         }
     }
 
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        match jobs.get(&job.id) {
+            None => Err(StorageError::job_not_found(job.id.clone())),
+            Some(existing) if existing.state.kind() != expected => Ok(false),
+            Some(_) => {
+                jobs.insert(job.id.clone(), job.clone());
+                Ok(true)
+            }
+        }
+    }
+
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
         let mut jobs = self.jobs.write().unwrap();
         Ok(jobs.remove(job_id).is_some())
@@ -145,14 +161,14 @@ impl MonitoringApi for MemoryStorage {
 
     async fn list(
         &self,
-        state_filter: Option<&JobState>,
+        state_filter: Option<JobStateKind>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Vec<Job>, StorageError> {
         let jobs = self.jobs.read().unwrap();
 
-        let mut filtered_jobs: Vec<Job> = if let Some(state) = state_filter {
-            Self::filter_jobs_by_state(&jobs, state)
+        let mut filtered_jobs: Vec<Job> = if let Some(kind) = state_filter {
+            Self::filter_jobs_by_state(&jobs, kind)
         } else {
             jobs.values().cloned().collect()
         };
@@ -257,6 +273,82 @@ impl Storage for MemoryStorage {
         });
         due.truncate(limit);
         Ok(due)
+    }
+
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // One critical section: select-and-transition under the same write
+        // lock. No `.await` between the read and the writes, so a parallel
+        // scheduler instance against the same MemoryStorage can never see
+        // a Scheduled job after it's been claimed here.
+        let mut jobs = self.jobs.write().unwrap();
+
+        let mut due_ids: Vec<String> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::Scheduled { enqueue_at, .. } => *enqueue_at <= now,
+                _ => false,
+            })
+            .map(|job| job.id.clone())
+            .collect();
+
+        // Stable order matching the read-only fetch_due_scheduled_jobs:
+        // priority desc, then created_at asc.
+        due_ids.sort_by(|a, b| {
+            let ja = &jobs[a];
+            let jb = &jobs[b];
+            jb.priority
+                .cmp(&ja.priority)
+                .then_with(|| ja.created_at.cmp(&jb.created_at))
+        });
+        due_ids.truncate(limit);
+
+        let mut claimed = Vec::with_capacity(due_ids.len());
+        for id in due_ids {
+            if let Some(job) = jobs.get_mut(&id) {
+                job.state = JobState::enqueued(&job.queue);
+                claimed.push(job.clone());
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+
+        let mut due_ids: Vec<String> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::AwaitingRetry { retry_at, .. } => *retry_at <= now,
+                _ => false,
+            })
+            .map(|job| job.id.clone())
+            .collect();
+
+        due_ids.sort_by(|a, b| {
+            let ja = &jobs[a];
+            let jb = &jobs[b];
+            jb.priority
+                .cmp(&ja.priority)
+                .then_with(|| ja.created_at.cmp(&jb.created_at))
+        });
+        due_ids.truncate(limit);
+
+        let mut claimed = Vec::with_capacity(due_ids.len());
+        for id in due_ids {
+            if let Some(job) = jobs.get_mut(&id) {
+                job.state = JobState::enqueued(&job.queue);
+                claimed.push(job.clone());
+            }
+        }
+        Ok(claimed)
     }
 
     async fn requeue_stranded_jobs(
@@ -636,9 +728,8 @@ mod tests {
         assert_eq!(all_jobs.len(), 3);
 
         // Test list by state
-        let enqueued_state = JobState::enqueued("default");
         let enqueued_jobs = storage
-            .list(Some(&enqueued_state), None, None)
+            .list(Some(JobStateKind::Enqueued), None, None)
             .await
             .unwrap();
         assert_eq!(enqueued_jobs.len(), 1);

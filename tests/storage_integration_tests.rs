@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use qml_rs::{
-    Job, JobState, MonitoringApi, Storage,
+    Job, JobState, JobStateKind, MonitoringApi, Storage,
     storage::{MemoryConfig, StorageConfig, StorageInstance},
 };
 
@@ -101,9 +101,8 @@ async fn test_storage_interface(storage: &StorageInstance) {
     assert_eq!(all_jobs.len(), 3);
 
     // Test filtering by state
-    let enqueued_state = JobState::enqueued("default");
     let enqueued_jobs = storage
-        .list(Some(&enqueued_state), None, None)
+        .list(Some(JobStateKind::Enqueued), None, None)
         .await
         .unwrap();
     assert_eq!(enqueued_jobs.len(), 1);

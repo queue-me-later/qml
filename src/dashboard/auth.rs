@@ -176,11 +176,17 @@ fn authority_of(url: &str) -> Option<String> {
 /// version was a 25-line hand-rolled implementation; the crate
 /// version is audited, handles padding edge cases the same way, and
 /// keeps the dashboard off custom decoding code.
+///
+/// The input is passed through verbatim — the crate handles the `=`
+/// padding internally. The previous hand-rolled implementation called
+/// `input.trim_end_matches('=')` (stripping padding), and a brief
+/// intermediate of this function called `.trim()` (stripping
+/// surrounding whitespace) which would have widened the contract; the
+/// only caller (`check_basic`) already trims its input, so this
+/// matches the old strict-format behavior.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(input.trim())
-        .ok()
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
 #[cfg(test)]

@@ -250,9 +250,20 @@ impl DashboardServer {
             ));
         }
 
-        // Stitch the unguarded /metrics route in *after* the auth
-        // layer if `metrics_skip_auth` is set, so it bypasses the
-        // auth middleware entirely.
+        // Stitch the unguarded `/metrics` route in *after* the auth
+        // layer is applied to `guarded`, when `metrics_skip_auth` is
+        // on. Axum's middleware semantics make this the right shape:
+        // `Router::layer` wraps only the routes already in that
+        // router, and `Router::merge` combines two routers without
+        // re-applying either side's middleware to the other side. The
+        // result is exactly the split we want — guarded routes still
+        // hit auth, the merged-in `/metrics` doesn't.
+        //
+        // It's worth a comment because the visual order
+        // (`.layer(auth)` then `.merge(unguarded)`) reads like the
+        // auth applies to everything, which axum's docs explicitly
+        // disclaim. The two `metrics_route_*_when_skip_auth_*` tests
+        // in `metrics_route_tests` lock down both shapes.
         let mut app = guarded;
         #[cfg(feature = "metrics")]
         if let Some(unguarded) = unguarded_metrics_router {

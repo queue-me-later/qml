@@ -383,30 +383,130 @@ impl MonitoringApi for RedisStorage {
     }
 
     async fn update(&self, job: &Job) -> Result<(), StorageError> {
-        let job_key = self.job_key(&job.id);
+        // Atomic update in a single Lua call: read the persisted blob to
+        // discover the *current* state (no TOCTOU), then write the new
+        // blob plus the index swap and counter math in one invocation.
+        //
+        // The earlier shape was a separate `get()` + `set()` pair in Rust
+        // with five non-transactional follow-up index commands, which:
+        //   1. Two concurrent updaters reading the same `old_state` would
+        //      both decrement the same old-state counter (drift).
+        //   2. A reader between the SET and the index commands could see a
+        //      job whose `state` field claimed e.g. `Processing` but whose
+        //      state-set membership and counts still said `Enqueued`.
+        //
+        // KEYS:
+        //   1. job key (full)
+        //   2. state index prefix
+        //   3. all_jobs key
+        //   4. available ZSET
+        //   5. counts hash
+        //
+        // ARGV:
+        //   1. new state name (lowercase, e.g. "enqueued")
+        //   2. new full job JSON to write
+        //   3. new score for the available ZSET, or "" if not available
+        //   4. new state availability flag ("1" if available, else "0")
+        //
+        // Returns "missing" if no job exists at the key, "ok" otherwise.
+        let lua_script = r#"
+            local job_key = KEYS[1]
+            local state_key_prefix = KEYS[2]
+            local all_jobs_key = KEYS[3]
+            local available_key = KEYS[4]
+            local counts_key = KEYS[5]
+            local new_state_name = ARGV[1]
+            local new_blob = ARGV[2]
+            local new_score = ARGV[3]
+            local new_available = ARGV[4]
 
-        // Get the current job to check if it exists and get old state
-        let current_job = self.get(&job.id).await?;
-        let old_state = current_job.as_ref().map(|j| &j.state);
+            local current = redis.call('GET', job_key)
+            if not current then
+                return 'missing'
+            end
 
-        if current_job.is_none() {
-            return Err(StorageError::job_not_found(job.id.clone()));
-        }
+            -- Determine old state from the persisted blob — atomically,
+            -- since this Lua run is the only thing touching the key while
+            -- it executes.
+            local old_job = cjson.decode(current)
+            local old_variant
+            for k, _ in pairs(old_job.state) do
+                old_variant = k
+                break
+            end
+            local old_state_name
+            if old_variant == 'AwaitingRetry' then
+                old_state_name = 'awaiting_retry'
+            else
+                old_state_name = string.lower(old_variant or '')
+            end
+
+            local job_id = old_job.id
+
+            redis.call('SET', job_key, new_blob)
+            redis.call('SADD', all_jobs_key, job_id)
+
+            if old_state_name ~= new_state_name then
+                redis.call('SREM', state_key_prefix .. old_state_name, job_id)
+                redis.call('SADD', state_key_prefix .. new_state_name, job_id)
+                redis.call('HINCRBY', counts_key, old_state_name, -1)
+                redis.call('HINCRBY', counts_key, new_state_name, 1)
+            end
+
+            if new_available == '1' then
+                redis.call('ZADD', available_key, tonumber(new_score), job_id)
+            else
+                redis.call('ZREM', available_key, job_id)
+            end
+
+            return 'ok'
+        "#;
 
         let mut conn = self.get_connection().await?;
-
-        // Serialize and store the updated job
-        let job_json = serde_json::to_string(job).map_err(|e| {
+        let new_blob = serde_json::to_string(job).map_err(|e| {
             StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
         })?;
 
-        self.with_timeout::<_, ()>(conn.set(&job_key, job_json))
-            .await?;
+        let job_key = self.job_key(&job.id);
+        let state_key_prefix = format!("{}:state:", self.config.key_prefix);
+        let all_jobs_key = self.all_jobs_key();
+        let available_key = self.available_jobs_key();
+        let counts_key = self.job_counts_key();
 
-        // Update indices
-        self.update_job_indices(job, old_state).await?;
+        let new_state_name = Self::state_to_string(&job.state);
+        let (new_score, new_available) = if Self::is_job_available(job) {
+            let score =
+                job.priority as f64 + (job.created_at.timestamp_millis() as f64 / 1_000_000.0);
+            (score.to_string(), "1")
+        } else {
+            (String::new(), "0")
+        };
 
-        Ok(())
+        let result: String = redis::Script::new(lua_script)
+            .key(&job_key)
+            .key(&state_key_prefix)
+            .key(&all_jobs_key)
+            .key(&available_key)
+            .key(&counts_key)
+            .arg(&new_state_name)
+            .arg(&new_blob)
+            .arg(&new_score)
+            .arg(new_available)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to update job: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
+        match result.as_str() {
+            "ok" => Ok(()),
+            "missing" => Err(StorageError::job_not_found(job.id.clone())),
+            other => Err(StorageError::OperationError {
+                message: format!("Unexpected update response: {}", other),
+                source: None,
+            }),
+        }
     }
 
     async fn update_if_state(

@@ -245,6 +245,14 @@ impl RedisStorage {
     /// a non-trivial parse. Same-priority FIFO ordering is therefore
     /// approximate for newly-promoted jobs; it's accurate as long as the
     /// claim batch is small.
+    ///
+    /// Timestamp format: `now` is rendered as RFC3339 with microsecond
+    /// precision (`SecondsFormat::Micros`) and the `Z` suffix — the same
+    /// shape chrono's serde adapter produces for `DateTime<Utc>` and the
+    /// shape Postgres's `to_jsonb(NOW())` produces (modulo `Z` vs
+    /// `+00:00`, which both parse). All three sources share microsecond
+    /// precision so lexicographic comparison of the time field stays
+    /// chronological across backends.
     async fn claim_due_jobs_lua(
         &self,
         from_state_str: &str,
@@ -253,6 +261,14 @@ impl RedisStorage {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Job>, StorageError> {
+        // Defensive: bail on a zero limit without round-tripping to Redis.
+        // The trait permits `limit: usize`; callers (currently the
+        // scheduler) pass a positive batch size, but a future caller
+        // mistakenly passing 0 would otherwise issue an SMEMBERS for
+        // nothing.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut conn = self.get_connection().await?;
 
         let lua_script = r#"

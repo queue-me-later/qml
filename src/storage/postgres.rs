@@ -1628,10 +1628,11 @@ impl Storage for PostgresStorage {
 
     async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
         // Same shape as requeue_stranded_jobs but filtered on
-        // `state_data->>'server_name' = $1` instead of a staleness cutoff.
-        // Matches every Processing job attributed to this dead peer and
-        // flips it back to Enqueued so it can be re-picked by any live
-        // worker.
+        // `state_data->'Processing'->>'server_name' = $1` (note: the
+        // externally-tagged `Processing` wrapper) instead of a staleness
+        // cutoff. Matches every Processing job attributed to this dead
+        // peer and flips it back to Enqueued so it can be re-picked by
+        // any live worker.
         self.update_processing_to_enqueued(
             "AND state_data->'Processing'->>'server_name' = $1",
             "Failed to reclaim jobs from server",

@@ -4,6 +4,7 @@
 //! using QML's embedded PostgreSQL schema installation. The schema is now included
 //! directly in the binary and only requires the 'postgres' feature to be enabled.
 
+use qml_rs::storage::prelude::*;
 #[cfg(feature = "postgres")]
 use qml_rs::storage::{PostgresConfig, PostgresStorage, StorageError};
 #[cfg(feature = "postgres")]

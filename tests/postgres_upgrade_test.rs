@@ -13,6 +13,7 @@
 #![cfg(feature = "postgres")]
 
 use qml_rs::RecurringJob;
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{PostgresConfig, PostgresStorage, Storage};
 use sqlx::postgres::PgPoolOptions;
 use std::env;

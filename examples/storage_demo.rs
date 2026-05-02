@@ -1,3 +1,4 @@
+use qml_rs::storage::prelude::*;
 use qml_rs::{
     Job, JobState, JobStateKind, MonitoringApi, Storage,
     storage::{MemoryConfig, StorageConfig, StorageInstance},
@@ -124,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Demonstrates basic storage operations
 async fn demo_storage_operations(
-    storage: &StorageInstance,
+    storage: &std::sync::Arc<dyn Storage>,
     storage_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing {}", storage_name);

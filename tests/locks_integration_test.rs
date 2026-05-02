@@ -10,6 +10,7 @@ use std::env;
 use std::time::Duration;
 
 use qml_rs::storage::Storage;
+use qml_rs::storage::prelude::*;
 
 fn database_url() -> Option<String> {
     env::var("DATABASE_URL")

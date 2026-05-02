@@ -3,7 +3,10 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::{MemoryConfig, MonitoringApi, Storage, StorageError};
+use super::{
+    JobLocker, JobStore, MemoryConfig, MonitoringApi, NamedLocks, RecurringStore, ServerRegistry,
+    StorageError,
+};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Job lock information for MemoryStorage
@@ -204,7 +207,7 @@ impl MonitoringApi for MemoryStorage {
 }
 
 #[async_trait]
-impl Storage for MemoryStorage {
+impl JobStore for MemoryStorage {
     async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
         // Check capacity before adding
         if self.is_at_capacity() {
@@ -351,6 +354,19 @@ impl Storage for MemoryStorage {
         Ok(claimed)
     }
 
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        let before = jobs.len();
+        jobs.retain(|_, job| match job.expires_at {
+            Some(ts) => ts > now,
+            None => true,
+        });
+        Ok(before - jobs.len())
+    }
+}
+
+#[async_trait]
+impl JobLocker for MemoryStorage {
     async fn requeue_stranded_jobs(
         &self,
         stale_before: DateTime<Utc>,
@@ -489,7 +505,10 @@ impl Storage for MemoryStorage {
 
         Ok(jobs)
     }
+}
 
+#[async_trait]
+impl RecurringStore for MemoryStorage {
     async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
         let mut map = self.recurring.write().unwrap();
         map.insert(job.id.clone(), job.clone());
@@ -536,17 +555,10 @@ impl Storage for MemoryStorage {
         }
         Ok(due)
     }
+}
 
-    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
-        let mut jobs = self.jobs.write().unwrap();
-        let before = jobs.len();
-        jobs.retain(|_, job| match job.expires_at {
-            Some(ts) => ts > now,
-            None => true,
-        });
-        Ok(before - jobs.len())
-    }
-
+#[async_trait]
+impl ServerRegistry for MemoryStorage {
     async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
         let mut servers = self.servers.write().unwrap();
         servers.insert(info.server_id.clone(), info.clone());
@@ -609,7 +621,10 @@ impl Storage for MemoryStorage {
         }
         Ok(reclaimed)
     }
+}
 
+#[async_trait]
+impl NamedLocks for MemoryStorage {
     async fn try_acquire_lock(
         &self,
         resource: &str,

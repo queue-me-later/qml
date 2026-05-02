@@ -17,6 +17,7 @@
 use std::env;
 
 use qml_rs::core::{Job, JobState, JobStateKind};
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{MemoryStorage, MonitoringApi, Storage, StorageError};
 
 #[cfg(feature = "postgres")]

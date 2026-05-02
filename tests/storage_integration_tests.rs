@@ -1,4 +1,5 @@
 use chrono::{Duration, Utc};
+use qml_rs::storage::prelude::*;
 use qml_rs::{
     Job, JobState, JobStateKind, MonitoringApi, Storage,
     storage::{MemoryConfig, StorageConfig, StorageInstance},
@@ -77,7 +78,7 @@ async fn test_storage_polymorphism() {
 }
 
 /// Test a storage interface regardless of implementation
-async fn test_storage_interface(storage: &StorageInstance) {
+async fn test_storage_interface(storage: &std::sync::Arc<dyn Storage>) {
     // Create test jobs with different states
     let mut job1 = Job::new(
         "email_job",
@@ -138,15 +139,13 @@ async fn test_concurrent_storage_access() {
     let mut handles = vec![];
 
     for i in 0..10 {
-        let storage_clone = match &storage {
-            StorageInstance::Memory(_) => {
-                StorageInstance::Memory(MemoryStorage::with_config(MemoryConfig::new()))
-            }
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(_) => unreachable!(),
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(_) => unreachable!(),
-        };
+        // Each spawned task gets a fresh in-memory storage. The
+        // previous version pattern-matched on `StorageInstance` enum
+        // variants (since-retired) to rebuild a memory variant; now
+        // that the unit struct just hands out `Arc<dyn Storage>` we
+        // construct one directly.
+        let storage_clone: std::sync::Arc<dyn Storage> =
+            std::sync::Arc::new(MemoryStorage::with_config(MemoryConfig::new()));
 
         let handle = tokio::spawn(async move {
             let job = Job::new(
@@ -321,3 +320,4 @@ async fn test_storage_pagination() {
 
 // Re-export MemoryStorage for the concurrent test
 use qml_rs::MemoryStorage;
+use qml_rs::storage::prelude::*;

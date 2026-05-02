@@ -186,640 +186,6 @@ pub use redis::RedisStorage;
 /// println!("Available for processing: {}", available.len());
 /// # });
 /// ```
-#[async_trait]
-pub trait Storage: MonitoringApi + Send + Sync {
-    /// Store a new job in the storage backend.
-    ///
-    /// Persists a job to the storage system, making it available for processing.
-    /// The job is typically stored in the "enqueued" state unless specified otherwise.
-    ///
-    /// ## Arguments
-    /// * `job` - The job to store with all its metadata and configuration
-    ///
-    /// ## Returns
-    /// * `Ok(())` - Job was stored successfully
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// let job = Job::with_config(
-    ///     "send_notification",
-    ///     serde_json::json!({ "user_id": "user123" }),
-    ///     "notifications", // queue
-    ///     5,              // priority
-    ///     3               // max_retries
-    /// );
-    ///
-    /// storage.enqueue(&job).await.unwrap();
-    /// println!("Job {} enqueued successfully", job.id);
-    /// # });
-    /// ```
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError>;
-
-    /// Get jobs that are ready to be processed immediately.
-    ///
-    /// Returns jobs that are available for processing: enqueued jobs, scheduled jobs
-    /// whose time has arrived, and jobs awaiting retry whose retry time has passed.
-    ///
-    /// ## Arguments
-    /// * `limit` - Maximum number of jobs to return (None = no limit)
-    ///
-    /// ## Returns
-    /// * `Ok(jobs)` - Vector of jobs ready for processing
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Enqueue several jobs
-    /// for i in 0..5 {
-    ///     let job = Job::new("process_item", serde_json::json!([i.to_string()]));
-    ///     storage.enqueue(&job).await.unwrap();
-    /// }
-    ///
-    /// // Get available jobs for processing
-    /// let available = storage.get_available_jobs(Some(3)).await.unwrap();
-    /// println!("Available for processing: {}", available.len());
-    ///
-    /// for job in available {
-    ///     println!("Job {} is ready: {}", job.id, job.method);
-    /// }
-    /// # });
-    /// ```
-    async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError>;
-
-    /// Fetch scheduled jobs whose `enqueue_at` has already passed.
-    ///
-    /// Storage backends are expected to push the time predicate down to the
-    /// engine (SQL WHERE, Redis ZRANGEBYSCORE, etc.) rather than loading every
-    /// scheduled job into memory. Results are ordered by priority (desc) then
-    /// `created_at` (asc) when the backend supports ordering.
-    async fn fetch_due_scheduled_jobs(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Fetch awaiting-retry jobs whose `retry_at` has already passed.
-    ///
-    /// Same contract as [`fetch_due_scheduled_jobs`] but for jobs in the
-    /// `AwaitingRetry` state.
-    async fn fetch_due_retry_jobs(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Atomically claim due scheduled jobs and transition them to
-    /// `Enqueued`.
-    ///
-    /// Unlike [`fetch_due_scheduled_jobs`], this method performs the
-    /// `Scheduled → Enqueued` transition inside the storage engine so two
-    /// schedulers running against the same backend cannot promote the same
-    /// job twice. Returns the claimed jobs already in their post-transition
-    /// (`Enqueued`) state.
-    ///
-    /// **Caller contract — important:** the storage engine has already
-    /// persisted the `Enqueued` transition by the time this call returns.
-    /// Callers must NOT call [`MonitoringApi::update`] (or any other write
-    /// path) on the returned jobs to "save" the transition — the persisted
-    /// row already reflects it. The intended usage is to consume the
-    /// returned jobs as observations only (e.g. for logging/metrics) and
-    /// let the regular worker fetch path pick them up via
-    /// [`fetch_and_lock_job`]. Re-writing them is harmless on Postgres and
-    /// the in-memory backend (the state is the same), but on Redis it
-    /// re-runs index churn for no reason.
-    ///
-    /// Backends implement this as:
-    /// - **Postgres**: `UPDATE ... WHERE state_name = 'scheduled' AND
-    ///   <due predicate> RETURNING *` with `FOR UPDATE SKIP LOCKED`.
-    /// - **Redis**: a Lua script that decodes each candidate, checks the
-    ///   time predicate, and performs the SET + index swaps in one
-    ///   invocation.
-    /// - **Memory**: a single critical section under the jobs write lock.
-    async fn claim_due_scheduled_jobs(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Atomically claim due retry jobs and transition them to `Enqueued`.
-    /// Same contract as [`claim_due_scheduled_jobs`] (including the
-    /// "do-not-`update()`-the-returned-jobs" caller contract) but for jobs
-    /// in the `AwaitingRetry` state.
-    async fn claim_due_retry_jobs(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Recover jobs stranded in the `Processing` state by a previous server
-    /// instance.
-    ///
-    /// A job is considered stranded if its `Processing::started_at` is
-    /// earlier than `stale_before`. Matching jobs are transitioned back to
-    /// `Enqueued` (preserving their original `queue`) and any explicit locks
-    /// on them are cleared. Returns the number of jobs recovered.
-    ///
-    /// This is called by `BackgroundJobServer::start` on startup with
-    /// `stale_before = now - config.stale_processing_after`. `stale_before`
-    /// should comfortably exceed the typical job runtime so a worker that's
-    /// still alive on another server isn't fighting the sweep.
-    async fn requeue_stranded_jobs(
-        &self,
-        stale_before: DateTime<Utc>,
-    ) -> Result<usize, StorageError>;
-
-    /// Atomically fetch and lock a job for processing to prevent race conditions.
-    ///
-    /// This is the **primary method for job processing** in production environments.
-    /// It atomically finds an available job, locks it, and marks it as processing
-    /// in a single operation, preventing multiple workers from processing the same job.
-    ///
-    /// ## Race Condition Prevention
-    ///
-    /// Different storage backends use different mechanisms:
-    /// - **PostgreSQL**: `SELECT FOR UPDATE SKIP LOCKED` with dedicated lock table
-    /// - **Redis**: Lua scripts for atomic operations with distributed locking
-    /// - **Memory**: Mutex-based locking with automatic cleanup
-    ///
-    /// ## Arguments
-    /// * `worker_id` - Unique identifier of the worker claiming the job
-    /// * `queues` - Optional list of specific queues to fetch from (None = all queues)
-    ///
-    /// ## Returns
-    /// * `Ok(Some(job))` - Job was successfully fetched and locked
-    /// * `Ok(None)` - No jobs are available for processing
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Backend caveats
-    ///
-    /// **Redis**: when `queues` is `Some` and non-empty, the Lua script
-    /// scans up to **1024 candidates** ordered by score from the global
-    /// available ZSET, returning the first whose `queue` matches the
-    /// filter. If your deployment can have more than 1024 ineligible-
-    /// queue jobs queued ahead of an eligible one, queue-scoped workers
-    /// can transiently return `Ok(None)` even though work for them
-    /// exists. The cap is bounded for predictability under Redis's
-    /// `lua-time-limit`; per-queue ZSETs (a future change) will make the
-    /// scan exact.
-    ///
-    /// **Postgres** and **Memory**: no such cap — the queue filter is
-    /// pushed down to the engine (SQL `WHERE queue_name = ANY(...)` on
-    /// Postgres) and applied exactly.
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Enqueue some jobs
-    /// for i in 0..3 {
-    ///     let job = Job::with_config(
-    ///         "process_item",
-    ///         serde_json::json!({ "index": i }),
-    ///         if i == 0 { "critical" } else { "normal" }, // different queues
-    ///         i as i32,
-    ///         3
-    ///     );
-    ///     storage.enqueue(&job).await.unwrap();
-    /// }
-    ///
-    /// // Worker fetches from any queue
-    /// let job = storage.fetch_and_lock_job("worker-1", None).await.unwrap();
-    /// match job {
-    ///     Some(job) => {
-    ///         println!("Worker-1 got job: {} from queue: {}", job.id, job.queue);
-    ///         // Job is now locked and marked as processing
-    ///     },
-    ///     None => println!("No jobs available"),
-    /// }
-    ///
-    /// // Worker fetches only from critical queue
-    /// let critical_job = storage.fetch_and_lock_job(
-    ///     "worker-2",
-    ///     Some(&["critical".to_string()])
-    /// ).await.unwrap();
-    /// # });
-    /// ```
-    async fn fetch_and_lock_job(
-        &self,
-        worker_id: &str,
-        queues: Option<&[String]>,
-    ) -> Result<Option<Job>, StorageError>;
-
-    /// Try to acquire an explicit lock on a specific job.
-    ///
-    /// Attempts to acquire an exclusive lock on a job for coordination between
-    /// workers. This is useful for implementing custom job processing logic
-    /// or manual job management.
-    ///
-    /// ## Arguments
-    /// * `job_id` - The unique identifier of the job to lock
-    /// * `worker_id` - Unique identifier of the worker trying to acquire the lock
-    /// * `timeout_seconds` - Lock timeout in seconds (auto-release after this time)
-    ///
-    /// ## Returns
-    /// * `Ok(true)` - Lock was successfully acquired
-    /// * `Ok(false)` - Lock could not be acquired (already locked by another worker)
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let job = Job::new("exclusive_task", serde_json::Value::Null);
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Worker 1 tries to acquire lock
-    /// let acquired = storage.try_acquire_job_lock(&job.id, "worker-1", 300).await.unwrap();
-    /// assert!(acquired);
-    ///
-    /// // Worker 2 tries to acquire the same lock (should fail)
-    /// let acquired = storage.try_acquire_job_lock(&job.id, "worker-2", 300).await.unwrap();
-    /// assert!(!acquired);
-    ///
-    /// // Worker 1 releases the lock
-    /// storage.release_job_lock(&job.id, "worker-1").await.unwrap();
-    ///
-    /// // Now worker 2 can acquire it
-    /// let acquired = storage.try_acquire_job_lock(&job.id, "worker-2", 300).await.unwrap();
-    /// assert!(acquired);
-    /// # });
-    /// ```
-    async fn try_acquire_job_lock(
-        &self,
-        job_id: &str,
-        worker_id: &str,
-        timeout_seconds: u64,
-    ) -> Result<bool, StorageError>;
-
-    /// Release an explicit lock on a job.
-    ///
-    /// Releases a lock that was previously acquired with `try_acquire_job_lock`.
-    /// Only the worker that acquired the lock can release it.
-    ///
-    /// ## Arguments
-    /// * `job_id` - The unique identifier of the job to unlock
-    /// * `worker_id` - Unique identifier of the worker releasing the lock
-    ///
-    /// ## Returns
-    /// * `Ok(true)` - Lock was successfully released
-    /// * `Ok(false)` - Lock was not held by this worker (or already expired)
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    /// let job = Job::new("task_with_lock", serde_json::Value::Null);
-    /// storage.enqueue(&job).await.unwrap();
-    ///
-    /// // Acquire lock
-    /// storage.try_acquire_job_lock(&job.id, "worker-1", 300).await.unwrap();
-    ///
-    /// // Do some work...
-    ///
-    /// // Release lock
-    /// let released = storage.release_job_lock(&job.id, "worker-1").await.unwrap();
-    /// assert!(released);
-    ///
-    /// // Trying to release again should return false
-    /// let released = storage.release_job_lock(&job.id, "worker-1").await.unwrap();
-    /// assert!(!released);
-    /// # });
-    /// ```
-    async fn release_job_lock(&self, job_id: &str, worker_id: &str) -> Result<bool, StorageError>;
-
-    /// Atomically fetch multiple available jobs with locking.
-    ///
-    /// Similar to `fetch_and_lock_job` but fetches multiple jobs in a single
-    /// atomic operation. Useful for batch processing scenarios where a worker
-    /// can handle multiple jobs simultaneously.
-    ///
-    /// ## Arguments
-    /// * `worker_id` - Unique identifier of the worker claiming the jobs
-    /// * `limit` - Maximum number of jobs to fetch (None = implementation default)
-    /// * `queues` - Optional list of specific queues to fetch from (None = all queues)
-    ///
-    /// ## Returns
-    /// * `Ok(jobs)` - Vector of jobs that were successfully fetched and locked
-    /// * `Err(StorageError)` - Storage operation failed
-    ///
-    /// ## Examples
-    /// ```rust
-    /// use qml_rs::{MemoryStorage, Job, Storage};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let storage = MemoryStorage::new();
-    ///
-    /// // Enqueue batch of jobs
-    /// for i in 0..10 {
-    ///     let job = Job::new("batch_process", serde_json::json!({ "i": i }));
-    ///     storage.enqueue(&job).await.unwrap();
-    /// }
-    ///
-    /// // Worker fetches multiple jobs at once
-    /// let jobs = storage.fetch_available_jobs_atomic("worker-1", Some(5), None).await.unwrap();
-    /// println!("Worker-1 got {} jobs for batch processing", jobs.len());
-    ///
-    /// for job in jobs {
-    ///     println!("Processing job {} with payload: {}", job.id, job.payload);
-    /// }
-    /// # });
-    /// ```
-    async fn fetch_available_jobs_atomic(
-        &self,
-        worker_id: &str,
-        limit: Option<usize>,
-        queues: Option<&[String]>,
-    ) -> Result<Vec<Job>, StorageError>;
-
-    /// Insert or update a [`RecurringJob`] template.
-    ///
-    /// Keyed by [`RecurringJob::id`]. Backends should upsert (insert on
-    /// first call, overwrite subsequent calls for the same id).
-    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError>;
-
-    /// Remove a recurring-job template by id.
-    ///
-    /// Returns `Ok(true)` if a row existed and was removed, `Ok(false)` if
-    /// the id was unknown.
-    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError>;
-
-    /// List recurring-job templates (for dashboards / operator tooling).
-    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError>;
-
-    /// Atomically claim recurring-job templates whose `next_run_at <= now`
-    /// and are `enabled`. Implementations must use locking (Postgres: `FOR
-    /// UPDATE SKIP LOCKED`, Redis: per-row `SET NX`) so two servers running
-    /// the poller cannot double-fire the same tick.
-    ///
-    /// Claimed rows are returned to the caller *before* `next_run_at` is
-    /// advanced — the caller is responsible for calling
-    /// [`RecurringJob::advance`] and then [`upsert_recurring_job`] to write
-    /// the new `next_run_at` back. The advance is done in-memory (not in
-    /// SQL) because cron expressions can't be computed by the database.
-    async fn fetch_due_recurring_jobs(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<RecurringJob>, StorageError>;
-
-    /// Delete jobs whose `expires_at` is in the past.
-    ///
-    /// Called periodically by the cleanup worker. Backends should only
-    /// touch rows in a final state (Succeeded / Failed / Deleted) — in-
-    /// flight jobs should never carry an `expires_at`. Returns the number
-    /// of rows removed.
-    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
-
-    // ---------------------------------------------------------------------
-    // D1: server heartbeats + dead-server detection
-    // ---------------------------------------------------------------------
-
-    /// Insert or update a live [`ServerInfo`] registration. Called once on
-    /// [`BackgroundJobServer::start`](crate::processing::BackgroundJobServer::start)
-    /// when heartbeats are enabled. Backends should upsert (replace on
-    /// duplicate `server_id`).
-    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError>;
-
-    /// Bump `last_heartbeat` for a previously-registered `server_id`.
-    /// Returns `Ok(true)` if the row existed and was updated, `Ok(false)`
-    /// if the server was not registered (or had already been reclaimed).
-    async fn heartbeat_server(
-        &self,
-        server_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<bool, StorageError>;
-
-    /// Remove a server registration. Called from `stop()` on graceful
-    /// shutdown, and by peers after reclaiming a dead server's jobs.
-    /// Returns `Ok(true)` if a row existed and was deleted.
-    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError>;
-
-    /// Return every server whose `last_heartbeat < stale_before`. Peers
-    /// call this to find servers that have likely crashed.
-    async fn list_dead_servers(
-        &self,
-        stale_before: DateTime<Utc>,
-    ) -> Result<Vec<ServerInfo>, StorageError>;
-
-    /// Re-queue every `Processing` job whose
-    /// [`JobState::Processing::server_name`] matches `server_id`, returning
-    /// the number of jobs moved back to `Enqueued`. Used by the heartbeat
-    /// worker to actively reclaim a dead peer's in-flight work rather than
-    /// waiting for lock-expiry or the next startup sweep.
-    ///
-    /// This is idempotent: a second call after the first reclaim sees zero
-    /// matching `Processing` rows and returns 0.
-    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError>;
-
-    // -- D2: generic named distributed locks -----------------------------
-
-    /// Try to acquire a named distributed lock.
-    ///
-    /// `resource` is the lock key (arbitrary user-chosen string).
-    /// `owner` identifies the holder (e.g. `server_id`, `worker_id`, or a
-    /// caller-supplied token). `ttl` is how long the lock lives before
-    /// another owner can take it over.
-    ///
-    /// Semantics:
-    /// - If no row exists for `resource`, the lock is created and
-    ///   `Ok(true)` is returned.
-    /// - If a row exists but `expires_at` is in the past, it is taken
-    ///   over (`owner` and `expires_at` overwritten) and `Ok(true)` is
-    ///   returned.
-    /// - If a row exists, is not expired, and is held by the same
-    ///   `owner`, the `expires_at` is refreshed and `Ok(true)` is
-    ///   returned (re-entrant / extend).
-    /// - Otherwise returns `Ok(false)`.
-    ///
-    /// This is a separate mechanism from [`Storage::try_acquire_job_lock`]
-    /// — job locks live on the job row so fetch-and-lock remains a single
-    /// atomic `UPDATE ... RETURNING`. Generic locks exist for user-facing
-    /// "at most one instance of X" semantics (e.g. a recurring report
-    /// that must not overlap with itself).
-    async fn try_acquire_lock(
-        &self,
-        resource: &str,
-        owner: &str,
-        ttl: std::time::Duration,
-    ) -> Result<bool, StorageError>;
-
-    /// Release a named lock. Only the current `owner` can release.
-    /// Returns `Ok(true)` if a matching row was deleted, `Ok(false)` if
-    /// no row existed or it was owned by someone else.
-    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError>;
-
-    /// Background sweep of expired generic named locks.
-    ///
-    /// Returns the number of expired entries removed. Backends differ:
-    /// - **Postgres**: `DELETE FROM qml_locks WHERE expires_at < $1`.
-    ///   The `try_acquire_lock` path replaces expired rows opportunistically
-    ///   on contention, but a workload that takes a lock once and never
-    ///   re-acquires (e.g. one-shot named locks) accumulates rows
-    ///   indefinitely without this sweep.
-    /// - **Redis**: a no-op — named locks use the native Redis `PX` TTL
-    ///   so the server expires them automatically. Returns `Ok(0)`.
-    /// - **Memory**: drops entries from the in-process `named_locks` map.
-    ///
-    /// Called by [`crate::processing::CleanupWorker`] on each tick.
-    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
-}
-
-/// Storage instance that can hold any storage implementation
-pub enum StorageInstance {
-    /// Memory storage instance
-    Memory(MemoryStorage),
-    /// Redis storage instance
-    #[cfg(feature = "redis")]
-    Redis(RedisStorage),
-    /// PostgreSQL storage instance
-    #[cfg(feature = "postgres")]
-    Postgres(PostgresStorage),
-}
-
-impl StorageInstance {
-    /// Create a storage instance from configuration
-    ///
-    /// # Arguments
-    /// * `config` - The storage configuration
-    ///
-    /// # Returns
-    /// * `Ok(storage)` - The created storage instance
-    /// * `Err(StorageError)` - If there was an error creating the storage
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use qml_rs::storage::{StorageInstance, StorageConfig, MemoryConfig};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let config = StorageConfig::Memory(MemoryConfig::default());
-    /// let storage = StorageInstance::from_config(config).await.unwrap();
-    /// # });
-    /// ```
-    pub async fn from_config(config: StorageConfig) -> Result<Self, StorageError> {
-        match config {
-            StorageConfig::Memory(memory_config) => Ok(StorageInstance::Memory(
-                MemoryStorage::with_config(memory_config),
-            )),
-            #[cfg(feature = "redis")]
-            StorageConfig::Redis(redis_config) => {
-                let redis_storage = RedisStorage::with_config(redis_config).await?;
-                Ok(StorageInstance::Redis(redis_storage))
-            }
-            #[cfg(feature = "postgres")]
-            StorageConfig::Postgres(postgres_config) => {
-                let postgres_storage = PostgresStorage::new(postgres_config).await?;
-                Ok(StorageInstance::Postgres(postgres_storage))
-            }
-        }
-    }
-
-    /// Create a memory storage instance with default configuration
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use qml_rs::storage::StorageInstance;
-    ///
-    /// let storage = StorageInstance::memory();
-    /// ```
-    pub fn memory() -> Self {
-        StorageInstance::Memory(MemoryStorage::new())
-    }
-
-    /// Create a memory storage instance with custom configuration
-    ///
-    /// # Arguments
-    /// * `config` - The memory storage configuration
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use qml_rs::storage::{StorageInstance, MemoryConfig};
-    ///
-    /// let config = MemoryConfig::new().with_max_jobs(1000);
-    /// let storage = StorageInstance::memory_with_config(config);
-    /// ```
-    pub fn memory_with_config(config: MemoryConfig) -> Self {
-        StorageInstance::Memory(MemoryStorage::with_config(config))
-    }
-
-    /// Create a Redis storage instance with custom configuration
-    ///
-    /// # Arguments
-    /// * `config` - The Redis storage configuration
-    ///
-    /// # Returns
-    /// * `Ok(storage)` - The created Redis storage instance
-    /// * `Err(StorageError)` - If there was an error connecting to Redis
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use qml_rs::storage::{StorageInstance, RedisConfig};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let config = RedisConfig::new().with_url("redis://localhost:6379");
-    /// match StorageInstance::redis(config).await {
-    ///     Ok(storage) => println!("Redis storage created successfully"),
-    ///     Err(e) => println!("Failed to create Redis storage: {}", e),
-    /// }
-    /// # });
-    /// ```
-    #[cfg(feature = "redis")]
-    pub async fn redis(config: RedisConfig) -> Result<Self, StorageError> {
-        let redis_storage = RedisStorage::with_config(config).await?;
-        Ok(StorageInstance::Redis(redis_storage))
-    }
-
-    /// Create a PostgreSQL storage instance with custom configuration
-    ///
-    /// # Arguments
-    /// * `config` - The PostgreSQL storage configuration
-    ///
-    /// # Returns
-    /// * `Ok(storage)` - The created PostgreSQL storage instance
-    /// * `Err(StorageError)` - If there was an error connecting to PostgreSQL
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use qml_rs::storage::{StorageInstance, PostgresConfig};
-    ///
-    /// # tokio_test::block_on(async {
-    /// let config = PostgresConfig::new().with_database_url("postgresql://postgres:password@localhost:5432/qml");
-    /// match StorageInstance::postgres(config).await {
-    ///     Ok(storage) => println!("PostgreSQL storage created successfully"),
-    ///     Err(e) => println!("Failed to create PostgreSQL storage: {}", e),
-    /// }
-    /// # });
-    /// ```
-    #[cfg(feature = "postgres")]
-    pub async fn postgres(config: PostgresConfig) -> Result<Self, StorageError> {
-        let postgres_storage = PostgresStorage::new(config).await?;
-        Ok(StorageInstance::Postgres(postgres_storage))
-    }
-}
-
 /// Dashboard-facing subset of storage operations.
 ///
 /// [`MonitoringApi`] carves out the methods the Axum dashboard and its
@@ -883,403 +249,416 @@ pub trait MonitoringApi: Send + Sync {
     /// Get the count of jobs grouped by their current state.
     async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError>;
 }
+// =========================================================================
+// Sub-traits — operational surfaces of a storage backend
+// =========================================================================
+//
+// Originally one giant `Storage` trait carried 24 methods spanning job
+// CRUD + atomic claim + recurring-job templates + server registry +
+// generic named locks. The mass made it (a) hard for a partial backend
+// (e.g. an in-process mirror) to opt out of methods it doesn't support
+// and (b) easy for callers to demand the full surface where a narrow
+// one would do.
+//
+// The split below carves the surface into five cohesive sub-traits.
+// `Storage` is now a marker umbrella with a blanket `impl<T> Storage
+// for T where T: ...`, so every existing `Arc<dyn Storage>` callsite
+// continues to work and every backend that implements the five sub-
+// traits automatically implements `Storage`.
+//
+//   * `JobStore`       — enqueue, list/query, time-based fetches,
+//                        atomic claim-and-transition, expiration.
+//   * `JobLocker`      — race-condition primitives: fetch-and-lock,
+//                        per-job named locks, stranded recovery.
+//   * `RecurringStore` — cron-scheduled job templates.
+//   * `ServerRegistry` — heartbeat / dead-server detection / reclaim.
+//   * `NamedLocks`     — generic distributed locks for user-facing
+//                        "at most one instance of X" semantics.
+//
+// `JobStore` extends `MonitoringApi`, so backends only have to write
+// the dashboard read-side once.
 
+/// Persistence-side of a storage backend: enqueue, list/query, atomic
+/// claim-and-transition, expiration sweep.
 #[async_trait]
-impl MonitoringApi for StorageInstance {
-    async fn get(&self, job_id: &str) -> Result<Option<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.get(job_id).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.get(job_id).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.get(job_id).await,
-        }
-    }
+pub trait JobStore: MonitoringApi {
+    /// Persist a new job. Typically lands in the `Enqueued` state
+    /// unless the caller assigned a different state on `job.state`.
+    async fn enqueue(&self, job: &Job) -> Result<(), StorageError>;
 
-    async fn update(&self, job: &Job) -> Result<(), StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.update(job).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.update(job).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.update(job).await,
-        }
-    }
+    /// Get jobs that are ready to be processed immediately.
+    ///
+    /// Returns enqueued jobs, scheduled jobs whose time has arrived,
+    /// and jobs awaiting retry whose retry time has passed. Used by
+    /// the dashboard's queue-statistics view; workers go through the
+    /// atomic [`JobLocker::fetch_and_lock_job`] path instead.
+    async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError>;
 
-    async fn update_if_state(
-        &self,
-        job: &Job,
-        expected: JobStateKind,
-    ) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.update_if_state(job, expected).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.update_if_state(job, expected).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.update_if_state(job, expected).await,
-        }
-    }
-
-    async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.delete(job_id).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.delete(job_id).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.delete(job_id).await,
-        }
-    }
-
-    async fn list(
-        &self,
-        state_filter: Option<JobStateKind>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.list(state_filter, limit, offset).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.list(state_filter, limit, offset).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.list(state_filter, limit, offset).await,
-        }
-    }
-
-    async fn get_job_counts(&self) -> Result<HashMap<JobStateKind, usize>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.get_job_counts().await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.get_job_counts().await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.get_job_counts().await,
-        }
-    }
-}
-
-#[async_trait]
-impl Storage for StorageInstance {
-    async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.enqueue(job).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.enqueue(job).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.enqueue(job).await,
-        }
-    }
-
-    async fn get_available_jobs(&self, limit: Option<usize>) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.get_available_jobs(limit).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.get_available_jobs(limit).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.get_available_jobs(limit).await,
-        }
-    }
-
+    /// Fetch scheduled jobs whose `enqueue_at` has already passed.
+    /// Read-only — does not transition state. Backends push the time
+    /// predicate down to the engine; results are ordered by priority
+    /// (desc) then `created_at` (asc). Use [`claim_due_scheduled_jobs`](Self::claim_due_scheduled_jobs)
+    /// for the atomic claim-and-promote primitive used by the scheduler.
     async fn fetch_due_scheduled_jobs(
         &self,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.fetch_due_scheduled_jobs(now, limit).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.fetch_due_scheduled_jobs(now, limit).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage.fetch_due_scheduled_jobs(now, limit).await
-            }
-        }
-    }
+    ) -> Result<Vec<Job>, StorageError>;
 
+    /// Read-only counterpart of [`fetch_due_scheduled_jobs`](Self::fetch_due_scheduled_jobs)
+    /// for jobs in `AwaitingRetry`.
     async fn fetch_due_retry_jobs(
         &self,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.fetch_due_retry_jobs(now, limit).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.fetch_due_retry_jobs(now, limit).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.fetch_due_retry_jobs(now, limit).await,
-        }
-    }
+    ) -> Result<Vec<Job>, StorageError>;
 
+    /// Atomically claim due scheduled jobs and transition them to
+    /// `Enqueued`.
+    ///
+    /// The transition is persisted by the storage engine before this
+    /// call returns. Two schedulers running against the same backend
+    /// cannot both promote the same job. Returned jobs are already in
+    /// `Enqueued` state.
+    ///
+    /// **Caller contract:** do NOT call [`MonitoringApi::update`] on
+    /// the returned jobs to "save" the transition — the persisted row
+    /// already reflects it. Re-writing is harmless on Postgres / Memory
+    /// but causes redundant index churn on Redis.
     async fn claim_due_scheduled_jobs(
         &self,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.claim_due_scheduled_jobs(now, limit).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.claim_due_scheduled_jobs(now, limit).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage.claim_due_scheduled_jobs(now, limit).await
-            }
-        }
-    }
+    ) -> Result<Vec<Job>, StorageError>;
 
+    /// Atomic counterpart of [`claim_due_scheduled_jobs`](Self::claim_due_scheduled_jobs)
+    /// for jobs in `AwaitingRetry`. Same caller contract.
     async fn claim_due_retry_jobs(
         &self,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.claim_due_retry_jobs(now, limit).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.claim_due_retry_jobs(now, limit).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.claim_due_retry_jobs(now, limit).await,
-        }
-    }
+    ) -> Result<Vec<Job>, StorageError>;
 
-    async fn requeue_stranded_jobs(
-        &self,
-        stale_before: DateTime<Utc>,
-    ) -> Result<usize, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.requeue_stranded_jobs(stale_before).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.requeue_stranded_jobs(stale_before).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.requeue_stranded_jobs(stale_before).await,
-        }
-    }
+    /// Delete jobs whose `expires_at` is in the past.
+    ///
+    /// Called periodically by [`crate::processing::CleanupWorker`].
+    /// Backends should only touch rows in a final state
+    /// (`Succeeded` / `Failed` / `Deleted`) — in-flight jobs should
+    /// never carry an `expires_at`. Returns the number of rows removed.
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
+}
 
+/// Race-condition primitives: atomic fetch-and-lock for workers, per-job
+/// named locks, and stranded-job recovery.
+#[async_trait]
+pub trait JobLocker: Send + Sync {
+    /// Atomically fetch and lock a job for processing.
+    ///
+    /// The primary worker entry point. Atomically finds an available
+    /// job, locks it, and marks it `Processing` in a single operation —
+    /// preventing multiple workers from claiming the same job.
+    ///
+    /// Backends use different mechanisms to enforce atomicity:
+    /// - **PostgreSQL**: `SELECT ... FOR UPDATE SKIP LOCKED`.
+    /// - **Redis**: a Lua script that picks the highest-score entry
+    ///   from one or more candidate ZSETs.
+    /// - **Memory**: mutex-based.
+    ///
+    /// `queues = None` matches any queue. `queues = Some(&[...])`
+    /// restricts to the listed queues. With per-queue indexing on
+    /// Redis (added alongside the original 1024-cap fix), the queue
+    /// filter is exact on every backend.
     async fn fetch_and_lock_job(
         &self,
         worker_id: &str,
         queues: Option<&[String]>,
-    ) -> Result<Option<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.fetch_and_lock_job(worker_id, queues).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.fetch_and_lock_job(worker_id, queues).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage.fetch_and_lock_job(worker_id, queues).await
-            }
-        }
-    }
+    ) -> Result<Option<Job>, StorageError>;
 
-    async fn try_acquire_job_lock(
-        &self,
-        job_id: &str,
-        worker_id: &str,
-        timeout_seconds: u64,
-    ) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => {
-                storage
-                    .try_acquire_job_lock(job_id, worker_id, timeout_seconds)
-                    .await
-            }
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => {
-                storage
-                    .try_acquire_job_lock(job_id, worker_id, timeout_seconds)
-                    .await
-            }
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage
-                    .try_acquire_job_lock(job_id, worker_id, timeout_seconds)
-                    .await
-            }
-        }
-    }
-
-    async fn release_job_lock(&self, job_id: &str, worker_id: &str) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.release_job_lock(job_id, worker_id).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.release_job_lock(job_id, worker_id).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.release_job_lock(job_id, worker_id).await,
-        }
-    }
-
+    /// Atomic batch variant of [`fetch_and_lock_job`](Self::fetch_and_lock_job).
+    /// Each backend calls fetch-and-lock per slot; the contract is N
+    /// claims rather than one giant atomic over N rows.
     async fn fetch_available_jobs_atomic(
         &self,
         worker_id: &str,
         limit: Option<usize>,
         queues: Option<&[String]>,
-    ) -> Result<Vec<Job>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => {
-                storage
-                    .fetch_available_jobs_atomic(worker_id, limit, queues)
-                    .await
-            }
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => {
-                storage
-                    .fetch_available_jobs_atomic(worker_id, limit, queues)
-                    .await
-            }
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage
-                    .fetch_available_jobs_atomic(worker_id, limit, queues)
-                    .await
-            }
-        }
-    }
+    ) -> Result<Vec<Job>, StorageError>;
 
-    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.upsert_recurring_job(job).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.upsert_recurring_job(job).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.upsert_recurring_job(job).await,
-        }
-    }
+    /// Acquire an exclusive per-job lock for `timeout_seconds`.
+    /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if
+    /// another worker holds it.
+    ///
+    /// Distinct from [`NamedLocks::try_acquire_lock`]: this lock lives
+    /// on the job row itself (or a per-job entry on Redis/Memory) so
+    /// fetch-and-lock can remain a single atomic operation.
+    async fn try_acquire_job_lock(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        timeout_seconds: u64,
+    ) -> Result<bool, StorageError>;
 
-    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.remove_recurring_job(id).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.remove_recurring_job(id).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.remove_recurring_job(id).await,
-        }
-    }
+    /// Release a per-job lock held by `worker_id`. No-op if the lock
+    /// has been taken over by someone else.
+    async fn release_job_lock(&self, job_id: &str, worker_id: &str) -> Result<bool, StorageError>;
 
-    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.list_recurring_jobs().await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.list_recurring_jobs().await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.list_recurring_jobs().await,
-        }
-    }
+    /// Recover jobs stranded in the `Processing` state by a previous
+    /// server instance.
+    ///
+    /// A job is stranded if its `Processing::started_at` predates
+    /// `stale_before`. Matching jobs are transitioned back to
+    /// `Enqueued` (preserving their original `queue`) and any explicit
+    /// per-job locks are cleared. Returns the number of jobs recovered.
+    ///
+    /// Called by `BackgroundJobServer::start` on startup.
+    /// `stale_before` should comfortably exceed the typical job
+    /// runtime so a still-alive worker on another server isn't
+    /// fighting the sweep.
+    async fn requeue_stranded_jobs(
+        &self,
+        stale_before: DateTime<Utc>,
+    ) -> Result<usize, StorageError>;
+}
 
+/// Recurring-job templates — the storage side of cron-scheduled jobs.
+#[async_trait]
+pub trait RecurringStore: Send + Sync {
+    /// Insert or update a [`RecurringJob`] template, keyed by
+    /// [`RecurringJob::id`].
+    async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError>;
+
+    /// Remove a recurring-job template by id. Returns `Ok(true)` if
+    /// the row existed and was removed, `Ok(false)` if the id was
+    /// unknown.
+    async fn remove_recurring_job(&self, id: &str) -> Result<bool, StorageError>;
+
+    /// List recurring-job templates (for dashboards / operator tooling).
+    async fn list_recurring_jobs(&self) -> Result<Vec<RecurringJob>, StorageError>;
+
+    /// Atomically claim recurring-job templates whose `next_run_at <=
+    /// now` and are `enabled`. Implementations use locking (Postgres:
+    /// `FOR UPDATE SKIP LOCKED`; Redis: per-row `SET NX`) so two
+    /// servers running the poller cannot double-fire the same tick.
+    ///
+    /// Claimed rows are returned to the caller *before* `next_run_at`
+    /// is advanced — the caller calls [`RecurringJob::advance`] and
+    /// [`upsert_recurring_job`](Self::upsert_recurring_job) to write
+    /// the new `next_run_at` back. Cron expressions can't be
+    /// computed in the database.
     async fn fetch_due_recurring_jobs(
         &self,
         now: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<RecurringJob>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.fetch_due_recurring_jobs(now, limit).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.fetch_due_recurring_jobs(now, limit).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage.fetch_due_recurring_jobs(now, limit).await
-            }
-        }
-    }
+    ) -> Result<Vec<RecurringJob>, StorageError>;
+}
 
-    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.delete_expired_jobs(now).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.delete_expired_jobs(now).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.delete_expired_jobs(now).await,
-        }
-    }
+/// Live-server registry. Used by the heartbeat worker to detect dead
+/// peers and reclaim their in-flight jobs.
+#[async_trait]
+pub trait ServerRegistry: Send + Sync {
+    /// Insert or update a live [`ServerInfo`] registration. Called
+    /// once on `BackgroundJobServer::start` when heartbeats are
+    /// enabled.
+    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError>;
 
-    async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.register_server(info).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.register_server(info).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.register_server(info).await,
-        }
-    }
-
+    /// Bump `last_heartbeat` for a previously-registered `server_id`.
+    /// Returns `Ok(false)` if the server was not registered (or had
+    /// already been reclaimed).
     async fn heartbeat_server(
         &self,
         server_id: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.heartbeat_server(server_id, now).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.heartbeat_server(server_id, now).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.heartbeat_server(server_id, now).await,
-        }
-    }
+    ) -> Result<bool, StorageError>;
 
-    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.deregister_server(server_id).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.deregister_server(server_id).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.deregister_server(server_id).await,
-        }
-    }
+    /// Remove a server registration. Called from `stop()` on graceful
+    /// shutdown, and by peers after reclaiming a dead server's jobs.
+    async fn deregister_server(&self, server_id: &str) -> Result<bool, StorageError>;
 
+    /// Return every server whose `last_heartbeat < stale_before`. Peers
+    /// call this to find servers that have likely crashed.
     async fn list_dead_servers(
         &self,
         stale_before: DateTime<Utc>,
-    ) -> Result<Vec<ServerInfo>, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.list_dead_servers(stale_before).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.list_dead_servers(stale_before).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.list_dead_servers(stale_before).await,
-        }
-    }
+    ) -> Result<Vec<ServerInfo>, StorageError>;
 
-    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.reclaim_jobs_from_server(server_id).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.reclaim_jobs_from_server(server_id).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.reclaim_jobs_from_server(server_id).await,
-        }
-    }
+    /// Re-queue every `Processing` job whose
+    /// [`crate::core::JobState::Processing::server_name`] matches
+    /// `server_id`, returning the number of jobs moved back to
+    /// `Enqueued`. Idempotent — a second call after the first reclaim
+    /// returns 0.
+    async fn reclaim_jobs_from_server(&self, server_id: &str) -> Result<usize, StorageError>;
+}
 
+/// Generic distributed named locks — for "at most one instance of X"
+/// semantics (e.g. a recurring report that must not overlap with
+/// itself).
+#[async_trait]
+pub trait NamedLocks: Send + Sync {
+    /// Try to acquire a named lock.
+    ///
+    /// `resource` is the lock key, `owner` identifies the holder, `ttl`
+    /// is how long the lock lives before another owner can take over.
+    ///
+    /// Semantics:
+    /// - Free resource → created, `Ok(true)`.
+    /// - Expired → taken over (overwriting `owner` and `expires_at`), `Ok(true)`.
+    /// - Held by same `owner` → refresh (extend), `Ok(true)`.
+    /// - Held live by a different owner → `Ok(false)`.
+    ///
+    /// Distinct from [`JobLocker::try_acquire_job_lock`]: per-job
+    /// locks live on the job row so fetch-and-lock remains a single
+    /// atomic operation.
     async fn try_acquire_lock(
         &self,
         resource: &str,
         owner: &str,
         ttl: std::time::Duration,
-    ) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => {
-                storage.try_acquire_lock(resource, owner, ttl).await
-            }
+    ) -> Result<bool, StorageError>;
+
+    /// Release a named lock. Only the current `owner` can release.
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError>;
+
+    /// Background sweep of expired generic named locks. Returns the
+    /// number of expired entries removed.
+    ///
+    /// - **Postgres**: `DELETE FROM qml_locks WHERE expires_at < $1`.
+    ///   The `try_acquire_lock` path replaces expired rows
+    ///   opportunistically on contention, but a workload that takes a
+    ///   lock once and never re-acquires would otherwise leak rows.
+    /// - **Redis**: no-op — Redis-native PX TTL handles expiration
+    ///   server-side. Returns `Ok(0)`.
+    /// - **Memory**: drops entries from the in-process map.
+    ///
+    /// Called by [`crate::processing::CleanupWorker`] on each tick.
+    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
+}
+
+/// Composite trait combining every storage operation: job CRUD +
+/// queries ([`JobStore`]), atomic claim/lock primitives ([`JobLocker`]),
+/// recurring-job templates ([`RecurringStore`]), server registry
+/// ([`ServerRegistry`]), and generic named locks ([`NamedLocks`]).
+///
+/// `Arc<dyn Storage>` is the canonical handle the runtime holds. Every
+/// method on `Storage` comes from one of the five sub-traits via
+/// supertrait inheritance; calling them on a `dyn Storage` value
+/// requires the relevant sub-trait to be in scope.
+///
+/// A [`prelude`] module re-exports all five sub-traits in one shot —
+/// `use qml_rs::storage::prelude::*` is the easiest way to bring them
+/// all into scope when you'd otherwise need `use qml_rs::Storage` to
+/// reach the full surface.
+///
+/// Each backend writes a one-line `impl Storage for Backend {}` —
+/// zero-cost, because every method comes from the five sub-traits.
+pub trait Storage:
+    JobStore + JobLocker + RecurringStore + ServerRegistry + NamedLocks + Send + Sync
+{
+}
+
+impl Storage for MemoryStorage {}
+#[cfg(feature = "redis")]
+impl Storage for RedisStorage {}
+#[cfg(feature = "postgres")]
+impl Storage for PostgresStorage {}
+
+/// One-stop import for every storage trait in this module.
+///
+/// `use qml_rs::storage::prelude::*` brings [`Storage`] *and* the five
+/// sub-traits ([`JobStore`], [`JobLocker`], [`RecurringStore`],
+/// [`ServerRegistry`], [`NamedLocks`]) plus [`MonitoringApi`] into
+/// scope. Because Rust resolves trait methods by which trait is in
+/// scope, calling `storage.enqueue(...)` on an `&dyn Storage` requires
+/// `JobStore` to be reachable — the prelude saves callers from
+/// remembering which method lives where.
+pub mod prelude {
+    pub use super::{
+        JobLocker, JobStore, MonitoringApi, NamedLocks, RecurringStore, ServerRegistry, Storage,
+    };
+}
+
+// =========================================================================
+// StorageInstance — module-level constructors returning Arc<dyn Storage>
+// =========================================================================
+
+/// Module-level constructor surface for the supported backends.
+///
+/// Originally a 3-variant enum (`Memory | Redis | Postgres`) with a
+/// 350-line hand-written `match`-based dispatch implementing every
+/// `Storage` trait method. With the trait split into sub-traits and a
+/// blanket `impl<T> Storage for T where T: ...`, the enum + dispatch
+/// became pure boilerplate. Replaced with a unit struct whose
+/// associated functions return `Arc<dyn Storage>` directly — every
+/// backend type already satisfies `Storage` via the blanket impl, so
+/// no per-backend dispatch is needed.
+///
+/// Existing call sites (`StorageInstance::memory()`,
+/// `StorageInstance::redis(cfg).await`, etc.) keep their syntax; what
+/// changes is that those constructors now return `Arc<dyn Storage>`
+/// rather than an enum value the caller has to wrap in `Arc::new`.
+pub struct StorageInstance;
+
+impl StorageInstance {
+    /// Create a storage instance from configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use qml_rs::storage::{StorageInstance, StorageConfig, MemoryConfig};
+    ///
+    /// # tokio_test::block_on(async {
+    /// let config = StorageConfig::Memory(MemoryConfig::default());
+    /// let storage = StorageInstance::from_config(config).await.unwrap();
+    /// # });
+    /// ```
+    pub async fn from_config(
+        config: StorageConfig,
+    ) -> Result<std::sync::Arc<dyn Storage>, StorageError> {
+        match config {
+            StorageConfig::Memory(memory_config) => Ok(std::sync::Arc::new(
+                MemoryStorage::with_config(memory_config),
+            )),
             #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.try_acquire_lock(resource, owner, ttl).await,
+            StorageConfig::Redis(redis_config) => Ok(std::sync::Arc::new(
+                RedisStorage::with_config(redis_config).await?,
+            )),
             #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => {
-                storage.try_acquire_lock(resource, owner, ttl).await
-            }
+            StorageConfig::Postgres(postgres_config) => Ok(std::sync::Arc::new(
+                PostgresStorage::new(postgres_config).await?,
+            )),
         }
     }
 
-    async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.release_lock(resource, owner).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.release_lock(resource, owner).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.release_lock(resource, owner).await,
-        }
+    /// Create a memory storage instance with default configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use qml_rs::storage::StorageInstance;
+    ///
+    /// let storage = StorageInstance::memory();
+    /// ```
+    pub fn memory() -> std::sync::Arc<dyn Storage> {
+        std::sync::Arc::new(MemoryStorage::new())
     }
 
-    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
-        match self {
-            StorageInstance::Memory(storage) => storage.cleanup_expired_named_locks(now).await,
-            #[cfg(feature = "redis")]
-            StorageInstance::Redis(storage) => storage.cleanup_expired_named_locks(now).await,
-            #[cfg(feature = "postgres")]
-            StorageInstance::Postgres(storage) => storage.cleanup_expired_named_locks(now).await,
-        }
+    /// Create a memory storage instance with custom configuration.
+    pub fn memory_with_config(config: MemoryConfig) -> std::sync::Arc<dyn Storage> {
+        std::sync::Arc::new(MemoryStorage::with_config(config))
+    }
+
+    /// Create a Redis storage instance with custom configuration.
+    #[cfg(feature = "redis")]
+    pub async fn redis(config: RedisConfig) -> Result<std::sync::Arc<dyn Storage>, StorageError> {
+        Ok(std::sync::Arc::new(
+            RedisStorage::with_config(config).await?,
+        ))
+    }
+
+    /// Create a PostgreSQL storage instance with custom configuration.
+    #[cfg(feature = "postgres")]
+    pub async fn postgres(
+        config: PostgresConfig,
+    ) -> Result<std::sync::Arc<dyn Storage>, StorageError> {
+        Ok(std::sync::Arc::new(PostgresStorage::new(config).await?))
     }
 }

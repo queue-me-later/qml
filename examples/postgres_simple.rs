@@ -9,6 +9,7 @@
 #[cfg(feature = "postgres")]
 use qml_rs::{Job, JobState, MonitoringApi, Storage};
 
+use qml_rs::storage::prelude::*;
 #[cfg(feature = "postgres")]
 use qml_rs::storage::{PostgresConfig, PostgresStorage};
 

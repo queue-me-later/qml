@@ -19,7 +19,8 @@
 //!
 //! ### Memory Storage (Development/Testing)
 //! ```rust
-//! use qml_rs::{MemoryStorage, Job, Storage};
+//! use qml_rs::{Job, MemoryStorage};
+//! use qml_rs::storage::prelude::*;
 //! use std::sync::Arc;
 //!
 //! # tokio_test::block_on(async {
@@ -146,7 +147,8 @@
 //! - **Memory**: Mutex-based locking with automatic cleanup
 //!
 //! ```rust
-//! use qml_rs::{Storage, MemoryStorage};
+//! use qml_rs::MemoryStorage;
+//! use qml_rs::storage::prelude::*;
 //!
 //! # tokio_test::block_on(async {
 //! let storage = MemoryStorage::new();
@@ -264,7 +266,9 @@
 //!         .with_auto_migrate(true)
 //!         .with_max_connections(50);
 //!
-//!     let storage = Arc::new(StorageInstance::postgres(storage_config).await?);
+//!     // `StorageInstance::postgres` returns `Arc<dyn Storage>` —
+//!     // no outer Arc::new wrap.
+//!     let storage = StorageInstance::postgres(storage_config).await?;
 //!
 //!     let registry = Arc::new(WorkerRegistry::new());
 //!     let server_config = ServerConfig::new("production-server")
@@ -318,7 +322,8 @@
 //!
 //! ### Unit Testing with Memory Storage
 //! ```rust
-//! use qml_rs::{MemoryStorage, Job, Storage};
+//! use qml_rs::{Job, MemoryStorage};
+//! use qml_rs::storage::prelude::*;
 //!
 //! #[tokio::test]
 //! async fn test_job_processing() {
@@ -334,7 +339,8 @@
 //!
 //! ### Stress Testing
 //! ```rust
-//! use qml_rs::{MemoryStorage, Job, Storage};
+//! use qml_rs::{Job, MemoryStorage};
+//! use qml_rs::storage::prelude::*;
 //! use futures::future::join_all;
 //!
 //! #[tokio::test]

@@ -68,7 +68,8 @@ pub use redis::RedisStorage;
 ///
 /// ### Basic Storage Operations
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, MonitoringApi, Storage};
+/// use qml_rs::{Job, MemoryStorage};
+/// use qml_rs::storage::prelude::*;
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();
@@ -94,7 +95,8 @@ pub use redis::RedisStorage;
 ///
 /// ### Atomic Job Processing
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, Storage};
+/// use qml_rs::{Job, MemoryStorage};
+/// use qml_rs::storage::prelude::*;
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();
@@ -153,7 +155,8 @@ pub use redis::RedisStorage;
 ///
 /// ### Job Filtering and Statistics
 /// ```rust
-/// use qml_rs::{MemoryStorage, Job, JobState, MonitoringApi, Storage};
+/// use qml_rs::{Job, JobState, MemoryStorage};
+/// use qml_rs::storage::prelude::*;
 ///
 /// # tokio_test::block_on(async {
 /// let storage = MemoryStorage::new();

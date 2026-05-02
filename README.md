@@ -22,11 +22,22 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-qml-rs = "0.1.0"
+qml-rs = "2.0"
 
 # Enable PostgreSQL support
-qml-rs = { version = "1.0.0", features = ["postgres"] }
+qml-rs = { version = "2.0", features = ["postgres"] }
+
+# Or pull the kitchen sink (postgres + redis + dashboard + metrics):
+qml-rs = { version = "2.0", features = ["postgres", "redis", "dashboard", "metrics"] }
 ```
+
+> **Upgrading from 1.x?** See [`CHANGELOG.md`](CHANGELOG.md) — 2.0
+> includes critical correctness fixes that warranted a major bump,
+> plus a `Storage` trait split. The migration is small for most call
+> sites (drop redundant `Arc::new(StorageInstance::*)` wraps; add
+> `use qml_rs::storage::prelude::*` where you call `Storage` methods
+> on a `dyn` value). Custom backends need to split their
+> `impl Storage for X` into five sub-trait impls.
 
 ## 🔧 **Complete Feature Set**
 
@@ -250,15 +261,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### **Multi-Backend Production Example**
 
-```rust
+```rust,ignore
 use qml_rs::{
-    BackgroundJobServer, DashboardServer, Job, PostgresConfig,
-    ServerConfig, StorageInstance, WorkerRegistry
+    BackgroundJobServer, DashboardConfig, DashboardServer, PostgresConfig,
+    ServerConfig, StorageInstance, WorkerRegistry,
 };
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Production PostgreSQL setup
     let storage_config = PostgresConfig::new()
         .with_database_url(std::env::var("DATABASE_URL")?)
@@ -266,25 +277,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_connections(50)
         .with_min_connections(5);
 
-    let storage = Arc::new(StorageInstance::postgres(storage_config).await?);
+    // `StorageInstance::postgres` returns `Arc<dyn Storage>` directly
+    // — no outer `Arc::new` wrap.
+    let storage = StorageInstance::postgres(storage_config).await?;
 
     // Setup workers and server
     let registry = Arc::new(setup_worker_registry());
     let server_config = ServerConfig::new("production-server")
         .worker_count(20)
-        .queues(vec!["critical".to_string(), "normal".to_string(), "bulk".to_string()]);
+        .queues(vec!["critical".into(), "normal".into(), "bulk".into()]);
 
-    // Start job processing server
-    let job_server = BackgroundJobServer::new(storage.clone(), registry, server_config).await?;
+    // BackgroundJobServer::new takes (config, storage, registry).
+    let job_server = BackgroundJobServer::new(server_config, storage.clone(), registry);
 
-    // Start web dashboard
-    let dashboard = DashboardServer::new(storage.clone()).await?;
+    // DashboardServer takes (storage, config). The address lives on
+    // DashboardConfig; bind to 0.0.0.0 explicitly when exposing the
+    // dashboard outside loopback (DashboardConfig::auth must be set
+    // when binding to a non-loopback host).
+    let dashboard_config = DashboardConfig {
+        host: "0.0.0.0".to_string(),
+        port: 8080,
+        ..Default::default()
+    };
+    let dashboard = DashboardServer::new(storage.clone(), dashboard_config);
 
     // Start both servers
-    tokio::try_join!(
-        job_server.start(),
-        dashboard.start("0.0.0.0:8080")
-    )?;
+    tokio::try_join!(job_server.start(), dashboard.start())?;
 
     Ok(())
 }

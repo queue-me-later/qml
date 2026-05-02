@@ -52,7 +52,7 @@ impl PostgresStorage {
             .max_lifetime(config.max_lifetime)
             .connect(&config.database_url)
             .await
-            .map_err(|e| StorageError::ConnectionError {
+            .map_err(|e| StorageError::Connection {
                 message: format!("Failed to connect to PostgreSQL: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -119,7 +119,6 @@ impl PostgresStorage {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::OperationFailed {
-                operation: "schema_check".to_string(),
                 message: format!("Failed to check schema existence: {}", e),
                 source: Some(Box::new(e)),
             })
@@ -135,7 +134,6 @@ impl PostgresStorage {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::OperationFailed {
-                operation: "table_check".to_string(),
                 message: format!(
                     "Failed to check table existence for '{}': {}",
                     table_name, e
@@ -191,27 +189,24 @@ impl PostgresStorage {
                     operation()
                         .await
                         .map_err(|retry_err| StorageError::OperationFailed {
-                            operation: operation_name.to_string(),
                             message: format!(
-                                "Operation failed even after migration: {}",
-                                retry_err
+                                "{}: operation failed even after migration: {}",
+                                operation_name, retry_err
                             ),
                             source: Some(Box::new(retry_err)),
                         })
                 } else {
                     Err(StorageError::OperationFailed {
-                        operation: operation_name.to_string(),
                         message: format!(
-                            "Schema error detected but auto_migrate is disabled. Please run migrations manually: {}",
-                            e
+                            "{}: schema error detected but auto_migrate is disabled — run migrations manually: {}",
+                            operation_name, e
                         ),
                         source: Some(Box::new(e)),
                     })
                 }
             }
             Err(e) => Err(StorageError::OperationFailed {
-                operation: operation_name.to_string(),
-                message: format!("Database operation failed: {}", e),
+                message: format!("{}: database operation failed: {}", operation_name, e),
                 source: Some(Box::new(e)),
             }),
         }
@@ -264,13 +259,14 @@ impl PostgresStorage {
         );
 
         let bound = bind(sqlx::query(&query));
-        let result = bound
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::OperationError {
-                message: format!("{}: {}", op_message, e),
-                source: Some(Box::new(e)),
-            })?;
+        let result =
+            bound
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::OperationFailed {
+                    message: format!("{}: {}", op_message, e),
+                    source: Some(Box::new(e)),
+                })?;
 
         Ok(result.rows_affected() as usize)
     }
@@ -400,83 +396,83 @@ impl PostgresStorage {
     fn row_to_job(row: &sqlx::postgres::PgRow) -> Result<Job, StorageError> {
         let id: Uuid = row
             .try_get("id")
-            .map_err(|e| StorageError::DeserializationError {
+            .map_err(|e| StorageError::Deserialization {
                 message: format!("Failed to get job ID: {}", e),
                 source: Some(Box::new(e)),
             })?;
 
         let method_name: String =
             row.try_get("method_name")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get method name: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let payload: serde_json::Value =
             row.try_get("arguments")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get payload: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let created_at: DateTime<Utc> =
             row.try_get("created_at")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get created_at: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let state_name: String =
             row.try_get("state_name")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get state name: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let state_data: serde_json::Value =
             row.try_get("state_data")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get state data: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let queue_name: String =
             row.try_get("queue_name")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get queue name: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
-        let priority: i32 =
-            row.try_get("priority")
-                .map_err(|e| StorageError::DeserializationError {
-                    message: format!("Failed to get priority: {}", e),
-                    source: Some(Box::new(e)),
-                })?;
+        let priority: i32 = row
+            .try_get("priority")
+            .map_err(|e| StorageError::Deserialization {
+                message: format!("Failed to get priority: {}", e),
+                source: Some(Box::new(e)),
+            })?;
 
         let max_retries: i32 =
             row.try_get("max_retries")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get max_retries: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let current_retries: i32 =
             row.try_get("current_retries")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get current_retries: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let metadata_json: Option<serde_json::Value> =
             row.try_get("metadata")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get metadata: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let metadata: HashMap<String, String> = if let Some(meta) = metadata_json {
-            serde_json::from_value(meta).map_err(|e| StorageError::DeserializationError {
+            serde_json::from_value(meta).map_err(|e| StorageError::Deserialization {
                 message: format!("Failed to deserialize metadata: {}", e),
                 source: Some(Box::new(e)),
             })?
@@ -486,21 +482,21 @@ impl PostgresStorage {
 
         let job_type: Option<String> =
             row.try_get("job_type")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get job_type: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let timeout_seconds: Option<i32> =
             row.try_get("timeout_seconds")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get timeout_seconds: {}", e),
                     source: Some(Box::new(e)),
                 })?;
 
         let expires_at: Option<DateTime<Utc>> =
             row.try_get("expires_at")
-                .map_err(|e| StorageError::DeserializationError {
+                .map_err(|e| StorageError::Deserialization {
                     message: format!("Failed to get expires_at: {}", e),
                     source: Some(Box::new(e)),
                 })?;
@@ -545,7 +541,7 @@ impl PostgresStorage {
 
     /// Convert JobState to JSON data
     fn job_state_to_data(state: &JobState) -> Result<serde_json::Value, StorageError> {
-        serde_json::to_value(state).map_err(|e| StorageError::SerializationError {
+        serde_json::to_value(state).map_err(|e| StorageError::Serialization {
             message: format!("Failed to serialize job state: {}", e),
             source: Some(Box::new(e)),
         })
@@ -556,7 +552,7 @@ impl PostgresStorage {
         state_name: &str,
         state_data: &serde_json::Value,
     ) -> Result<JobState, StorageError> {
-        serde_json::from_value(state_data.clone()).map_err(|e| StorageError::DeserializationError {
+        serde_json::from_value(state_data.clone()).map_err(|e| StorageError::Deserialization {
             message: format!("Failed to deserialize job state {}: {}", state_name, e),
             source: Some(Box::new(e)),
         })
@@ -598,7 +594,7 @@ impl PostgresStorage {
 
     /// Materialize a row from `qml_servers` into a [`ServerInfo`].
     fn row_to_server_info(row: &sqlx::postgres::PgRow) -> Result<ServerInfo, StorageError> {
-        let err = |field: &str, e: sqlx::Error| StorageError::DeserializationError {
+        let err = |field: &str, e: sqlx::Error| StorageError::Deserialization {
             message: format!("Failed to get {}: {}", field, e),
             source: Some(Box::new(e)),
         };
@@ -623,7 +619,7 @@ impl PostgresStorage {
 
     /// Materialize a row from `qml_recurring_jobs` into a [`RecurringJob`].
     fn row_to_recurring(row: &sqlx::postgres::PgRow) -> Result<RecurringJob, StorageError> {
-        let err = |field: &str, e: sqlx::Error| StorageError::DeserializationError {
+        let err = |field: &str, e: sqlx::Error| StorageError::Deserialization {
             message: format!("Failed to get {}: {}", field, e),
             source: Some(Box::new(e)),
         };
@@ -691,12 +687,12 @@ impl MonitoringApi for PostgresStorage {
         let metadata = if job.metadata.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                StorageError::SerializationError {
+            Some(
+                serde_json::to_value(&job.metadata).map_err(|e| StorageError::Serialization {
                     message: format!("Failed to serialize metadata: {}", e),
                     source: Some(Box::new(e)),
-                }
-            })?)
+                })?,
+            )
         };
 
         let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
@@ -731,7 +727,7 @@ impl MonitoringApi for PostgresStorage {
             .bind(job.expires_at)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to update job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -758,12 +754,12 @@ impl MonitoringApi for PostgresStorage {
         let metadata = if job.metadata.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                StorageError::SerializationError {
+            Some(
+                serde_json::to_value(&job.metadata).map_err(|e| StorageError::Serialization {
                     message: format!("Failed to serialize metadata: {}", e),
                     source: Some(Box::new(e)),
-                }
-            })?)
+                })?,
+            )
         };
 
         let expected_state_name = match expected {
@@ -810,7 +806,7 @@ impl MonitoringApi for PostgresStorage {
             .bind(job.expires_at)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to update_if_state job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -825,7 +821,7 @@ impl MonitoringApi for PostgresStorage {
             .bind(job_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to verify job existence: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -847,7 +843,7 @@ impl MonitoringApi for PostgresStorage {
             .bind(job_uuid)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to delete job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -907,7 +903,7 @@ impl MonitoringApi for PostgresStorage {
             sqlx_query
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| StorageError::OperationError {
+                .map_err(|e| StorageError::OperationFailed {
                     message: format!("Failed to list jobs: {}", e),
                     source: Some(Box::new(e)),
                 })?;
@@ -929,7 +925,7 @@ impl MonitoringApi for PostgresStorage {
         let rows = sqlx::query(&query)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to get job counts: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -939,17 +935,17 @@ impl MonitoringApi for PostgresStorage {
         for row in rows {
             let state_name: String =
                 row.try_get("state_name")
-                    .map_err(|e| StorageError::DeserializationError {
+                    .map_err(|e| StorageError::Deserialization {
                         message: format!("Failed to get state name from count query: {}", e),
                         source: Some(Box::new(e)),
                     })?;
 
-            let count: i64 =
-                row.try_get("count")
-                    .map_err(|e| StorageError::DeserializationError {
-                        message: format!("Failed to get count from count query: {}", e),
-                        source: Some(Box::new(e)),
-                    })?;
+            let count: i64 = row
+                .try_get("count")
+                .map_err(|e| StorageError::Deserialization {
+                    message: format!("Failed to get count from count query: {}", e),
+                    source: Some(Box::new(e)),
+                })?;
 
             let kind = match state_name.as_str() {
                 "enqueued" => JobStateKind::Enqueued,
@@ -976,12 +972,12 @@ impl Storage for PostgresStorage {
         let metadata = if job.metadata.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(&job.metadata).map_err(|e| {
-                StorageError::SerializationError {
+            Some(
+                serde_json::to_value(&job.metadata).map_err(|e| StorageError::Serialization {
                     message: format!("Failed to serialize metadata: {}", e),
                     source: Some(Box::new(e)),
-                }
-            })?)
+                })?,
+            )
         };
 
         let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
@@ -1051,7 +1047,7 @@ impl Storage for PostgresStorage {
         let rows = sqlx::query(&query)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to get available jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1090,7 +1086,7 @@ impl Storage for PostgresStorage {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to fetch due scheduled jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1125,7 +1121,7 @@ impl Storage for PostgresStorage {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to fetch due retry jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1180,7 +1176,7 @@ impl Storage for PostgresStorage {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to claim due scheduled jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1230,7 +1226,7 @@ impl Storage for PostgresStorage {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to claim due retry jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1318,7 +1314,7 @@ impl Storage for PostgresStorage {
         }
 
         let row = sqlx_query.fetch_optional(&self.pool).await.map_err(|e| {
-            StorageError::OperationError {
+            StorageError::OperationFailed {
                 message: format!("Failed to fetch and lock job: {}", e),
                 source: Some(Box::new(e)),
             }
@@ -1349,7 +1345,7 @@ impl Storage for PostgresStorage {
             .bind(timeout_seconds as i32)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to acquire job lock: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1370,7 +1366,7 @@ impl Storage for PostgresStorage {
             .bind(worker_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to release job lock: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1430,7 +1426,7 @@ impl Storage for PostgresStorage {
             .bind(job.enabled)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to upsert recurring job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1443,7 +1439,7 @@ impl Storage for PostgresStorage {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to delete recurring job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1463,7 +1459,7 @@ impl Storage for PostgresStorage {
         let rows = sqlx::query(&query)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to list recurring jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1500,7 +1496,7 @@ impl Storage for PostgresStorage {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to fetch due recurring jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1528,7 +1524,7 @@ impl Storage for PostgresStorage {
             .bind(now)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to delete expired jobs: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1559,7 +1555,7 @@ impl Storage for PostgresStorage {
             .bind(&info.queues)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to register server: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1580,7 +1576,7 @@ impl Storage for PostgresStorage {
             .bind(now)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to heartbeat server: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1596,7 +1592,7 @@ impl Storage for PostgresStorage {
             .bind(server_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to deregister server: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1619,7 +1615,7 @@ impl Storage for PostgresStorage {
             .bind(stale_before)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to list dead servers: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1673,7 +1669,7 @@ impl Storage for PostgresStorage {
             .bind(ttl_secs)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to acquire lock: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1691,7 +1687,7 @@ impl Storage for PostgresStorage {
             .bind(owner)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to release lock: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1714,7 +1710,7 @@ impl Storage for PostgresStorage {
             .bind(now)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to clean up expired named locks: {}", e),
                 source: Some(Box::new(e)),
             })?;

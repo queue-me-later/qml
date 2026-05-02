@@ -60,8 +60,7 @@ impl RedisStorage {
             .map_err(|_| StorageError::timeout(self.config.command_timeout.as_millis() as u64))?
             .map_err(|e| {
                 StorageError::operation_failed_with_source(
-                    "Redis command",
-                    e.to_string(),
+                    format!("Redis command failed: {}", e),
                     Box::new(e),
                 )
             })
@@ -363,7 +362,7 @@ impl RedisStorage {
             .arg(limit as i64)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to claim due {} jobs: {}", from_state_str, e),
                 source: Some(Box::new(e)),
             })?;
@@ -516,7 +515,7 @@ impl MonitoringApi for RedisStorage {
             .arg(new_available)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to update job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -524,7 +523,7 @@ impl MonitoringApi for RedisStorage {
         match result.as_str() {
             "ok" => Ok(()),
             "missing" => Err(StorageError::job_not_found(job.id.clone())),
-            other => Err(StorageError::OperationError {
+            other => Err(StorageError::OperationFailed {
                 message: format!("Unexpected update response: {}", other),
                 source: None,
             }),
@@ -639,7 +638,7 @@ impl MonitoringApi for RedisStorage {
             .arg(new_available)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to update_if_state job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -648,7 +647,7 @@ impl MonitoringApi for RedisStorage {
             "ok" => Ok(true),
             "mismatch" => Ok(false),
             "missing" => Err(StorageError::job_not_found(job.id.clone())),
-            other => Err(StorageError::OperationError {
+            other => Err(StorageError::OperationFailed {
                 message: format!("Unexpected update_if_state response: {}", other),
                 source: None,
             }),
@@ -1070,7 +1069,7 @@ impl Storage for RedisStorage {
             .arg(cap)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to fetch and lock job: {}", e),
                 source: Some(Box::new(e)),
             })?;
@@ -1135,7 +1134,7 @@ impl Storage for RedisStorage {
             .arg(worker_id)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| StorageError::OperationError {
+            .map_err(|e| StorageError::OperationFailed {
                 message: format!("Failed to release job lock: {}", e),
                 source: Some(Box::new(e)),
             })?;

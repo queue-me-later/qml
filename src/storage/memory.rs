@@ -619,7 +619,7 @@ impl Storage for MemoryStorage {
         let now = Utc::now();
         let new_expires_at = now
             + chrono::Duration::from_std(ttl).map_err(|e| {
-                StorageError::operation_failed("try_acquire_lock", format!("invalid ttl: {}", e))
+                StorageError::operation_failed(format!("try_acquire_lock: invalid ttl: {}", e))
             })?;
 
         let mut locks = self.named_locks.write().unwrap();

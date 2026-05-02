@@ -7,7 +7,7 @@ use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -651,6 +651,12 @@ impl BackgroundJobServer {
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(1)),
         );
+        // Default `Burst` makes a slow worker (one whose process_job ran
+        // longer than `polling_interval`) try to "catch up" by firing
+        // every missed tick back-to-back. That just hammers storage with
+        // queries the worker can't keep up with anyway. `Skip` collapses
+        // backed-up ticks into one — the right shape for a poller.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -686,9 +692,14 @@ impl BackgroundJobServer {
                 Err(e) => {
                     error!("Error fetching jobs: {}", e);
                     // Back off on error, but remain cancellable during the nap.
+                    // Add jitter so a fleet of workers all observing the same
+                    // transient backend failure doesn't resume in lock-step
+                    // and stampede the recovering backend on every tick.
+                    let jitter_ms = fastrand::u64(0..1500);
+                    let backoff = std::time::Duration::from_millis(5_000 + jitter_ms);
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        _ = sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = sleep(backoff) => {}
                     }
                 }
             }

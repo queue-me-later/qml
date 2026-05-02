@@ -1036,8 +1036,8 @@ impl Storage for PostgresStorage {
             WHERE state_name IN ('enqueued', 'scheduled', 'awaiting_retry')
             AND (
                 state_name = 'enqueued' OR
-                (state_name = 'scheduled' AND (state_data->'Scheduled'->>'enqueue_at')::timestamptz <= NOW()) OR
-                (state_name = 'awaiting_retry' AND (state_data->'AwaitingRetry'->>'retry_at')::timestamptz <= NOW())
+                (state_name = 'scheduled' AND qml.parse_iso_utc(state_data->'Scheduled'->>'enqueue_at') <= NOW()) OR
+                (state_name = 'awaiting_retry' AND qml.parse_iso_utc(state_data->'AwaitingRetry'->>'retry_at') <= NOW())
             )
             ORDER BY priority DESC, created_at ASC
             "#,
@@ -1078,7 +1078,7 @@ impl Storage for PostgresStorage {
                    queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name = 'scheduled'
-              AND (state_data->'Scheduled'->>'enqueue_at')::timestamptz <= $1
+              AND qml.parse_iso_utc(state_data->'Scheduled'->>'enqueue_at') <= $1
             ORDER BY priority DESC, created_at ASC
             LIMIT $2
             "#,
@@ -1113,7 +1113,7 @@ impl Storage for PostgresStorage {
                    queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name = 'awaiting_retry'
-              AND (state_data->'AwaitingRetry'->>'retry_at')::timestamptz <= $1
+              AND qml.parse_iso_utc(state_data->'AwaitingRetry'->>'retry_at') <= $1
             ORDER BY priority DESC, created_at ASC
             LIMIT $2
             "#,
@@ -1152,7 +1152,7 @@ impl Storage for PostgresStorage {
             WITH due AS (
                 SELECT id FROM {table}
                 WHERE state_name = 'scheduled'
-                  AND (state_data->'Scheduled'->>'enqueue_at')::timestamptz <= $1
+                  AND qml.parse_iso_utc(state_data->'Scheduled'->>'enqueue_at') <= $1
                 ORDER BY priority DESC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT $2
@@ -1202,7 +1202,7 @@ impl Storage for PostgresStorage {
             WITH due AS (
                 SELECT id FROM {table}
                 WHERE state_name = 'awaiting_retry'
-                  AND (state_data->'AwaitingRetry'->>'retry_at')::timestamptz <= $1
+                  AND qml.parse_iso_utc(state_data->'AwaitingRetry'->>'retry_at') <= $1
                 ORDER BY priority DESC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT $2

@@ -1,7 +1,13 @@
 use crate::error::QmlError;
 use thiserror::Error;
 
-/// Storage-specific errors that can occur during job persistence operations
+/// Storage-specific errors that can occur during job persistence operations.
+///
+/// Every variant that wraps an underlying driver error carries a
+/// `source: Option<Box<dyn Error + Send + Sync>>` field with `#[source]`,
+/// so callers can walk `Error::source()` or downcast to the concrete
+/// type. Earlier revisions stringified the cause into `message` and
+/// dropped the chain; the helper constructors here always preserve it.
 #[derive(Error, Debug)]
 pub enum StorageError {
     /// Connection-related errors (network, authentication, etc.)
@@ -12,9 +18,20 @@ pub enum StorageError {
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
-    /// Serialization/deserialization errors when converting jobs to/from storage format
+    /// Encoding a value (job, state, metadata) into the storage's
+    /// transport format failed.
     #[error("Serialization error: {message}")]
     Serialization {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
+    /// Decoding a value out of the storage's transport format failed.
+    /// Distinct from [`Serialization`] so callers handling a corrupt-row
+    /// recovery path can match precisely.
+    #[error("Deserialization error: {message}")]
+    Deserialization {
         message: String,
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -36,10 +53,13 @@ pub enum StorageError {
     #[error("Storage configuration error: {message}")]
     Configuration { message: String },
 
-    /// General storage operation errors
-    #[error("Storage operation failed: {operation} - {message}")]
+    /// A storage-engine operation failed for a reason that isn't a
+    /// connection / serialization / not-found / capacity issue. The
+    /// `message` field should already include enough operation context
+    /// (e.g. `"Failed to fetch and lock job"`); the underlying driver
+    /// error is preserved on `source`.
+    #[error("Storage operation failed: {message}")]
     OperationFailed {
-        operation: String,
         message: String,
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -60,41 +80,6 @@ pub enum StorageError {
     /// Invalid job data format
     #[error("Invalid job data: {message}")]
     InvalidJobData { message: String },
-
-    /// Connection-specific error (shorthand). Carries an optional source so
-    /// the underlying driver error can be inspected via `Error::source()` or
-    /// downcast — earlier versions stringified the cause into `message` and
-    /// dropped the chain.
-    #[error("Connection error: {message}")]
-    ConnectionError {
-        message: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    /// Serialization-specific error (shorthand)
-    #[error("Serialization error: {message}")]
-    SerializationError {
-        message: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    /// Deserialization-specific error (shorthand)
-    #[error("Deserialization error: {message}")]
-    DeserializationError {
-        message: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    /// Operation-specific error (shorthand)
-    #[error("Operation error: {message}")]
-    OperationError {
-        message: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
 }
 
 impl StorageError {
@@ -136,6 +121,25 @@ impl StorageError {
         }
     }
 
+    /// Create a deserialization error with a message
+    pub fn deserialization<S: Into<String>>(message: S) -> Self {
+        Self::Deserialization {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a deserialization error with a message and source error
+    pub fn deserialization_with_source<S: Into<String>>(
+        message: S,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        Self::Deserialization {
+            message: message.into(),
+            source: Some(source),
+        }
+    }
+
     /// Create a job not found error
     pub fn job_not_found<S: Into<String>>(job_id: S) -> Self {
         Self::JobNotFound {
@@ -162,23 +166,21 @@ impl StorageError {
         }
     }
 
-    /// Create an operation failed error
-    pub fn operation_failed<S: Into<String>, T: Into<String>>(operation: S, message: T) -> Self {
+    /// Create an operation-failed error without a source (e.g. when the
+    /// failure is logical, not driven by an underlying driver error).
+    pub fn operation_failed<S: Into<String>>(message: S) -> Self {
         Self::OperationFailed {
-            operation: operation.into(),
             message: message.into(),
             source: None,
         }
     }
 
-    /// Create an operation failed error with source
-    pub fn operation_failed_with_source<S: Into<String>, T: Into<String>>(
-        operation: S,
-        message: T,
+    /// Create an operation-failed error with a captured source.
+    pub fn operation_failed_with_source<S: Into<String>>(
+        message: S,
         source: Box<dyn std::error::Error + Send + Sync>,
     ) -> Self {
         Self::OperationFailed {
-            operation: operation.into(),
             message: message.into(),
             source: Some(source),
         }
@@ -198,51 +200,51 @@ impl StorageError {
         }
     }
 
-    /// Connection-error shorthand with a captured source. Prefer this over
-    /// `ConnectionError { message, source: None }` so the cause chain is
-    /// preserved for downstream `Error::source()` callers.
+    /// `Connection` shorthand that takes the raw error as a typed
+    /// generic, boxes it, and attaches it as the source — saves the
+    /// caller a `Box::new(...)`.
     pub fn conn_err<M, E>(message: M, source: E) -> Self
     where
         M: Into<String>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        Self::ConnectionError {
+        Self::Connection {
             message: message.into(),
             source: Some(Box::new(source)),
         }
     }
 
-    /// Serialization-error shorthand with a captured source.
+    /// `Serialization` shorthand with a captured source.
     pub fn ser_err<M, E>(message: M, source: E) -> Self
     where
         M: Into<String>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        Self::SerializationError {
+        Self::Serialization {
             message: message.into(),
             source: Some(Box::new(source)),
         }
     }
 
-    /// Deserialization-error shorthand with a captured source.
+    /// `Deserialization` shorthand with a captured source.
     pub fn de_err<M, E>(message: M, source: E) -> Self
     where
         M: Into<String>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        Self::DeserializationError {
+        Self::Deserialization {
             message: message.into(),
             source: Some(Box::new(source)),
         }
     }
 
-    /// Operation-error shorthand with a captured source.
+    /// `OperationFailed` shorthand with a captured source.
     pub fn op_err<M, E>(message: M, source: E) -> Self
     where
         M: Into<String>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        Self::OperationError {
+        Self::OperationFailed {
             message: message.into(),
             source: Some(Box::new(source)),
         }
@@ -254,13 +256,12 @@ impl From<StorageError> for QmlError {
     fn from(err: StorageError) -> Self {
         match err {
             StorageError::JobNotFound { job_id } => QmlError::JobNotFound { job_id },
-            // Both Serialization shapes map onto QmlError::SerializationError.
-            // The shorthand variants previously fell through to the generic
-            // StorageError arm, which dropped the typed signal callers were
-            // relying on.
+            // Both Serialization and Deserialization map onto
+            // QmlError::SerializationError. QmlError doesn't currently
+            // separate the two; if it grows a Deserialization variant,
+            // this is the place to split them.
             StorageError::Serialization { message, .. }
-            | StorageError::SerializationError { message, .. }
-            | StorageError::DeserializationError { message, .. } => {
+            | StorageError::Deserialization { message, .. } => {
                 QmlError::SerializationError { message }
             }
             _ => QmlError::StorageError {

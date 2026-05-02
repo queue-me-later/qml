@@ -66,17 +66,37 @@ impl CleanupWorker {
     }
 
     /// One cleanup sweep. Exposed for tests.
+    ///
+    /// Two pieces of work, in order:
+    /// 1. Delete jobs whose `expires_at` has passed (final-state sweep).
+    /// 2. Delete generic named locks whose `expires_at` has passed.
+    ///
+    /// Both share a single `now` so a tick is consistent. Returns the
+    /// number of expired *jobs* removed (preserved for backward
+    /// compatibility with the existing test); named-lock removal is
+    /// logged but doesn't change the return.
     pub async fn sweep_once(&self) -> Result<usize> {
-        let removed = self
-            .storage
-            .delete_expired_jobs(Utc::now())
-            .await
-            .map_err(|e| QmlError::StorageError {
-                message: format!("Failed to delete expired jobs: {}", e),
-            })?;
+        let now = Utc::now();
+        let removed =
+            self.storage
+                .delete_expired_jobs(now)
+                .await
+                .map_err(|e| QmlError::StorageError {
+                    message: format!("Failed to delete expired jobs: {}", e),
+                })?;
         if removed > 0 {
             info!("Cleanup worker removed {} expired jobs", removed);
         }
+
+        match self.storage.cleanup_expired_named_locks(now).await {
+            Ok(0) => {}
+            Ok(n) => info!("Cleanup worker removed {} expired named locks", n),
+            // A failed lock sweep shouldn't poison the whole tick — we
+            // already swept jobs successfully and a future tick will
+            // retry the lock cleanup.
+            Err(e) => error!("Failed to clean up expired named locks: {}", e),
+        }
+
         Ok(removed)
     }
 }

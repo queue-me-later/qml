@@ -70,11 +70,72 @@ CREATE INDEX IF NOT EXISTS idx_qml_jobs_expires_at ON qml.qml_jobs(expires_at) W
 CREATE INDEX IF NOT EXISTS idx_qml_jobs_locked_by ON qml.qml_jobs(locked_by) WHERE locked_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_qml_jobs_lock_expires ON qml.qml_jobs(lock_expires_at) WHERE lock_expires_at IS NOT NULL;
 
--- Job type and timeout indexes
+-- Job type index
 CREATE INDEX IF NOT EXISTS idx_qml_jobs_job_type ON qml.qml_jobs(job_type) WHERE job_type IS NOT NULL;
 
--- Add indexes for the new columns
-CREATE INDEX IF NOT EXISTS idx_qml_jobs_job_type ON qml.qml_jobs(job_type) WHERE job_type IS NOT NULL;
+-- Helper: parse an ISO-8601 timestamp text out of state_data and return
+-- it as a timestamptz. Marked IMMUTABLE so it's usable in expression
+-- indexes (Postgres rejects `text::timestamptz` in indexes — that cast
+-- is STABLE because it can depend on session DateStyle / TimeZone).
+--
+-- This is safe to mark IMMUTABLE because every writer in the codebase
+-- emits timestamps with an explicit UTC suffix:
+--   * chrono's serde adapter writes RFC3339 with `Z`.
+--   * Lua scripts use `to_rfc3339_opts(SecondsFormat::Micros, true)`.
+--   * `to_jsonb(NOW())` writes `+00:00`.
+-- All three formats parse to the same UTC instant regardless of
+-- session timezone, so the index value is stable across sessions.
+CREATE OR REPLACE FUNCTION qml.parse_iso_utc(t text)
+    RETURNS timestamptz
+    LANGUAGE sql
+    IMMUTABLE PARALLEL SAFE STRICT
+AS $func$
+    SELECT ($1::timestamp AT TIME ZONE 'UTC')
+$func$;
+
+COMMENT ON FUNCTION qml.parse_iso_utc(text) IS
+    'IMMUTABLE wrapper for parsing UTC ISO-8601 timestamps out of state_data; required because text::timestamptz is STABLE and can''t be used directly in expression indexes';
+
+-- Hot-path index for `fetch_and_lock_job` / `claim_due_*`. The query is:
+--
+--   SELECT id FROM qml_jobs
+--   WHERE state_name IN ('enqueued', 'awaiting_retry')
+--     [AND queue_name = ANY(...)]
+--   ORDER BY priority DESC, created_at ASC
+--   FOR UPDATE SKIP LOCKED LIMIT 1
+--
+-- The pre-existing `idx_qml_jobs_state_priority` covers the IN-list but
+-- forces a sort on `created_at` per priority bucket and doesn't include
+-- `queue_name`. This partial index covers the access path exactly:
+-- only enqueued/awaiting_retry rows, indexed by (queue, priority desc,
+-- created_at asc) so workers polling a specific queue walk the index
+-- in claim order.
+CREATE INDEX IF NOT EXISTS idx_qml_jobs_fetch
+    ON qml.qml_jobs (queue_name, priority DESC, created_at ASC)
+    WHERE state_name IN ('enqueued', 'awaiting_retry');
+
+-- Time-predicate index for `fetch_due_scheduled_jobs` and
+-- `claim_due_scheduled_jobs`. The query predicate is rewritten to use
+-- `qml.parse_iso_utc(...)` so the planner can match this index.
+-- Without the index, the planner falls back to a sequential scan +
+-- per-row JSON extraction.
+CREATE INDEX IF NOT EXISTS idx_qml_jobs_due_scheduled
+    ON qml.qml_jobs (
+        qml.parse_iso_utc(state_data->'Scheduled'->>'enqueue_at'),
+        priority DESC,
+        created_at ASC
+    )
+    WHERE state_name = 'scheduled';
+
+-- Time-predicate index for `fetch_due_retry_jobs` and
+-- `claim_due_retry_jobs`. Mirrors the scheduled one.
+CREATE INDEX IF NOT EXISTS idx_qml_jobs_due_retry
+    ON qml.qml_jobs (
+        qml.parse_iso_utc(state_data->'AwaitingRetry'->>'retry_at'),
+        priority DESC,
+        created_at ASC
+    )
+    WHERE state_name = 'awaiting_retry';
 
 -- =========================================================================
 -- RECURRING JOB TEMPLATES (R1)

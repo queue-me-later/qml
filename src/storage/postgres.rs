@@ -217,6 +217,64 @@ impl PostgresStorage {
         }
     }
 
+    /// Shared SQL for transitioning Processing rows back to Enqueued.
+    ///
+    /// Used by both `requeue_stranded_jobs` (filtered by staleness) and
+    /// `reclaim_jobs_from_server` (filtered by dead-peer server_name).
+    /// `where_filter` is appended after `WHERE state_name = 'processing'`
+    /// and may reference `$1` (the single bound parameter from `bind`).
+    ///
+    /// `to_jsonb(NOW())` is the canonical way to build a JSON timestamp
+    /// in Postgres — it produces an ISO-8601 string that round-trips
+    /// through chrono's serde format. The previous version of this code
+    /// used a hand-rolled `to_char(... 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
+    /// mask which was sensitive to format-string drift between Postgres
+    /// versions and to chrono's deserialization expectations.
+    async fn update_processing_to_enqueued<F>(
+        &self,
+        where_filter: &str,
+        op_message: &str,
+        bind: F,
+    ) -> Result<usize, StorageError>
+    where
+        F: FnOnce(
+            sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+        ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    {
+        let query = format!(
+            r#"
+            UPDATE {table}
+            SET state_name = 'enqueued',
+                state_data = jsonb_build_object(
+                    'Enqueued',
+                    jsonb_build_object(
+                        'enqueued_at', to_jsonb(NOW()),
+                        'queue', queue_name
+                    )
+                ),
+                locked_by = NULL,
+                locked_at = NULL,
+                lock_expires_at = NULL,
+                updated_at = NOW()
+            WHERE state_name = 'processing'
+              {where_filter}
+            "#,
+            table = self.table_name(),
+            where_filter = where_filter,
+        );
+
+        let bound = bind(sqlx::query(&query));
+        let result = bound
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("{}: {}", op_message, e),
+                source: Some(Box::new(e)),
+            })?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
     /// Run QML PostgreSQL schema installation
     ///
     /// This method installs the complete QML PostgreSQL schema using the embedded
@@ -881,8 +939,8 @@ impl Storage for PostgresStorage {
             WHERE state_name IN ('enqueued', 'scheduled', 'awaiting_retry')
             AND (
                 state_name = 'enqueued' OR
-                (state_name = 'scheduled' AND (state_data->>'enqueue_at')::timestamp <= NOW()) OR
-                (state_name = 'awaiting_retry' AND (state_data->>'retry_at')::timestamp <= NOW())
+                (state_name = 'scheduled' AND (state_data->'Scheduled'->>'enqueue_at')::timestamptz <= NOW()) OR
+                (state_name = 'awaiting_retry' AND (state_data->'AwaitingRetry'->>'retry_at')::timestamptz <= NOW())
             )
             ORDER BY priority DESC, created_at ASC
             "#,
@@ -923,7 +981,7 @@ impl Storage for PostgresStorage {
                    queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name = 'scheduled'
-              AND (state_data->>'enqueue_at')::timestamptz <= $1
+              AND (state_data->'Scheduled'->>'enqueue_at')::timestamptz <= $1
             ORDER BY priority DESC, created_at ASC
             LIMIT $2
             "#,
@@ -958,7 +1016,7 @@ impl Storage for PostgresStorage {
                    queue_name, priority, max_retries, current_retries, metadata, job_type, timeout_seconds, expires_at
             FROM {}
             WHERE state_name = 'awaiting_retry'
-              AND (state_data->>'retry_at')::timestamptz <= $1
+              AND (state_data->'AwaitingRetry'->>'retry_at')::timestamptz <= $1
             ORDER BY priority DESC, created_at ASC
             LIMIT $2
             "#,
@@ -997,7 +1055,7 @@ impl Storage for PostgresStorage {
             WITH due AS (
                 SELECT id FROM {table}
                 WHERE state_name = 'scheduled'
-                  AND (state_data->>'enqueue_at')::timestamptz <= $1
+                  AND (state_data->'Scheduled'->>'enqueue_at')::timestamptz <= $1
                 ORDER BY priority DESC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT $2
@@ -1005,8 +1063,11 @@ impl Storage for PostgresStorage {
             UPDATE {table} AS j
             SET state_name = 'enqueued',
                 state_data = jsonb_build_object(
-                    'enqueued_at', to_jsonb(NOW()),
-                    'queue', j.queue_name
+                    'Enqueued',
+                    jsonb_build_object(
+                        'enqueued_at', to_jsonb(NOW()),
+                        'queue', j.queue_name
+                    )
                 )
             WHERE j.id IN (SELECT id FROM due)
             RETURNING j.id, j.method_name, j.arguments, j.created_at, j.state_name,
@@ -1044,7 +1105,7 @@ impl Storage for PostgresStorage {
             WITH due AS (
                 SELECT id FROM {table}
                 WHERE state_name = 'awaiting_retry'
-                  AND (state_data->>'retry_at')::timestamptz <= $1
+                  AND (state_data->'AwaitingRetry'->>'retry_at')::timestamptz <= $1
                 ORDER BY priority DESC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT $2
@@ -1052,8 +1113,11 @@ impl Storage for PostgresStorage {
             UPDATE {table} AS j
             SET state_name = 'enqueued',
                 state_data = jsonb_build_object(
-                    'enqueued_at', to_jsonb(NOW()),
-                    'queue', j.queue_name
+                    'Enqueued',
+                    jsonb_build_object(
+                        'enqueued_at', to_jsonb(NOW()),
+                        'queue', j.queue_name
+                    )
                 )
             WHERE j.id IN (SELECT id FROM due)
             RETURNING j.id, j.method_name, j.arguments, j.created_at, j.state_name,
@@ -1085,38 +1149,17 @@ impl Storage for PostgresStorage {
         &self,
         stale_before: DateTime<Utc>,
     ) -> Result<usize, StorageError> {
-        // Single UPDATE: flips every stale Processing row back to Enqueued.
-        // `jsonb_build_object` synthesizes a fresh Enqueued state_data from
-        // the job's own `queue_name` column; `enqueued_at` is ISO-8601 so it
-        // round-trips through serde_json::from_value into chrono::DateTime.
-        let query = format!(
-            r#"
-            UPDATE {table}
-            SET state_name = 'enqueued',
-                state_data = jsonb_build_object(
-                    'enqueued_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
-                    'queue', queue_name
-                ),
-                locked_by = NULL,
-                locked_at = NULL,
-                lock_expires_at = NULL,
-                updated_at = NOW()
-            WHERE state_name = 'processing'
-              AND (state_data->>'started_at')::timestamptz < $1
-            "#,
-            table = self.table_name()
-        );
-
-        let result = sqlx::query(&query)
-            .bind(stale_before)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::OperationError {
-                message: format!("Failed to requeue stranded jobs: {}", e),
-                source: Some(Box::new(e)),
-            })?;
-
-        Ok(result.rows_affected() as usize)
+        // Reused by `reclaim_jobs_from_server`; the only differences are
+        // the WHERE clause and the bound parameter. Keeping one source of
+        // truth for the Processing → Enqueued transition prevents the two
+        // call sites from drifting (an earlier version used a fragile
+        // hand-rolled to_char timestamp mask in only one of them).
+        self.update_processing_to_enqueued(
+            "AND (state_data->'Processing'->>'started_at')::timestamptz < $1",
+            "Failed to requeue stranded jobs",
+            |q| q.bind(stale_before),
+        )
+        .await
     }
 
     async fn fetch_and_lock_job(
@@ -1492,32 +1535,12 @@ impl Storage for PostgresStorage {
         // Matches every Processing job attributed to this dead peer and
         // flips it back to Enqueued so it can be re-picked by any live
         // worker.
-        let query = format!(
-            r#"
-            UPDATE {table}
-            SET state_name = 'enqueued',
-                state_data = jsonb_build_object(
-                    'enqueued_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
-                    'queue', queue_name
-                ),
-                locked_by = NULL,
-                locked_at = NULL,
-                lock_expires_at = NULL,
-                updated_at = NOW()
-            WHERE state_name = 'processing'
-              AND state_data->>'server_name' = $1
-            "#,
-            table = self.table_name()
-        );
-        let result = sqlx::query(&query)
-            .bind(server_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::OperationError {
-                message: format!("Failed to reclaim jobs from server: {}", e),
-                source: Some(Box::new(e)),
-            })?;
-        Ok(result.rows_affected() as usize)
+        self.update_processing_to_enqueued(
+            "AND state_data->'Processing'->>'server_name' = $1",
+            "Failed to reclaim jobs from server",
+            |q| q.bind(server_id.to_string()),
+        )
+        .await
     }
 
     async fn try_acquire_lock(

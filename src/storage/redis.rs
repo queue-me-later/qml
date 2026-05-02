@@ -658,10 +658,18 @@ impl Storage for RedisStorage {
         let mut conn = self.get_connection().await?;
         let available_key = self.available_jobs_key();
 
-        // Get job IDs ordered by score (priority and creation time)
-        let count = limit.unwrap_or(-1_isize as usize) as isize;
+        // Get job IDs ordered by score (priority and creation time).
+        // ZREVRANGE uses inclusive indices: -1 means "the last element",
+        // i.e. "to the end". The earlier formulation
+        // `(-1_isize as usize) as isize` round-tripped to -1 then
+        // subtracted 1, giving -2 — which excludes the *last* element of
+        // the set, so a limit-less call lost one entry off the end.
+        let end_index: isize = match limit {
+            Some(n) => (n as isize) - 1,
+            None => -1,
+        };
         let job_ids: Vec<String> = self
-            .with_timeout(conn.zrevrange(&available_key, 0, count - 1))
+            .with_timeout(conn.zrevrange(&available_key, 0, end_index))
             .await?;
 
         let mut jobs = Vec::new();

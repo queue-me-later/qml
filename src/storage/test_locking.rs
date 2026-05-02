@@ -330,7 +330,12 @@ async fn test_redis_lock_management() {
         return;
     };
 
-    let job_id = "redis_lock_test";
+    // Unique job_id so a parallel test (or a stale lock from a prior
+    // failed run) sharing the same default key_prefix can't pre-poison
+    // `qml:lock:redis_lock_test` and break the "worker 1 acquires"
+    // assertion.
+    let job_id_owned = format!("redis_lock_test_{}", uuid::Uuid::new_v4());
+    let job_id = job_id_owned.as_str();
     let worker1 = "redis_worker_1";
     let worker2 = "redis_worker_2";
 
@@ -371,11 +376,18 @@ async fn test_postgres_race_condition_prevention() {
 
     let storage = Arc::new(storage);
 
-    // Create a single job
-    let job = create_test_job("postgres_race_test");
+    // Scope the test to a unique queue. Multiple tests share the same
+    // postgres database (and table), so leftover Enqueued rows from a
+    // previous run would let several workers grab "different" jobs and
+    // break the "exactly one worker fetches it" assertion.
+    let queue = format!("pg-race-{}", uuid::Uuid::new_v4());
+    let mut job = create_test_job("postgres_race_test");
+    job.queue = queue.clone();
+    job.state = crate::core::JobState::enqueued(&queue);
     storage.enqueue(&job).await.unwrap();
 
-    // Multiple workers try to fetch the same job
+    // Multiple workers try to fetch the same job, each scoped to the
+    // single test queue.
     let num_workers = 8;
     let success_count = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
@@ -384,9 +396,13 @@ async fn test_postgres_race_condition_prevention() {
         let storage_clone = Arc::clone(&storage);
         let success_count_clone = Arc::clone(&success_count);
         let worker_id = format!("pg_worker_{}", i);
+        let queues = vec![queue.clone()];
 
         let handle = tokio::spawn(async move {
-            match storage_clone.fetch_and_lock_job(&worker_id, None).await {
+            match storage_clone
+                .fetch_and_lock_job(&worker_id, Some(&queues))
+                .await
+            {
                 Ok(Some(_job)) => {
                     success_count_clone.fetch_add(1, Ordering::SeqCst);
                     true
@@ -420,7 +436,17 @@ async fn test_postgres_lock_table() {
         return;
     };
 
-    let job_id = "postgres_lock_test";
+    // The Postgres backend's `try_acquire_job_lock` is a row-level lock on
+    // an existing `qml_jobs` row (it UPDATEs `locked_by`/`lock_expires_at`
+    // on the job itself). It cannot lock an arbitrary id — the row must
+    // exist first. Enqueue a real job to grab a real id; the previous
+    // version of this test passed a free-form string that wasn't even a
+    // UUID, but only "passed" while DATABASE_URL was unset and
+    // `create_postgres_storage` returned None.
+    let job = create_test_job("postgres_lock_test");
+    storage.enqueue(&job).await.unwrap();
+    let job_id_owned = job.id.clone();
+    let job_id = job_id_owned.as_str();
     let worker1 = "pg_worker_1";
     let worker2 = "pg_worker_2";
 

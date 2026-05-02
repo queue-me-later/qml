@@ -482,11 +482,16 @@ mod tests {
     #[test]
     #[cfg(feature = "postgres")]
     fn test_postgres_config_default() {
+        // `PostgresConfig::default()` reads DATABASE_URL when present, falling
+        // back to the hardcoded dev string. Compute the expected value the
+        // same way so this test is stable whether or not the surrounding
+        // environment exports DATABASE_URL — earlier we asserted the
+        // fallback unconditionally and broke under `DATABASE_URL=...
+        // cargo test` setups.
+        let expected_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://postgres:password@localhost:5432/qml".to_string());
         let config = PostgresConfig::default();
-        assert_eq!(
-            config.database_url,
-            "postgresql://postgres:password@localhost:5432/qml"
-        );
+        assert_eq!(config.database_url, expected_url);
         assert_eq!(config.max_connections, 20);
         assert_eq!(config.min_connections, 1);
         assert_eq!(config.table_name, "qml_jobs");

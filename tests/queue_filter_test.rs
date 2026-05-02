@@ -238,3 +238,57 @@ async fn postgres_queue_filter_no_filter_returns_all() {
     let qb = format!("pgnf-b-{suffix}");
     exercise_no_filter(&storage, &qa, &qb).await;
 }
+
+/// Regression: with the previous bounded-candidate-cap implementation
+/// of `fetch_and_lock_job`, a Redis worker scoped to queue `target`
+/// could miss eligible jobs when more than 1024 ineligible-queue jobs
+/// were enqueued ahead of them. The per-queue ZSET design reads only
+/// the per-queue keys named in the filter, so cross-queue depth no
+/// longer matters.
+#[cfg(feature = "redis")]
+#[tokio::test]
+async fn redis_queue_filter_finds_eligible_past_old_1024_cap() {
+    use qml_rs::storage::{RedisConfig, RedisStorage};
+
+    let Some(url) = redis_url() else {
+        eprintln!("REDIS_URL not set; skipping redis cap-removal test");
+        return;
+    };
+
+    let prefix = format!("qf-cap-{}", uuid::Uuid::new_v4());
+    let config = RedisConfig::new().with_url(&url).with_key_prefix(&prefix);
+    let storage = match RedisStorage::with_config(config).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skipping redis cap-removal test: {e}");
+            return;
+        }
+    };
+
+    // 1500 jobs in the noise queue (>1024 — the old cap).
+    let noise_queue = "redcap-noise";
+    let target_queue = "redcap-target";
+    for _ in 0..1500 {
+        storage.enqueue(&job_in(noise_queue)).await.unwrap();
+    }
+
+    // One job in the target queue — must be findable by a worker
+    // scoped to that queue, regardless of how many noise-queue jobs
+    // are in front of it in any global ordering.
+    let target = job_in(target_queue);
+    let target_id = target.id.clone();
+    storage.enqueue(&target).await.unwrap();
+
+    let only_target = vec![target_queue.to_string()];
+    let claimed = storage
+        .fetch_and_lock_job("worker-target", Some(&only_target))
+        .await
+        .unwrap();
+
+    let claimed = claimed.expect(
+        "queue-scoped worker must find the target job past the >1024 noise jobs — the \
+         per-queue ZSET design should make cross-queue depth irrelevant",
+    );
+    assert_eq!(claimed.id, target_id);
+    assert_eq!(claimed.queue, target_queue);
+}

@@ -188,25 +188,17 @@ impl RedisStorage {
                 .await?;
         }
 
-        // Set TTL for completed/failed jobs if configured
-        match job.state {
-            JobState::Succeeded { .. } => {
-                if let Some(ttl) = self.config.completed_job_ttl {
-                    let job_key = self.job_key(&job.id);
-                    self.with_timeout::<_, ()>(conn.expire(&job_key, ttl.as_secs() as i64))
-                        .await?;
-                }
-            }
-            JobState::Failed { .. } => {
-                if let Some(ttl) = self.config.failed_job_ttl {
-                    let job_key = self.job_key(&job.id);
-                    self.with_timeout::<_, ()>(conn.expire(&job_key, ttl.as_secs() as i64))
-                        .await?;
-                }
-            }
-            _ => {}
-        }
-
+        // Expiration of final-state jobs is owned by `CleanupWorker` via
+        // `Storage::delete_expired_jobs`, which sweeps `expires_at` set by
+        // `JobProcessor` on transition. Native Redis EXPIRE used to also
+        // be set here, which raced the sweep: when the native TTL fired
+        // first, the job key disappeared but its index entries
+        // (qml:state:succeeded, qml:all, qml:counts) lived on forever
+        // because nothing observed the expiration. Stick with the
+        // out-of-band sweep — one expiration source, one consistent index.
+        // (`RedisConfig::completed_job_ttl` / `failed_job_ttl` remain on the
+        // public config for backward compatibility but no longer affect
+        // index lifecycle.)
         Ok(())
     }
 

@@ -17,6 +17,7 @@ use std::env;
 
 use chrono::{Duration, Utc};
 use qml_rs::core::{Job, JobState};
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{MemoryStorage, Storage};
 
 #[cfg(feature = "postgres")]

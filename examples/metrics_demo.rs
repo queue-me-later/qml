@@ -25,6 +25,7 @@
 use async_trait::async_trait;
 use chrono::Duration;
 use qml_rs::processing::metrics::{PrometheusMetrics, PrometheusMiddleware};
+use qml_rs::storage::prelude::*;
 use qml_rs::{
     BackgroundJobServer, Job, MemoryStorage, QmlError, ServerConfig, Storage, TracingMiddleware,
     Worker, WorkerContext, WorkerRegistry, WorkerResult,

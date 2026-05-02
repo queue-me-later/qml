@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use qml_rs::core::{Job, JobStateKind};
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{MemoryStorage, MonitoringApi, StorageError};
 use qml_rs::{DashboardConfig, DashboardServer};
 

@@ -24,6 +24,7 @@ use super::{
 use crate::core::{RecurringJob, ServerInfo};
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
+use crate::storage::prelude::*;
 
 /// Configuration for the background job server
 #[derive(Debug, Clone, Serialize, Deserialize)]

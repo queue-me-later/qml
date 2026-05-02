@@ -28,6 +28,7 @@ use axum::{
     response::Json,
     routing::{get, post},
 };
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{MemoryConfig, StorageInstance};
 use qml_rs::{Job, Storage};
 use serde::{Deserialize, Serialize};
@@ -92,10 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✅ QML storage initialized successfully (no panics!)");
 
-    // Create shared application state
-    let app_state = AppState {
-        storage: Arc::new(storage),
-    };
+    // Create shared application state. `memory_with_config` returns
+    // `Arc<dyn Storage>` directly now (post-trait-split refactor),
+    // so no outer `Arc::new(...)` wrap.
+    let app_state = AppState { storage };
 
     // Build the Axum router
     let app = Router::new()

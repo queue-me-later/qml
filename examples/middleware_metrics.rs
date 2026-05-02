@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use chrono::Duration;
+use qml_rs::storage::prelude::*;
 use qml_rs::{
     BackgroundJobServer, Job, JobMiddleware, MemoryStorage, Next, QmlError, ServerConfig, Storage,
     TracingMiddleware, Worker, WorkerContext, WorkerRegistry, WorkerResult,

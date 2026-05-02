@@ -14,6 +14,7 @@
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use qml_rs::storage::prelude::*;
 use qml_rs::{
     BackgroundJobServer, Job, JobScheduler, MonitoringApi, RetryPolicy, RetryStrategy,
     ServerConfig, Storage, StorageInstance, TypedWorker, WorkerContext, WorkerRegistry,
@@ -196,9 +197,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 QML Rust Processing Engine Demo");
     println!("=========================================\n");
 
-    // Create storage (using memory storage for demo)
+    // Create storage (using memory storage for demo).
+    // `memory()` returns `Arc<dyn Storage>` directly now.
     let storage = StorageInstance::memory();
-    let storage = Arc::new(storage);
 
     // Create and configure workers
     let email_worker = EmailWorker::new();

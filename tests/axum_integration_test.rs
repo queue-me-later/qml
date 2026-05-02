@@ -5,6 +5,7 @@
 //! 2. Jobs can be created and managed in an async/await context
 //! 3. Everything integrates smoothly with Axum's patterns
 
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{MemoryConfig, StorageConfig, StorageInstance};
 use qml_rs::{Job, MonitoringApi, Storage};
 
@@ -52,10 +53,11 @@ async fn test_axum_integration_patterns() {
         storage: Arc<dyn Storage + Send + Sync>,
     }
 
+    // `StorageInstance::memory()` now returns `Arc<dyn Storage>`
+    // directly (the old enum-shaped instance has been retired), so no
+    // outer `Arc::new(...)` wrap.
     let storage = StorageInstance::memory();
-    let app_state = AppState {
-        storage: Arc::new(storage),
-    };
+    let app_state = AppState { storage };
 
     // Simulate what would happen in an Axum handler
     let job = Job::new(

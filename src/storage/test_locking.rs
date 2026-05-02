@@ -5,6 +5,7 @@
 //! conditions in concurrent worker scenarios.
 
 use crate::core::Job;
+use crate::storage::prelude::*;
 use crate::storage::{MemoryStorage, Storage};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

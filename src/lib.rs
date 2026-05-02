@@ -445,7 +445,8 @@ pub use processing::{
 #[cfg(feature = "metrics")]
 pub use processing::{PrometheusMetrics, PrometheusMiddleware};
 pub use storage::{
-    MemoryStorage, MonitoringApi, Storage, StorageConfig, StorageError, StorageInstance,
+    JobLocker, JobStore, MemoryStorage, MonitoringApi, NamedLocks, RecurringStore, ServerRegistry,
+    Storage, StorageConfig, StorageError, StorageInstance,
 };
 
 #[cfg(feature = "redis")]

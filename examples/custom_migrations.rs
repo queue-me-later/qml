@@ -4,6 +4,7 @@
 //! The complete schema is now included in the binary and no external migration
 //! files are needed. This provides a much simpler and more reliable deployment.
 
+use qml_rs::storage::prelude::*;
 #[cfg(feature = "postgres")]
 use qml_rs::storage::{PostgresConfig, PostgresStorage};
 #[cfg(feature = "postgres")]

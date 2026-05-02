@@ -18,6 +18,7 @@ use super::{
 use crate::core::{Job, JobState};
 use crate::error::{QmlError, Result};
 use crate::storage::Storage;
+use crate::storage::prelude::*;
 
 /// Default middleware stack installed on every `JobProcessor` — just the
 /// built-in tracing span wrapper. Callers can replace this via

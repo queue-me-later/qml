@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use super::{MonitoringApi, PostgresConfig, Storage, StorageError};
+use super::{
+    JobLocker, JobStore, MonitoringApi, NamedLocks, PostgresConfig, RecurringStore, ServerRegistry,
+    StorageError,
+};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Default name of the jobs table. `PostgresConfig::table_name` defaults to
@@ -966,7 +969,7 @@ impl MonitoringApi for PostgresStorage {
 }
 
 #[async_trait]
-impl Storage for PostgresStorage {
+impl JobStore for PostgresStorage {
     async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
         let (state_name, state_data, arguments) = Self::job_to_row_values(job)?;
         let metadata = if job.metadata.is_empty() {
@@ -1238,6 +1241,25 @@ impl Storage for PostgresStorage {
         Ok(jobs)
     }
 
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let query = format!(
+            "DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at < $1",
+            self.table_name()
+        );
+        let result = sqlx::query(&query)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationFailed {
+                message: format!("Failed to delete expired jobs: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+        Ok(result.rows_affected() as usize)
+    }
+}
+
+#[async_trait]
+impl JobLocker for PostgresStorage {
     async fn requeue_stranded_jobs(
         &self,
         stale_before: DateTime<Utc>,
@@ -1393,7 +1415,10 @@ impl Storage for PostgresStorage {
 
         Ok(jobs)
     }
+}
 
+#[async_trait]
+impl RecurringStore for PostgresStorage {
     async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
         let table = self.recurring_table_name();
         let query = format!(
@@ -1514,23 +1539,10 @@ impl Storage for PostgresStorage {
         }
         Ok(out)
     }
+}
 
-    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
-        let query = format!(
-            "DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at < $1",
-            self.table_name()
-        );
-        let result = sqlx::query(&query)
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::OperationFailed {
-                message: format!("Failed to delete expired jobs: {}", e),
-                source: Some(Box::new(e)),
-            })?;
-        Ok(result.rows_affected() as usize)
-    }
-
+#[async_trait]
+impl ServerRegistry for PostgresStorage {
     async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
         let query = format!(
             r#"
@@ -1636,7 +1648,10 @@ impl Storage for PostgresStorage {
         )
         .await
     }
+}
 
+#[async_trait]
+impl NamedLocks for PostgresStorage {
     async fn try_acquire_lock(
         &self,
         resource: &str,

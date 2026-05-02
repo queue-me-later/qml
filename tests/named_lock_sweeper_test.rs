@@ -11,6 +11,7 @@ use std::env;
 use std::time::Duration;
 
 use chrono::Utc;
+use qml_rs::storage::prelude::*;
 use qml_rs::storage::{MemoryStorage, Storage};
 
 #[cfg(feature = "postgres")]

@@ -5,7 +5,10 @@ use serde_json;
 use std::collections::HashMap;
 use tokio::time::timeout;
 
-use super::{MonitoringApi, RedisConfig, Storage, StorageError};
+use super::{
+    JobLocker, JobStore, MonitoringApi, NamedLocks, RecurringStore, RedisConfig, ServerRegistry,
+    StorageError,
+};
 use crate::core::{Job, JobState, JobStateKind, RecurringJob, ServerInfo};
 
 /// Redis storage implementation for jobs
@@ -798,7 +801,7 @@ impl MonitoringApi for RedisStorage {
 }
 
 #[async_trait]
-impl Storage for RedisStorage {
+impl JobStore for RedisStorage {
     async fn enqueue(&self, job: &Job) -> Result<(), StorageError> {
         let mut conn = self.get_connection().await?;
         let job_key = self.job_key(&job.id);
@@ -932,6 +935,44 @@ impl Storage for RedisStorage {
             .await
     }
 
+    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        // Redis backends also set native TTL via update_job_indices, but
+        // `expires_at` on the Job is the authoritative clock because it
+        // gives the CleanupWorker a uniform cross-backend deadline.
+        let mut conn = self.get_connection().await?;
+        let all_key = self.all_jobs_key();
+        let ids: Vec<String> = self
+            .with_timeout::<_, Vec<String>>(conn.smembers(&all_key))
+            .await?;
+
+        let mut removed = 0usize;
+        for id in ids {
+            let key = self.job_key(&id);
+            let json: Option<String> = self
+                .with_timeout::<_, Option<String>>(conn.get(&key))
+                .await?;
+            let Some(s) = json else { continue };
+            let job: Job = match serde_json::from_str(&s) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            let expired = match job.expires_at {
+                Some(ts) => ts < now,
+                None => false,
+            };
+            if !expired {
+                continue;
+            }
+            self.remove_job_indices(&id, &job).await?;
+            let _: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+}
+
+#[async_trait]
+impl JobLocker for RedisStorage {
     async fn requeue_stranded_jobs(
         &self,
         stale_before: DateTime<Utc>,
@@ -1212,7 +1253,10 @@ impl Storage for RedisStorage {
 
         Ok(jobs)
     }
+}
 
+#[async_trait]
+impl RecurringStore for RedisStorage {
     async fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StorageError> {
         let mut conn = self.get_connection().await?;
         let key = self.recurring_key(&job.id);
@@ -1332,42 +1376,10 @@ impl Storage for RedisStorage {
         }
         Ok(claimed)
     }
+}
 
-    async fn delete_expired_jobs(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
-        // Redis backends also set native TTL via update_job_indices, but
-        // `expires_at` on the Job is the authoritative clock because it
-        // gives the CleanupWorker a uniform cross-backend deadline.
-        let mut conn = self.get_connection().await?;
-        let all_key = self.all_jobs_key();
-        let ids: Vec<String> = self
-            .with_timeout::<_, Vec<String>>(conn.smembers(&all_key))
-            .await?;
-
-        let mut removed = 0usize;
-        for id in ids {
-            let key = self.job_key(&id);
-            let json: Option<String> = self
-                .with_timeout::<_, Option<String>>(conn.get(&key))
-                .await?;
-            let Some(s) = json else { continue };
-            let job: Job = match serde_json::from_str(&s) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            let expired = match job.expires_at {
-                Some(ts) => ts < now,
-                None => false,
-            };
-            if !expired {
-                continue;
-            }
-            self.remove_job_indices(&id, &job).await?;
-            let _: i32 = self.with_timeout::<_, i32>(conn.del(&key)).await?;
-            removed += 1;
-        }
-        Ok(removed)
-    }
-
+#[async_trait]
+impl ServerRegistry for RedisStorage {
     async fn register_server(&self, info: &ServerInfo) -> Result<(), StorageError> {
         let mut conn = self.get_connection().await?;
         let key = self.server_key(&info.server_id);
@@ -1477,7 +1489,10 @@ impl Storage for RedisStorage {
         }
         Ok(reclaimed)
     }
+}
 
+#[async_trait]
+impl NamedLocks for RedisStorage {
     async fn try_acquire_lock(
         &self,
         resource: &str,

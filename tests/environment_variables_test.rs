@@ -78,11 +78,10 @@ async fn test_axum_qml_integration_with_env_vars() {
         storage: Arc<dyn Storage + Send + Sync>,
     }
 
-    // Test with memory storage (works without env vars)
+    // Test with memory storage (works without env vars).
+    // `memory()` returns `Arc<dyn Storage>` directly now.
     let storage = StorageInstance::memory();
-    let app_state = AppState {
-        storage: Arc::new(storage),
-    };
+    let app_state = AppState { storage };
 
     // Test job creation (typical Axum handler pattern)
     let job = Job::new(

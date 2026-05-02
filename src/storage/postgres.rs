@@ -1697,6 +1697,29 @@ impl Storage for PostgresStorage {
             })?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        // The takeover-on-acquire path in `try_acquire_lock` only fires
+        // when a peer attempts to claim a specific resource that's
+        // already expired. One-shot lock workloads (a recurring report
+        // that takes a lock once, finishes, and never re-acquires) leak
+        // rows indefinitely without this sweep. The partial index
+        // `idx_qml_locks_expires_at` keeps the DELETE cheap.
+        let locks_table = self.locks_table_name();
+        let query = format!(
+            "DELETE FROM {table} WHERE expires_at < $1",
+            table = locks_table
+        );
+        let result = sqlx::query(&query)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to clean up expired named locks: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+        Ok(result.rows_affected() as usize)
+    }
 }
 
 #[cfg(test)]

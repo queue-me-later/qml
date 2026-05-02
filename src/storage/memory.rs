@@ -652,6 +652,13 @@ impl Storage for MemoryStorage {
             _ => Ok(false),
         }
     }
+
+    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        let mut locks = self.named_locks.write().unwrap();
+        let before = locks.len();
+        locks.retain(|_, lock| lock.expires_at > now);
+        Ok(before - locks.len())
+    }
 }
 
 impl MemoryStorage {

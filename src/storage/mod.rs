@@ -666,6 +666,21 @@ pub trait Storage: MonitoringApi + Send + Sync {
     /// Returns `Ok(true)` if a matching row was deleted, `Ok(false)` if
     /// no row existed or it was owned by someone else.
     async fn release_lock(&self, resource: &str, owner: &str) -> Result<bool, StorageError>;
+
+    /// Background sweep of expired generic named locks.
+    ///
+    /// Returns the number of expired entries removed. Backends differ:
+    /// - **Postgres**: `DELETE FROM qml_locks WHERE expires_at < $1`.
+    ///   The `try_acquire_lock` path replaces expired rows opportunistically
+    ///   on contention, but a workload that takes a lock once and never
+    ///   re-acquires (e.g. one-shot named locks) accumulates rows
+    ///   indefinitely without this sweep.
+    /// - **Redis**: a no-op — named locks use the native Redis `PX` TTL
+    ///   so the server expires them automatically. Returns `Ok(0)`.
+    /// - **Memory**: drops entries from the in-process `named_locks` map.
+    ///
+    /// Called by [`crate::processing::CleanupWorker`] on each tick.
+    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError>;
 }
 
 /// Storage instance that can hold any storage implementation
@@ -1255,6 +1270,16 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.release_lock(resource, owner).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.release_lock(resource, owner).await,
+        }
+    }
+
+    async fn cleanup_expired_named_locks(&self, now: DateTime<Utc>) -> Result<usize, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.cleanup_expired_named_locks(now).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.cleanup_expired_named_locks(now).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.cleanup_expired_named_locks(now).await,
         }
     }
 }

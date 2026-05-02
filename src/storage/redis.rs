@@ -1487,6 +1487,18 @@ impl Storage for RedisStorage {
             .await?;
         Ok(deleted == 1)
     }
+
+    async fn cleanup_expired_named_locks(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<usize, StorageError> {
+        // Redis named locks use the server's native `PX` TTL on each key
+        // (set by `try_acquire_lock`), so the Redis server itself drops
+        // expired entries — there's no equivalent of the Postgres
+        // accumulating-row problem. Returning Ok(0) keeps the
+        // CleanupWorker tick cheap on Redis-backed deployments.
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

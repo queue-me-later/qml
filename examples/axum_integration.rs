@@ -85,9 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Starting Axum + QML Integration Example");
 
     // Initialize QML storage - this will NOT panic thanks to our fixes!
-    let storage_config = MemoryConfig::new()
-        .with_max_jobs(1000)
-        .with_auto_cleanup(true);
+    let storage_config = MemoryConfig::new().with_max_jobs(1000);
 
     let storage = StorageInstance::memory_with_config(storage_config);
 

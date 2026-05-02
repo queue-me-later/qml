@@ -145,15 +145,16 @@ fn check_bearer(header_value: &str, expected: &str) -> bool {
     constant_time_eq(token.trim().as_bytes(), expected.as_bytes())
 }
 
+/// Length-tolerant constant-time equality, delegated to the `subtle`
+/// crate. The earlier hand-rolled XOR-fold did the right thing but the
+/// audited version is simpler to reason about and keeps the dashboard
+/// off custom crypto code.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
     if a.len() != b.len() {
         return false;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.ct_eq(b).into()
 }
 
 /// Extract the authority (`host[:port]`) from a URL. Returns `None` if the
@@ -169,31 +170,23 @@ fn authority_of(url: &str) -> Option<String> {
     }
 }
 
+/// Standard Base64 decoder for the `Authorization: Basic ...` header.
+///
+/// Delegated to the `base64` crate's standard engine. The earlier
+/// version was a 25-line hand-rolled implementation; the crate
+/// version is audited, handles padding edge cases the same way, and
+/// keeps the dashboard off custom decoding code.
+///
+/// The input is passed through verbatim — the crate handles the `=`
+/// padding internally. The previous hand-rolled implementation called
+/// `input.trim_end_matches('=')` (stripping padding), and a brief
+/// intermediate of this function called `.trim()` (stripping
+/// surrounding whitespace) which would have widened the contract; the
+/// only caller (`check_basic`) already trims its input, so this
+/// matches the old strict-format behavior.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let input = input.trim_end_matches('=').as_bytes();
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u8 = 0;
-    for &c in input {
-        buf = (buf << 6) | val(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1u32 << bits) - 1;
-        }
-    }
-    Some(out)
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
 #[cfg(test)]

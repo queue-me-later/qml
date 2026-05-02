@@ -175,8 +175,15 @@ async fn test_concurrent_storage_access() {
     }
 }
 
-/// Test storage configuration serialization round-trip
+/// Test storage configuration serialization round-trip.
+///
+/// `auto_cleanup` is now a deprecated no-op (`MemoryStorage` never read
+/// it; cleanup is owned by `CleanupWorker`). The round-trip still has
+/// to preserve the field so old serialized configs deserialize without
+/// data loss — that's why we keep exercising it here, behind
+/// `allow(deprecated)`.
 #[tokio::test]
+#[allow(deprecated)]
 async fn test_config_serialization_roundtrip() {
     // Test Memory config
     let memory_config = StorageConfig::Memory(

@@ -779,18 +779,20 @@ impl StorageInstance {
 
 /// Dashboard-facing subset of storage operations.
 ///
-/// [`MonitoringApi`] carves out the five methods the Axum dashboard and its
+/// [`MonitoringApi`] carves out the methods the Axum dashboard and its
 /// [`DashboardService`](crate::dashboard::DashboardService) actually touch
-/// (`get`, `update`, `delete`, `list`, `get_job_counts`) so that dashboard
-/// tests can be written against a ~100-line fake instead of a full
-/// [`Storage`] backend. Every real [`Storage`] implementation is also a
-/// [`MonitoringApi`], so callers holding an `Arc<dyn Storage>` can pass it
-/// anywhere an `Arc<dyn MonitoringApi>` is expected via trait upcasting.
+/// (`get`, `update`, `update_if_state`, `delete`, `list`, `get_job_counts`)
+/// so that dashboard tests can be written against a small fake instead of
+/// a full [`Storage`] backend. Every real [`Storage`] implementation is
+/// also a [`MonitoringApi`], so callers holding an `Arc<dyn Storage>` can
+/// pass it anywhere an `Arc<dyn MonitoringApi>` is expected via trait
+/// upcasting.
 ///
-/// The trait deliberately includes `update` and `delete` even though they
-/// mutate state — the dashboard needs them for its retry-job and delete-job
-/// actions, and pretending they're read-only would force callers back onto
-/// the full [`Storage`] trait and defeat the testing payoff.
+/// The trait deliberately includes mutating methods even though it's
+/// scoped at observation/operations — the dashboard needs them for its
+/// retry-job and delete-job actions, and pretending they're read-only
+/// would force callers back onto the full [`Storage`] trait and defeat
+/// the testing payoff.
 #[async_trait]
 pub trait MonitoringApi: Send + Sync {
     /// Retrieve a job by its unique identifier.
@@ -798,6 +800,24 @@ pub trait MonitoringApi: Send + Sync {
 
     /// Update an existing job's state and metadata.
     async fn update(&self, job: &Job) -> Result<(), StorageError>;
+
+    /// Compare-and-swap variant of [`update`].
+    ///
+    /// Writes `job` only if the persisted row's state currently matches
+    /// `expected`. Returns `Ok(true)` when the update was applied,
+    /// `Ok(false)` when the state had moved on (a stomp was avoided),
+    /// and `Err(JobNotFound)` when no row exists for the id.
+    ///
+    /// Use this when a caller has read the job, decided to transition it
+    /// based on what it observed, and might race with a worker or a peer
+    /// dashboard. The dashboard "retry" button is the canonical example —
+    /// without CAS, a slow second retry could overwrite a `Processing`
+    /// state that a worker had already taken on after the first retry.
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError>;
 
     /// Remove a job from storage (soft or hard delete).
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError>;
@@ -833,6 +853,20 @@ impl MonitoringApi for StorageInstance {
             StorageInstance::Redis(storage) => storage.update(job).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.update(job).await,
+        }
+    }
+
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.update_if_state(job, expected).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.update_if_state(job, expected).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.update_if_state(job, expected).await,
         }
     }
 

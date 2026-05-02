@@ -138,6 +138,22 @@ impl MonitoringApi for MemoryStorage {
         }
     }
 
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+        match jobs.get(&job.id) {
+            None => Err(StorageError::job_not_found(job.id.clone())),
+            Some(existing) if existing.state.kind() != expected => Ok(false),
+            Some(_) => {
+                jobs.insert(job.id.clone(), job.clone());
+                Ok(true)
+            }
+        }
+    }
+
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
         let mut jobs = self.jobs.write().unwrap();
         Ok(jobs.remove(job_id).is_some())

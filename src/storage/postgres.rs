@@ -739,6 +739,97 @@ impl MonitoringApi for PostgresStorage {
         Ok(())
     }
 
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        let job_id = Uuid::from_str(&job.id).map_err(|e| StorageError::InvalidJobData {
+            message: format!("Invalid job ID format: {}", e),
+        })?;
+
+        let (new_state_name, new_state_data, arguments) = Self::job_to_row_values(job)?;
+        let metadata = if job.metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&job.metadata).map_err(|e| {
+                StorageError::SerializationError {
+                    message: format!("Failed to serialize metadata: {}", e),
+                    source: Some(Box::new(e)),
+                }
+            })?)
+        };
+
+        let expected_state_name = match expected {
+            JobStateKind::Enqueued => "enqueued",
+            JobStateKind::Processing => "processing",
+            JobStateKind::Succeeded => "succeeded",
+            JobStateKind::Failed => "failed",
+            JobStateKind::Deleted => "deleted",
+            JobStateKind::Scheduled => "scheduled",
+            JobStateKind::AwaitingRetry => "awaiting_retry",
+        };
+
+        // CAS in one round-trip: the predicate matches both the row id
+        // *and* the current state_name. If state has moved on,
+        // rows_affected = 0 and we follow up with a single SELECT to
+        // distinguish "stale state" (Ok(false)) from "row absent"
+        // (Err(JobNotFound)).
+        let query = format!(
+            r#"
+            UPDATE {}
+            SET method_name = $3, arguments = $4, state_name = $5, state_data = $6,
+                queue_name = $7, priority = $8, max_retries = $9, current_retries = $10,
+                metadata = $11, job_type = $12, timeout_seconds = $13, expires_at = $14,
+                updated_at = NOW()
+            WHERE id = $1 AND state_name = $2
+            "#,
+            self.table_name()
+        );
+
+        let result = sqlx::query(&query)
+            .bind(job_id)
+            .bind(expected_state_name)
+            .bind(&job.method)
+            .bind(arguments)
+            .bind(new_state_name)
+            .bind(new_state_data)
+            .bind(&job.queue)
+            .bind(job.priority)
+            .bind(job.max_retries as i32)
+            .bind(job.attempt as i32)
+            .bind(metadata)
+            .bind(&job.job_type)
+            .bind(job.timeout_seconds.map(|t| t as i32))
+            .bind(job.expires_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to update_if_state job: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+
+        // Distinguish missing from state-mismatch.
+        let exists_query = format!("SELECT 1 FROM {} WHERE id = $1", self.table_name());
+        let row_exists: Option<i32> = sqlx::query_scalar(&exists_query)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to verify job existence: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
+        match row_exists {
+            Some(_) => Ok(false),
+            None => Err(StorageError::job_not_found(job.id.clone())),
+        }
+    }
+
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
         let job_uuid = Uuid::from_str(job_id).map_err(|e| StorageError::InvalidJobData {
             message: format!("Invalid job ID format: {}", e),

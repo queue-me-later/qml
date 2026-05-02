@@ -417,6 +417,130 @@ impl MonitoringApi for RedisStorage {
         Ok(())
     }
 
+    async fn update_if_state(
+        &self,
+        job: &Job,
+        expected: JobStateKind,
+    ) -> Result<bool, StorageError> {
+        // Compare-and-swap in a single Lua call: GET the current job
+        // blob, decode, check the externally-tagged variant key against
+        // `expected`, and SET the new blob plus index updates only if
+        // it matches.
+        //
+        // KEYS[1] = job key (full)
+        // KEYS[2] = state index prefix
+        // KEYS[3] = available ZSET
+        // KEYS[4] = counts hash
+        // ARGV[1] = expected variant string ("Enqueued" / "Failed" / …)
+        // ARGV[2] = new variant string (for index swap)
+        // ARGV[3] = new full job JSON to write
+        // ARGV[4] = new score for the available ZSET (string), or "" if
+        //           the new state is not available
+        // ARGV[5] = new state availability flag ("1" if available, else "0")
+        //
+        // Returns:
+        //   "missing"   — no job at the key
+        //   "mismatch"  — job exists but state didn't match
+        //   "ok"        — applied
+        let lua_script = r#"
+            local job_key = KEYS[1]
+            local state_key_prefix = KEYS[2]
+            local available_key = KEYS[3]
+            local counts_key = KEYS[4]
+            local expected_variant = ARGV[1]
+            local new_variant = ARGV[2]
+            local new_blob = ARGV[3]
+            local new_score = ARGV[4]
+            local new_available = ARGV[5]
+
+            local current = redis.call('GET', job_key)
+            if not current then
+                return 'missing'
+            end
+            local job = cjson.decode(current)
+            if not job.state[expected_variant] then
+                return 'mismatch'
+            end
+
+            local old_variant = expected_variant
+
+            redis.call('SET', job_key, new_blob)
+            if old_variant ~= new_variant then
+                local lower_old = string.lower(old_variant)
+                local lower_new = string.lower(new_variant)
+                -- AwaitingRetry is stored as 'awaiting_retry' in the state
+                -- index key. The other variants are simple snake_case of the
+                -- camel-case variant name; for AwaitingRetry the lowercase
+                -- alone gives us 'awaitingretry' which is wrong.
+                if old_variant == 'AwaitingRetry' then lower_old = 'awaiting_retry' end
+                if new_variant == 'AwaitingRetry' then lower_new = 'awaiting_retry' end
+                redis.call('SREM', state_key_prefix .. lower_old, job.id)
+                redis.call('SADD', state_key_prefix .. lower_new, job.id)
+                redis.call('HINCRBY', counts_key, lower_old, -1)
+                redis.call('HINCRBY', counts_key, lower_new, 1)
+            end
+
+            if new_available == '1' then
+                redis.call('ZADD', available_key, tonumber(new_score), job.id)
+            else
+                redis.call('ZREM', available_key, job.id)
+            end
+
+            return 'ok'
+        "#;
+
+        let mut conn = self.get_connection().await?;
+        let new_blob = serde_json::to_string(job).map_err(|e| {
+            StorageError::serialization_with_source("Failed to serialize job", Box::new(e))
+        })?;
+
+        let job_key = self.job_key(&job.id);
+        let state_key_prefix = format!("{}:state:", self.config.key_prefix);
+        let available_key = self.available_jobs_key();
+        let counts_key = self.job_counts_key();
+
+        let new_kind = job.state.kind();
+        let new_variant = new_kind.name();
+        let expected_variant = expected.name();
+
+        // Match update_job_indices' score formula so the available ZSET
+        // remains consistent with the rest of the codebase.
+        let (new_score, new_available) = if Self::is_job_available(job) {
+            let score =
+                job.priority as f64 + (job.created_at.timestamp_millis() as f64 / 1_000_000.0);
+            (score.to_string(), "1")
+        } else {
+            (String::new(), "0")
+        };
+
+        let result: String = redis::Script::new(lua_script)
+            .key(&job_key)
+            .key(&state_key_prefix)
+            .key(&available_key)
+            .key(&counts_key)
+            .arg(expected_variant)
+            .arg(new_variant)
+            .arg(&new_blob)
+            .arg(&new_score)
+            .arg(new_available)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| StorageError::OperationError {
+                message: format!("Failed to update_if_state job: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
+        match result.as_str() {
+            "ok" => Ok(true),
+            "mismatch" => Ok(false),
+            "missing" => Err(StorageError::job_not_found(job.id.clone())),
+            other => Err(StorageError::OperationError {
+                message: format!("Unexpected update_if_state response: {}", other),
+                source: None,
+            }),
+        }
+    }
+
     async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
         // Get the job first to update indices
         let job = match self.get(job_id).await? {

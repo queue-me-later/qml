@@ -262,7 +262,14 @@ impl DashboardService {
         }))
     }
 
-    /// Retry a failed job (simplified)
+    /// Retry a failed job.
+    ///
+    /// Uses [`Storage::update_if_state`] so concurrent dashboard
+    /// retries (or a retry racing with a worker that already picked
+    /// the job up after a peer's earlier retry) don't stomp on a
+    /// `Processing` state. Returns `Ok(false)` when the job has moved
+    /// out of `Failed` between read and write — the caller surfaces
+    /// this as "nothing to do" rather than a hard error.
     pub async fn retry_job(&self, job_id: &str) -> Result<bool, QmlError> {
         let mut job = match self
             .storage
@@ -275,21 +282,20 @@ impl DashboardService {
             None => return Ok(false),
         };
 
-        // Only retry failed jobs
+        // Only retry failed jobs.
         if !matches!(job.state, JobState::Failed { .. }) {
             return Ok(false);
         }
 
-        // Reset job state to enqueued for retry
+        // Reset job state to enqueued for retry.
         job.state = JobState::enqueued(&job.queue);
 
         self.storage
-            .update(&job)
+            .update_if_state(&job, crate::core::JobStateKind::Failed)
             .await
             .map_err(|e| QmlError::StorageError {
                 message: e.to_string(),
-            })?;
-        Ok(true)
+            })
     }
 
     /// Delete a job (simplified)

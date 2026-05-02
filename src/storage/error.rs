@@ -61,21 +61,40 @@ pub enum StorageError {
     #[error("Invalid job data: {message}")]
     InvalidJobData { message: String },
 
-    /// Connection-specific error (shorthand)
+    /// Connection-specific error (shorthand). Carries an optional source so
+    /// the underlying driver error can be inspected via `Error::source()` or
+    /// downcast — earlier versions stringified the cause into `message` and
+    /// dropped the chain.
     #[error("Connection error: {message}")]
-    ConnectionError { message: String },
+    ConnectionError {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// Serialization-specific error (shorthand)
     #[error("Serialization error: {message}")]
-    SerializationError { message: String },
+    SerializationError {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// Deserialization-specific error (shorthand)
     #[error("Deserialization error: {message}")]
-    DeserializationError { message: String },
+    DeserializationError {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// Operation-specific error (shorthand)
     #[error("Operation error: {message}")]
-    OperationError { message: String },
+    OperationError {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 }
 
 impl StorageError {
@@ -178,6 +197,56 @@ impl StorageError {
             job_id: job_id.into(),
         }
     }
+
+    /// Connection-error shorthand with a captured source. Prefer this over
+    /// `ConnectionError { message, source: None }` so the cause chain is
+    /// preserved for downstream `Error::source()` callers.
+    pub fn conn_err<M, E>(message: M, source: E) -> Self
+    where
+        M: Into<String>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::ConnectionError {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Serialization-error shorthand with a captured source.
+    pub fn ser_err<M, E>(message: M, source: E) -> Self
+    where
+        M: Into<String>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::SerializationError {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Deserialization-error shorthand with a captured source.
+    pub fn de_err<M, E>(message: M, source: E) -> Self
+    where
+        M: Into<String>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::DeserializationError {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Operation-error shorthand with a captured source.
+    pub fn op_err<M, E>(message: M, source: E) -> Self
+    where
+        M: Into<String>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::OperationError {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 // Convert StorageError to QmlError for unified error handling
@@ -185,7 +254,15 @@ impl From<StorageError> for QmlError {
     fn from(err: StorageError) -> Self {
         match err {
             StorageError::JobNotFound { job_id } => QmlError::JobNotFound { job_id },
-            StorageError::Serialization { message, .. } => QmlError::SerializationError { message },
+            // Both Serialization shapes map onto QmlError::SerializationError.
+            // The shorthand variants previously fell through to the generic
+            // StorageError arm, which dropped the typed signal callers were
+            // relying on.
+            StorageError::Serialization { message, .. }
+            | StorageError::SerializationError { message, .. }
+            | StorageError::DeserializationError { message, .. } => {
+                QmlError::SerializationError { message }
+            }
             _ => QmlError::StorageError {
                 message: err.to_string(),
             },

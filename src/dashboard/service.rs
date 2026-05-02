@@ -186,7 +186,7 @@ impl DashboardService {
                     state: job.state,
                     created_at: job.created_at,
                     updated_at: job.created_at, // Use created_at as approximation
-                    attempts: 0,                // Not tracked in current Job struct
+                    attempts: job.attempt,
                     max_attempts: job.max_retries,
                     error_message,
                     scheduled_at,
@@ -221,7 +221,7 @@ impl DashboardService {
                     state: job.state,
                     created_at: job.created_at,
                     updated_at: job.created_at,
-                    attempts: 0,
+                    attempts: job.attempt,
                     max_attempts: job.max_retries,
                     error_message,
                     scheduled_at,
@@ -253,7 +253,7 @@ impl DashboardService {
                 state: job.state,
                 created_at: job.created_at,
                 updated_at: job.created_at,
-                attempts: 0,
+                attempts: job.attempt,
                 max_attempts: job.max_retries,
                 error_message,
                 scheduled_at,

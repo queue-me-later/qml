@@ -36,13 +36,19 @@ pub struct Settings {
 impl Settings {
     /// Load settings from environment variables
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        // The signature is fallible — propagate via `?` rather than
+        // `expect`. A panic here was a footgun for any caller that
+        // enabled the `postgres`/`redis` feature without exporting the
+        // matching URL.
         #[cfg(feature = "postgres")]
-        let database_url = Some(env::var("DATABASE_URL").expect("DATABASE_URL must be set"));
+        let database_url =
+            Some(env::var("DATABASE_URL").map_err(|e| format!("DATABASE_URL must be set: {}", e))?);
         #[cfg(not(feature = "postgres"))]
         let database_url = None;
 
         #[cfg(feature = "redis")]
-        let redis_url = Some(env::var("REDIS_URL").expect("REDIS_URL must be set"));
+        let redis_url =
+            Some(env::var("REDIS_URL").map_err(|e| format!("REDIS_URL must be set: {}", e))?);
         #[cfg(not(feature = "redis"))]
         let redis_url = None;
 

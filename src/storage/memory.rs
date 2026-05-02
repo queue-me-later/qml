@@ -259,6 +259,82 @@ impl Storage for MemoryStorage {
         Ok(due)
     }
 
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        // One critical section: select-and-transition under the same write
+        // lock. No `.await` between the read and the writes, so a parallel
+        // scheduler instance against the same MemoryStorage can never see
+        // a Scheduled job after it's been claimed here.
+        let mut jobs = self.jobs.write().unwrap();
+
+        let mut due_ids: Vec<String> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::Scheduled { enqueue_at, .. } => *enqueue_at <= now,
+                _ => false,
+            })
+            .map(|job| job.id.clone())
+            .collect();
+
+        // Stable order matching the read-only fetch_due_scheduled_jobs:
+        // priority desc, then created_at asc.
+        due_ids.sort_by(|a, b| {
+            let ja = &jobs[a];
+            let jb = &jobs[b];
+            jb.priority
+                .cmp(&ja.priority)
+                .then_with(|| ja.created_at.cmp(&jb.created_at))
+        });
+        due_ids.truncate(limit);
+
+        let mut claimed = Vec::with_capacity(due_ids.len());
+        for id in due_ids {
+            if let Some(job) = jobs.get_mut(&id) {
+                job.state = JobState::enqueued(&job.queue);
+                claimed.push(job.clone());
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        let mut jobs = self.jobs.write().unwrap();
+
+        let mut due_ids: Vec<String> = jobs
+            .values()
+            .filter(|job| match &job.state {
+                JobState::AwaitingRetry { retry_at, .. } => *retry_at <= now,
+                _ => false,
+            })
+            .map(|job| job.id.clone())
+            .collect();
+
+        due_ids.sort_by(|a, b| {
+            let ja = &jobs[a];
+            let jb = &jobs[b];
+            jb.priority
+                .cmp(&ja.priority)
+                .then_with(|| ja.created_at.cmp(&jb.created_at))
+        });
+        due_ids.truncate(limit);
+
+        let mut claimed = Vec::with_capacity(due_ids.len());
+        for id in due_ids {
+            if let Some(job) = jobs.get_mut(&id) {
+                job.state = JobState::enqueued(&job.queue);
+                claimed.push(job.clone());
+            }
+        }
+        Ok(claimed)
+    }
+
     async fn requeue_stranded_jobs(
         &self,
         stale_before: DateTime<Utc>,

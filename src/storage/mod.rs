@@ -279,6 +279,37 @@ pub trait Storage: MonitoringApi + Send + Sync {
         limit: usize,
     ) -> Result<Vec<Job>, StorageError>;
 
+    /// Atomically claim due scheduled jobs and transition them to
+    /// `Enqueued`.
+    ///
+    /// Unlike [`fetch_due_scheduled_jobs`], this method performs the
+    /// `Scheduled → Enqueued` transition inside the storage engine so two
+    /// schedulers running against the same backend cannot promote the same
+    /// job twice. Returns the claimed jobs already in their post-transition
+    /// (`Enqueued`) state.
+    ///
+    /// Backends implement this as:
+    /// - **Postgres**: `UPDATE ... WHERE state_name = 'scheduled' AND
+    ///   <due predicate> RETURNING *` with `FOR UPDATE SKIP LOCKED`.
+    /// - **Redis**: a Lua script that decodes each candidate, checks the
+    ///   time predicate, and performs the SET + index swaps in one
+    ///   invocation.
+    /// - **Memory**: a single critical section under the jobs write lock.
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
+    /// Atomically claim due retry jobs and transition them to `Enqueued`.
+    /// Same contract as [`claim_due_scheduled_jobs`] but for jobs in the
+    /// `AwaitingRetry` state.
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError>;
+
     /// Recover jobs stranded in the `Processing` state by a previous server
     /// instance.
     ///
@@ -890,6 +921,36 @@ impl Storage for StorageInstance {
             StorageInstance::Redis(storage) => storage.fetch_due_retry_jobs(now, limit).await,
             #[cfg(feature = "postgres")]
             StorageInstance::Postgres(storage) => storage.fetch_due_retry_jobs(now, limit).await,
+        }
+    }
+
+    async fn claim_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.claim_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.claim_due_scheduled_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => {
+                storage.claim_due_scheduled_jobs(now, limit).await
+            }
+        }
+    }
+
+    async fn claim_due_retry_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Job>, StorageError> {
+        match self {
+            StorageInstance::Memory(storage) => storage.claim_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "redis")]
+            StorageInstance::Redis(storage) => storage.claim_due_retry_jobs(now, limit).await,
+            #[cfg(feature = "postgres")]
+            StorageInstance::Postgres(storage) => storage.claim_due_retry_jobs(now, limit).await,
         }
     }
 

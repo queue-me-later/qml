@@ -2,19 +2,16 @@
 
 A production-ready Rust implementation of QML background job processing, designed for high-performance, reliability, and scalability.
 
-[![Rust](https://img.shields.io/badge/rust-1.70+-blue.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85+-blue.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-license)
 
-## 🚀 **Status: Production Ready** ✅
-
-**qml** is a complete, enterprise-grade background job processing system with:
+## Capabilities
 
 - **3 Storage Backends**: Memory, Redis, PostgreSQL with full ACID compliance
 - **Multi-threaded Processing**: Worker pools with configurable concurrency
 - **Web Dashboard**: Real-time monitoring with WebSocket updates
 - **Race Condition Prevention**: Comprehensive locking across all backends
-- **45+ Tests**: Including stress tests with 100 jobs + 20 workers
-- **Zero Build Warnings**: Clean, production-ready codebase
+- **Stress-tested**: 100 jobs across 20 workers with no race conditions
 
 ## 📦 Installation
 
@@ -24,11 +21,11 @@ Add to your `Cargo.toml`:
 [dependencies]
 qml-rs = "2.0"
 
-# Enable PostgreSQL support
-qml-rs = { version = "2.0", features = ["postgres"] }
+# With PostgreSQL support:
+# qml-rs = { version = "2.0", features = ["postgres"] }
 
-# Or pull the kitchen sink (postgres + redis + dashboard + metrics):
-qml-rs = { version = "2.0", features = ["postgres", "redis", "dashboard", "metrics"] }
+# All optional features (postgres + redis + dashboard + metrics):
+# qml-rs = { version = "2.0", features = ["postgres", "redis", "dashboard", "metrics"] }
 ```
 
 > **Upgrading from 1.x?** See [`CHANGELOG.md`](CHANGELOG.md) — 2.0
@@ -563,16 +560,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **Persistence**      | None        | Durable      | ACID       |
 | **Scalability**      | Single Node | Distributed  | Horizontal |
 | **Locking**          | Mutex       | Distributed  | Row-level  |
-| **Production Ready** | Development | ✅           | ✅         |
+| **Production Ready** | No (dev/test only) | Yes  | Yes        |
 | **Use Case**         | Testing     | High Traffic | Enterprise |
 
 ## 📊 **Performance Characteristics**
 
-### **Throughput** (Jobs/second)
+### **Throughput** (order-of-magnitude)
 
-- **Memory**: 50,000+ jobs/second
-- **Redis**: 10,000+ jobs/second
-- **PostgreSQL**: 5,000+ jobs/second (with proper indexing)
+These are rough order-of-magnitude figures from internal benchmarking on a
+developer laptop with small JSON payloads — useful for relative ordering
+between backends, not as absolute targets. Re-measure with your own hardware
+and payload shape (`cargo test test_high_concurrency_stress`) before sizing.
+
+- **Memory**: ~50,000 jobs/second
+- **Redis**: ~10,000 jobs/second
+- **PostgreSQL**: ~5,000 jobs/second (with proper indexing)
 
 ### **Concurrency Testing**
 
@@ -611,7 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### **Comprehensive Test Suite**
 
-- **Unit Tests**: 35+ tests for core functionality
+- **Unit Tests**: Core functionality coverage
 - **Integration Tests**: Cross-backend compatibility
 - **Race Condition Tests**: 10 dedicated locking tests
 - **Stress Tests**: High-concurrency scenarios
@@ -701,50 +703,6 @@ After running the dashboard example:
 - **REST API**: <http://localhost:8080/api/jobs>
 - **WebSocket**: ws://localhost:8080/ws
 
-## 🎯 **Migration Implementation Status**
-
-### **✅ Complete Automated Migration System**
-
-The QML library now includes comprehensive automated migration functionality:
-
-#### **Core Features Implemented**
-
-- **✅ Schema Detection**: Intelligent detection of missing schemas and tables
-- **✅ Auto-Migration**: Zero-config database setup with schema creation
-- **✅ Smart Migration Logic**: Only runs migrations when actually needed
-- **✅ Error Recovery**: Automatic retry on schema-related errors
-- **✅ Production Patterns**: Manual control options for production safety
-- **✅ Health Checks**: Post-migration validation and verification
-
-#### **Files Added/Enhanced**
-
-- **`migrations/20250719000001_initial_schema.sql`** - Complete QML schema with indexes and triggers
-- **`migrations/20250719000002_add_job_locking.sql`** - Advanced job locking for distributed processing
-- **`src/storage/postgres.rs`** - Enhanced with `schema_exists()`, `migrate_if_needed()`, error handling
-- **`examples/automated_migration.rs`** - Comprehensive migration patterns demo
-- **`src/error.rs`** - Added `MigrationError` variant for consistency
-
-#### **Migration Capabilities**
-
-```rust
-// Automatic schema detection
-storage.schema_exists().await?               // Check if schema exists
-storage.migrate_if_needed().await?           // Smart migration logic
-storage.migrate().await?                     // Force migration
-
-// Error handling
-PostgresStorage::new(config).await?          // Auto-migrate on init (if enabled)
-```
-
-#### **Production Ready Features**
-
-- **Environment-specific configurations** (development/production/testing)
-- **Retry logic** with configurable attempts and delays
-- **Connection pooling** with optimal settings per environment
-- **Comprehensive logging** with tracing integration
-- **Schema validation** and health checks
-- **Manual migration control** for production deployments
-
 ## 📋 **Production Deployment**
 
 ### **Database Setup**
@@ -757,7 +715,7 @@ CREATE USER qml_user WITH PASSWORD 'secure_password';
 GRANT ALL PRIVILEGES ON DATABASE qml TO qml_user;
 ```
 
-1. **Environment Variables**:
+2. **Environment Variables**:
 
 ```bash
 export DATABASE_URL="postgresql://qml_user:secure_password@localhost:5432/qml"
@@ -765,7 +723,7 @@ export RUST_LOG=info
 export QML_WORKERS=20
 ```
 
-1. **Docker Compose**:
+3. **Docker Compose**:
 
 ```yaml
 version: "3.8"
@@ -847,12 +805,19 @@ spec:
 
 ```rust
 let config = ServerConfig::new("production-server")
-    .worker_count(20)                    // Number of worker threads
-    .polling_interval(Duration::from_secs(1))  // Job fetch frequency
-    .job_timeout(Duration::from_secs(300))     // Per-job timeout
-    .queues(vec!["critical", "normal"])        // Queue priorities
-    .fetch_batch_size(10)                      // Jobs per fetch
-    .enable_scheduler(true);                   // Time-based scheduling
+    .worker_count(20)                                  // Worker threads
+    .polling_interval(Duration::from_secs(1))          // Job fetch frequency
+    .job_timeout(Duration::from_secs(300))             // Per-job timeout
+    .queues(vec!["critical".into(), "normal".into()])  // Queue priorities
+    .fetch_batch_size(10)                              // Jobs per fetch
+    .enable_scheduler(true)                            // Promote scheduled / retry jobs
+    .enable_recurring(true)                            // Cron-template poller (default on)
+    .enable_cleanup(true)                              // Sweep expired final-state rows (default on)
+    .enable_heartbeat(false);                          // Multi-server peer reclaim (off by default)
+
+// See the "Recurring Jobs" and "Automatic Expiration" sections above for
+// timing knobs (`recurring_poll_interval`, `succeeded_ttl`, `failed_ttl`,
+// `cleanup_interval`), which take `chrono::Duration`.
 ```
 
 ### **Storage Configurations**
@@ -875,15 +840,6 @@ let redis_config = RedisConfig::new()
     .with_completed_job_ttl(Duration::from_secs(86400)); // 24h
 ```
 
-## 🚀 **What's Next?**
-
-qml is production-ready! The next phase focuses on:
-
-1. **📚 Enhanced Documentation**: API docs, tutorials, best practices
-2. **📈 Performance Optimization**: Benchmarks and scaling guides
-3. **🔌 Ecosystem Integration**: Plugins, metrics, observability
-4. **📦 Crate Publication**: Release to crates.io for community adoption
-
 ## 🤝 **Contributing**
 
 We welcome contributions of all kinds! Whether you're fixing bugs, adding features, improving documentation, or enhancing tests, your help makes qml better for everyone.
@@ -891,8 +847,8 @@ We welcome contributions of all kinds! Whether you're fixing bugs, adding featur
 Please see our [Contributing Guide](CONTRIBUTING.md) for detailed information on:
 
 - 🚀 **Getting Started**: Development setup and environment configuration
-- � **Guidelines**: Code style, testing requirements, and best practices
-- � **Process**: Pull request workflow and commit message format
+- 📋 **Guidelines**: Code style, testing requirements, and best practices
+- 🔄 **Process**: Pull request workflow and commit message format
 - 🏗️ **Architecture**: Project structure and component overview
 - 🧪 **Testing**: Comprehensive testing guidelines and backend setup
 - 📚 **Documentation**: Writing and maintaining documentation
@@ -915,21 +871,6 @@ cargo watch -x test
 ```
 
 For questions or help getting started, please open an issue with the "question" label.
-
-## 📚 **Documentation**
-
-This README now contains all comprehensive documentation previously spread across multiple files:
-
-### **Consolidated Information**
-
-- **✅ Complete Migration Guide**: All automated migration patterns and best practices
-- **✅ Implementation Status**: Current feature status and capabilities
-- **✅ Production Deployment**: Enterprise-ready deployment patterns
-- **✅ Configuration Options**: Environment variables and programmatic config
-- **✅ Error Handling**: Comprehensive error recovery patterns
-- **✅ Health Checks**: Post-deployment validation and monitoring
-
-## 👥 **Contributing**
 
 ## 🔒 **Security & Production Notes**
 

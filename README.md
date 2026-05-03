@@ -1,16 +1,16 @@
 # qml
 
-A production-ready Rust implementation of QML background job processing, designed for high-performance, reliability, and scalability.
+A background job processor for Rust. Workers pull jobs from a pluggable storage backend (in-memory, Redis, or PostgreSQL), with built-in retries, scheduling, recurring (cron) jobs, and a real-time dashboard. The API is shaped after Hangfire (.NET) — `BackgroundJobServer`, `Job`, `RecurringJob`, etc.
 
 [![Rust](https://img.shields.io/badge/rust-1.85+-blue.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-license)
 
 ## Capabilities
 
-- **3 Storage Backends**: Memory, Redis, PostgreSQL with full ACID compliance
-- **Multi-threaded Processing**: Worker pools with configurable concurrency
-- **Web Dashboard**: Real-time monitoring with WebSocket updates
-- **Race Condition Prevention**: Comprehensive locking across all backends
+- **Three storage backends**: in-memory (dev/tests), Redis (durable, distributed), PostgreSQL (ACID, transactional)
+- **Multi-threaded processing**: worker pools with configurable concurrency
+- **Web dashboard**: real-time monitoring with WebSocket updates (feature-gated)
+- **Race-condition prevention**: backend-appropriate locking (Postgres `SELECT FOR UPDATE SKIP LOCKED`, Redis Lua, in-process Mutex)
 - **Stress-tested**: 100 jobs across 20 workers with no race conditions
 
 ## 📦 Installation
@@ -36,63 +36,34 @@ qml-rs = "2.0"
 > on a `dyn` value). Custom backends need to split their
 > `impl Storage for X` into five sub-trait impls.
 
-## 🔧 **Complete Feature Set**
+## 🔧 **Concepts**
 
-### **Storage Backends**
+### **Job lifecycle**
 
-- **MemoryStorage**: Thread-safe in-memory storage for development/testing
-- **RedisStorage**: Scalable Redis backend with Lua script atomicity
-- **PostgresStorage**: ACID-compliant PostgreSQL with SELECT FOR UPDATE locking
+```text
+Enqueued → Processing → Succeeded | Failed
+Scheduled    → Enqueued   (time-based activation)
+AwaitingRetry → Enqueued  (retry policy)
+Deleted                  (soft delete)
+```
 
-### **Job Processing Engine**
+State transitions are validated by `Job::set_state`. `Succeeded` and permanently-`Failed` jobs are stamped with `expires_at` and swept out-of-band by `CleanupWorker` (TTLs configurable via `succeeded_ttl` / `failed_ttl`, default 24h / 7d).
 
-- **Multi-threaded Workers**: Configurable worker pools with automatic job fetching
-- **Retry Logic**: Exponential backoff with customizable retry policies
-- **Job Scheduling**: Schedule jobs for future execution
-- **Queue Management**: Priority-based job queues with filtering
+### **Recurring jobs**
 
-### **Job States & Lifecycle**
+Cron-scheduled templates via `BackgroundJobServer::schedule_recurring`. The `RecurringJobPoller` claims due templates with a claim-and-park discipline, so two servers running against one storage backend won't fire the same tick twice. Templates persist across restarts.
 
-- `Enqueued` → `Processing` → `Succeeded` | `Failed`
-- `Scheduled` → `Enqueued` (time-based activation)
-- `AwaitingRetry` → `Enqueued` (retry logic)
-- `Deleted` (soft deletion with audit trail)
+### **Retry logic**
 
-### **Recurring Jobs**
+Failed jobs move to `AwaitingRetry` with an exponential-backoff schedule (configurable per job). The scheduler promotes them back to `Enqueued` when due. Permanent failure (max attempts exhausted) lands in `Failed` and gets the same expiration treatment as `Succeeded`.
 
-- Cron-scheduled templates via `BackgroundJobServer::schedule_recurring`
-- `RecurringJobPoller` materializes due templates into normal jobs
-- Claim-and-park locking prevents multi-server duplicate firings
-- Templates persist in a dedicated table/keyspace across restarts
+### **Race-condition prevention**
 
-### **Automatic Expiration**
+The `Storage` trait's `fetch_and_lock_job` is atomic against concurrent workers. Implementation per backend: PostgreSQL uses `SELECT … FOR UPDATE SKIP LOCKED` plus a dedicated lock table, Redis uses Lua scripts, in-memory uses a `Mutex` plus a per-job lock map with TTL cleanup.
 
-- `Succeeded` and permanently-`Failed` jobs are stamped with `expires_at`
-- `CleanupWorker` sweeps expired rows out-of-band (default every minute)
-- Configurable TTLs: `succeeded_ttl` (default 24h), `failed_ttl` (default 7d)
+### **Dashboard**
 
-### **Race Condition Prevention**
-
-- **PostgreSQL**: `SELECT FOR UPDATE SKIP LOCKED` with dedicated lock table
-- **Redis**: Atomic Lua scripts with distributed locking and expiration
-- **Memory**: Mutex-based locking with automatic cleanup
-
-### **Dashboard & Monitoring**
-
-- **Web UI**: Real-time job statistics and status monitoring
-- **WebSocket Updates**: Live dashboard updates without polling
-- **REST API**: Programmatic access to job data and statistics
-- **Job Statistics**: Detailed metrics by state, queue, and time period
-
-### **Advanced Features**
-
-- **Automated Database Migrations**: Zero-config PostgreSQL schema management with intelligent detection
-- **Schema Detection**: Automated detection of missing schemas and tables with error recovery
-- **Zero-Config Setup**: Databases initialize automatically even when empty
-- **Migration Best Practices**: Production-ready patterns with manual control options
-- **Connection Pooling**: Configurable connection pools for all backends
-- **Comprehensive Config**: Fine-tuned settings for production deployment
-- **Error Handling**: Detailed error types with proper error propagation
+Behind the `dashboard` feature: web UI with WebSocket-driven live updates, REST API at `/api/jobs`, basic/bearer auth (`DashboardConfig::auth`), and an `Origin`/`Referer` CSRF guard on mutating routes.
 
 ## 🚀 **Quick Start**
 
@@ -232,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### **Redis Cluster Setup**
+### **Redis Setup**
 
 ```rust
 use qml_rs::{RedisConfig, RedisStorage, StorageInstance};
@@ -311,257 +282,60 @@ fn setup_worker_registry() -> WorkerRegistry {
 }
 ```
 
-## 🗄️ **Automated Database Migration**
+## 🗄️ Database Schema (PostgreSQL)
 
-QML provides comprehensive automated migration support for PostgreSQL with zero-configuration setup and production-ready patterns.
+The complete PostgreSQL schema lives in `install.sql` and is **embedded into the binary** when the `postgres` feature is enabled — no external migration directory, no `sqlx migrate` runtime to manage.
 
-### **Zero-Configuration Setup**
+### Auto-install (development)
+
+`PostgresStorage::new` runs `install.sql` automatically when `with_auto_migrate(true)` (the default):
 
 ```rust
 use qml_rs::{PostgresConfig, PostgresStorage};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Just provide a database URL - migrations run automatically!
-    let storage = PostgresStorage::new(
-        PostgresConfig::new()
-            .with_database_url("postgresql://user:pass@localhost/db")
-            .with_auto_migrate(true)  // Default: enabled
-    ).await?;
-
-    println!("Database ready with schema!");
-    Ok(())
-}
-```
-
-### **Migration Strategies**
-
-#### **Development Pattern** (Recommended for local dev)
-
-```rust
-// Auto-migrate everything on startup
-let config = PostgresConfig::new()
-    .with_database_url(database_url)
-    .with_auto_migrate(true);        // Enabled by default
-
-let storage = PostgresStorage::new(config).await?; // Migrations run automatically
-```
-
-#### **Production Pattern** (Recommended for production)
-
-```rust
-// Manual migration control for production safety
-let config = PostgresConfig::new()
-    .with_database_url(database_url)
-    .with_auto_migrate(false);       // Disable auto-migration
-
-let storage = PostgresStorage::new(config).await?;
-
-// Run migrations explicitly when ready
-storage.migrate().await?;
-```
-
-#### **Testing Pattern** (Minimal resources)
-
-```rust
-// Fast setup for tests with automatic cleanup
-let config = PostgresConfig::new()
-    .with_database_url(test_database_url)
-    .with_auto_migrate(true)
-    .with_max_connections(2)        // Minimal resources
-    .with_min_connections(1);
-
-let storage = PostgresStorage::new(config).await?;
-```
-
-### **Smart Migration Detection**
-
-The library automatically detects when migrations are needed:
-
-```rust
-// Check if schema exists before operations
-if !storage.schema_exists().await? {
-    println!("Schema not found, migrations needed");
-    storage.migrate().await?;
-}
-
-// Only run migrations if actually needed
-let migration_needed = storage.migrate_if_needed().await?;
-if migration_needed {
-    println!("Migrations were applied");
-} else {
-    println!("Schema already up to date");
-}
-```
-
-### **Error Recovery & Health Checks**
-
-```rust
-use qml_rs::{PostgresStorage, StorageError, PostgresConfig};
-
-async fn robust_initialization(database_url: String) -> Result<PostgresStorage, Box<dyn std::error::Error>> {
-    let config = PostgresConfig::new()
-        .with_database_url(database_url)
-        .with_auto_migrate(true);
-
-    match PostgresStorage::new(config).await {
-        Ok(storage) => {
-            // Verify schema after initialization
-            if storage.schema_exists().await? {
-                Ok(storage)
-            } else {
-                // Force migration if schema still missing
-                storage.migrate().await?;
-                Ok(storage)
-            }
-        }
-        Err(StorageError::MigrationError { message }) => {
-            eprintln!("Migration failed: {}", message);
-            Err("Database initialization failed".into())
-        }
-        Err(e) => Err(Box::new(e)),
-    }
-}
-```
-
-### **Migration Files Structure**
-
-QML now uses an **embedded schema approach** - no external migration files needed!
-
-The complete PostgreSQL schema is embedded directly in the binary as `install.sql` and only requires the `postgres` feature to be enabled:
-
-```rust
-// Schema installation happens automatically or manually
 let storage = PostgresStorage::new(
     PostgresConfig::new()
-        .with_database_url(database_url)
-        .with_auto_migrate(true)  // Installs embedded schema automatically
+        .with_database_url("postgresql://user:pass@localhost/db")
+        .with_auto_migrate(true) // default
 ).await?;
 ```
 
-#### **Embedded Schema Features**
+### Manual install (production)
 
-The embedded `install.sql` includes everything needed for production:
-
-- **Complete job table** with all columns, constraints, and documentation
-- **Performance indexes** for efficient job processing and querying
-- **Distributed job locking** functions for multi-worker environments
-- **Automatic triggers** for timestamp management
-- **Job state enums** for type safety
-- **Comprehensive comments** for all tables, columns, and functions
-
-#### **Key Advantages**
-
-- ✅ **No external files** to manage or deploy
-- ✅ **Always in sync** with code version
-- ✅ **Simplified deployments** - just enable postgres feature
-- ✅ **Feature-gated** - only compiles when needed
-- ✅ **Production-ready** with all optimizations included
-
-### **Configuration Options**
-
-#### **Environment Variables**
-
-```bash
-# Database configuration
-export DATABASE_URL="postgresql://user:pass@localhost:5432/qml"
-export QML_MAX_CONNECTIONS="20"
-export QML_MIN_CONNECTIONS="2"
-export QML_AUTO_MIGRATE="true"  # Enable embedded schema auto-installation
-```
-
-#### **Programmatic Configuration**
+For production, disable auto-install and run the schema explicitly during deploys:
 
 ```rust
 let config = PostgresConfig::new()
     .with_database_url(database_url)
-    .with_auto_migrate(true)        // Enable embedded schema installation
-    .with_max_connections(20)
-    .with_min_connections(2)
-    .with_connect_timeout(Duration::from_secs(10))
-    .with_command_timeout(Duration::from_secs(30))
-    .with_schema_name("qml")
-    .with_table_name("qml_jobs");
-```
-
-### **Production Deployment Checklist**
-
-#### **Before Deployment**
-
-- [ ] Postgres feature is enabled in Cargo.toml: `features = ["postgres"]`
-- [ ] Database user has schema creation permissions
-- [ ] Connection limits are appropriate for load
-- [ ] Timeouts are configured for network conditions
-- [ ] Auto-migration setting matches environment (dev vs prod)
-
-#### **Manual Installation (Recommended for Production)**
-
-```rust
-// Deploy with auto_migrate=false for production safety
-let config = PostgresConfig::new()
     .with_auto_migrate(false);
 
-// Install embedded schema manually during deployment
 let storage = PostgresStorage::new(config).await?;
-storage.migrate().await?;  // Installs complete embedded schema
+storage.migrate().await?; // applies install.sql
 ```
 
-#### **Health Checks**
+`schema_exists()` and `migrate_if_needed()` are also available for conditional logic, and `StorageError::MigrationError` carries the failure detail when initialization fails.
 
-```rust
-async fn health_check(storage: &PostgresStorage) -> Result<(), Box<dyn std::error::Error>> {
-    // Check schema exists
-    if !storage.schema_exists().await? {
-        return Err("Schema missing".into());
-    }
+### Environment variables
 
-    // Test basic operation
-    storage.get_job_count("default").await?;
-    Ok(())
-}
+```bash
+export DATABASE_URL="postgresql://user:pass@localhost:5432/qml"
+export QML_MAX_CONNECTIONS="20"
+export QML_MIN_CONNECTIONS="2"
+export QML_AUTO_MIGRATE="true"
 ```
 
-### **Advanced Migration Patterns**
-
-#### **Conditional Migration**
-
-```rust
-// Only migrate if specific conditions are met
-let should_migrate = !storage.schema_exists().await? ||
-                    std::env::var("FORCE_MIGRATION").is_ok();
-
-if should_migrate {
-    storage.migrate().await?;
-}
-```
-
-### **Migration Monitoring & Logging**
-
-```rust
-use tracing::{info, warn, error};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Enable detailed migration logging
-    tracing_subscriber::fmt::init();
-
-    let storage = PostgresStorage::new(config).await?;
-    // Migration logs will be automatically emitted
-
-    Ok(())
-}
-```
+The full programmatic surface (`with_max_connections`, `with_min_connections`, `with_connect_timeout`, `with_command_timeout`, `with_schema_name`, `with_table_name`) is documented on `PostgresConfig`.
 
 ## 🎯 **Storage Backend Comparison**
 
-| Feature              | Memory      | Redis        | PostgreSQL |
-| -------------------- | ----------- | ------------ | ---------- |
-| **Performance**      | Ultra Fast  | Fast         | Good       |
-| **Persistence**      | None        | Durable      | ACID       |
-| **Scalability**      | Single Node | Distributed  | Horizontal |
-| **Locking**          | Mutex       | Distributed  | Row-level  |
-| **Production Ready** | No (dev/test only) | Yes  | Yes        |
-| **Use Case**         | Testing     | High Traffic | Enterprise |
+| Property             | Memory             | Redis                 | PostgreSQL              |
+| -------------------- | ------------------ | --------------------- | ----------------------- |
+| **Durable**          | No                 | Yes (with AOF/RDB)    | Yes                     |
+| **Transactional**    | No                 | No (atomic via Lua)   | Yes (ACID)              |
+| **Scope**            | Single process     | Multi-process / multi-node | Multi-process / multi-node |
+| **Locking**          | In-process Mutex   | Lua scripts           | `SELECT … FOR UPDATE SKIP LOCKED` |
+| **Production-ready** | No (dev/test only) | Yes                   | Yes                     |
+| **Best for**         | Unit tests, demos  | Low-latency at scale  | Strong durability, audits |
 
 ## 📊 **Performance Characteristics**
 
@@ -578,28 +352,25 @@ and payload shape (`cargo test test_high_concurrency_stress`) before sizing.
 
 ### **Concurrency Testing**
 
-- ✅ **100 jobs + 20 workers**: Zero race conditions
-- ✅ **Stress test**: 10,000+ jobs processed successfully
-- ✅ **Lock expiration**: Automatic cleanup after timeout
+The locking contract (atomic fetch-and-claim, no double-dispatch) is exercised against every backend. The stress suite runs 100 concurrent jobs across 20 workers and a longer-running scenario in the multi-thousand-job range; both are part of `cargo test`.
 
 ## 🏗 **Architecture Overview**
 
 ```text
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Web Dashboard │    │   Job Client    │    │  Worker Nodes   │
-│   (WebSocket)   │    │                 │    │                 │
+│   (WebSocket)   │    │  (enqueue API)  │    │  (BackgroundJobServer) │
 └─────────┬───────┘    └─────────┬───────┘    └─────────┬───────┘
           │                      │                      │
           └──────────────────────┼──────────────────────┘
                                  │
-                    ┌─────────────┴─────────────┐
-                    │      Storage Layer        │
-                    │                           │
-                    │  ┌─────┐ ┌─────┐ ┌─────┐  │
-                    │  │Mem  │ │Redis│ │PgSQL│  │
-                    │  └─────┘ └─────┘ └─────┘  │
-                    └───────────────────────────┘
+                ┌────────────────┴────────────────┐
+                │  Storage backend (pick one)     │
+                │   Memory  |  Redis  |  Postgres │
+                └─────────────────────────────────┘
 ```
+
+A deployment chooses **one** storage backend; the three boxes above are alternatives, not layers.
 
 ### **Core Components**
 
@@ -613,11 +384,10 @@ and payload shape (`cargo test test_high_concurrency_stress`) before sizing.
 
 ### **Comprehensive Test Suite**
 
-- **Unit Tests**: Core functionality coverage
-- **Integration Tests**: Cross-backend compatibility
-- **Race Condition Tests**: 10 dedicated locking tests
-- **Stress Tests**: High-concurrency scenarios
-- **Property Tests**: Edge case coverage
+- **Unit tests**: core functionality coverage
+- **Integration tests**: cross-backend compatibility (auto-skip when `DATABASE_URL` / `REDIS_URL` are unset)
+- **Locking-contract tests**: dedicated tests covering the atomic-fetch contract on every backend
+- **Stress tests**: high-concurrency scenarios (100 jobs × 20 workers)
 
 ### **Run Tests**
 
@@ -646,54 +416,30 @@ cargo run --example basic_job
 # Multi-backend storage operations
 cargo run --example storage_demo
 
-# Real-time dashboard with WebSocket
-cargo run --example dashboard_demo
-
-# Complete job processing with workers
+# Job processing with workers
 cargo run --example processing_demo
 
+# Middleware showing per-job metric emission
+cargo run --example middleware_metrics
+
+# Real-time dashboard with WebSocket
+cargo run --example dashboard_demo --features dashboard
+
+# Embedding the dashboard router in an existing Axum app
+cargo run --example axum_integration --features dashboard
+
+# Prometheus metrics middleware + /metrics endpoint
+cargo run --example metrics_demo --features metrics
+
 # PostgreSQL setup and operations
-cargo run --example postgres_simple
+cargo run --example postgres_simple --features postgres
 
-# Comprehensive automated migration demo with embedded schema
-cargo run --example automated_migration --features postgres
-
-# Embedded schema installation patterns
+# Embedded-schema installation patterns
 cargo run --example custom_migrations --features postgres
+
+# End-to-end migration patterns (dev / prod / test)
+cargo run --example automated_migration --features postgres
 ```
-
-#### **Automated Migration Example**
-
-The `automated_migration.rs` example demonstrates the new embedded schema approach:
-
-```rust
-// Multiple migration strategies using embedded schema
-pub enum MigrationStrategy {
-    Development,    // Auto-install embedded schema
-    Production,     // Manual embedded schema control
-    Testing,        // Minimal resources with embedded schema
-}
-
-// DatabaseManager with embedded schema installation
-let database_manager = DatabaseManager::new(
-    database_url,
-    MigrationStrategy::Development
-).await?;
-
-// Schema installation and health checks
-database_manager.ensure_schema().await?;
-database_manager.health_check().await?;
-```
-
-The example includes:
-
-- **Embedded schema installation** - no external files needed
-- **Feature-gated approach** - only compiles with postgres feature
-- **Zero-config setup** for development
-- **Manual control** for production
-- **Health checks and validation**
-- **Comprehensive error handling**
-- **Performance optimizations included**
 
 ### **Dashboard URLs**
 
@@ -707,11 +453,13 @@ After running the dashboard example:
 
 ### **Database Setup**
 
+> The values `secure_password` below are placeholders — substitute real secrets (or environment variables) in any deployment.
+
 1. **Database Creation**:
 
 ```sql
 CREATE DATABASE qml;
-CREATE USER qml_user WITH PASSWORD 'secure_password';
+CREATE USER qml_user WITH PASSWORD 'secure_password'; -- placeholder
 GRANT ALL PRIVILEGES ON DATABASE qml TO qml_user;
 ```
 
@@ -723,7 +471,7 @@ export RUST_LOG=info
 export QML_WORKERS=20
 ```
 
-3. **Docker Compose**:
+3. **Docker Compose** (Postgres + Redis + app):
 
 ```yaml
 version: "3.8"
@@ -733,33 +481,35 @@ services:
     environment:
       POSTGRES_DB: qml
       POSTGRES_USER: qml_user
-      POSTGRES_PASSWORD: secure_password
+      POSTGRES_PASSWORD: secure_password # placeholder
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
   qml-app:
     build: .
     environment:
       DATABASE_URL: postgresql://qml_user:secure_password@postgres:5432/qml
+      REDIS_URL: redis://redis:6379
       QML_WORKERS: 20
     depends_on:
       - postgres
+      - redis
     ports:
       - "8080:8080"
 
 volumes:
   postgres_data:
-```
-
-### **Redis Cluster**
-
-```bash
-# Redis with persistence
-docker run -d --name redis \
-  -p 6379:6379 \
-  redis:7-alpine redis-server --appendonly yes
+  redis_data:
 ```
 
 ### **Kubernetes Deployment**
@@ -781,7 +531,7 @@ spec:
     spec:
       containers:
         - name: qml
-          image: your-registry/qml-app:latest
+          image: your-registry/qml-app:latest # replace with your image
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -790,6 +540,20 @@ spec:
                   key: database-url
             - name: QML_WORKERS
               value: "10"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
           resources:
             requests:
               memory: "256Mi"
@@ -798,6 +562,8 @@ spec:
               memory: "512Mi"
               cpu: "500m"
 ```
+
+> The probes assume you've wired a `/health` endpoint into the dashboard router (or your own Axum app); adjust the path/port to whatever your binary exposes.
 
 ## 🔧 **Configuration Reference**
 
@@ -823,6 +589,8 @@ let config = ServerConfig::new("production-server")
 ### **Storage Configurations**
 
 ```rust
+use std::time::Duration;
+
 // PostgreSQL Production Config
 let pg_config = PostgresConfig::new()
     .with_database_url("postgresql://...")
@@ -857,8 +625,8 @@ Please see our [Contributing Guide](CONTRIBUTING.md) for detailed information on
 ### **Quick Start for Contributors**
 
 ```bash
-# Fork and clone the repository
-git clone https://github.com/yourusername/qml.git
+# Clone the repository (or your fork)
+git clone https://github.com/queue-me-later/qml.git
 cd qml
 
 # Install dependencies and run tests
@@ -872,25 +640,19 @@ cargo watch -x test
 
 For questions or help getting started, please open an issue with the "question" label.
 
-## 🔒 **Security & Production Notes**
+## 🔒 **Security Notes**
 
-### Development Credentials Warning
+### Placeholder credentials in defaults
 
-⚠️ **IMPORTANT**: This library includes placeholder development credentials in `src/storage/settings.rs` for testing and examples. These are clearly marked as development-only and should **NEVER** be used in production:
+`src/storage/settings.rs` contains an intentionally non-functional placeholder password (`dev_password_change_me`) used by tests and examples. It is **not** a real default — override it via environment variables or explicit `PostgresConfig`/`RedisConfig` builders in any non-test deployment.
 
-- `dev_password_change_me` - Development PostgreSQL password placeholder
-- Development environment defaults for local testing only
-- Sample configuration values for documentation
+### Production checklist
 
-### Production Deployment
-
-1. Always set proper environment variables (see `.env.example`)
-2. Use strong, unique passwords and secrets
-3. Configure proper database access controls
-4. Enable TLS/SSL for database connections
-5. Regularly rotate secrets and credentials
-
-The library follows security best practices and is safe for public repositories when proper production configuration is used.
+- Set credentials and connection URLs from environment variables (see `.env.example`).
+- Enable TLS/SSL on the database connection string.
+- Restrict the database user to the schemas/tables it actually needs.
+- If you expose the dashboard outside loopback, set `DashboardConfig::auth` (basic or bearer) — the dashboard layer enforces this and refuses to bind to a non-loopback host without it.
+- The dashboard's mutating endpoints are protected by an `Origin`/`Referer` CSRF guard; don't bypass it when adding new routes.
 
 ## 📄 **License**
 

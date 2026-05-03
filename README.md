@@ -1,6 +1,6 @@
 # qml
 
-A background job processor for Rust. Workers pull jobs from a pluggable storage backend (in-memory, Redis, or PostgreSQL), with built-in retries, scheduling, recurring (cron) jobs, and a real-time dashboard. The API is shaped after Hangfire (.NET) — `BackgroundJobServer`, `Job`, `RecurringJob`, etc.
+A background job processor for Rust. Workers pull jobs from a pluggable storage backend (in-memory, Redis, or PostgreSQL), with built-in retries, scheduling, recurring (cron) jobs, and a real-time dashboard.
 
 [![Rust](https://img.shields.io/badge/rust-1.85+-blue.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-license)

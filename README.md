@@ -40,11 +40,21 @@ qml-rs = "2.0"
 
 ### **Job lifecycle**
 
-```text
-Enqueued → Processing → Succeeded | Failed
-Scheduled    → Enqueued   (time-based activation)
-AwaitingRetry → Enqueued  (retry policy)
-Deleted                  (soft delete)
+```mermaid
+stateDiagram-v2
+    [*] --> Enqueued: enqueue()
+    [*] --> Scheduled: schedule_at()
+    Scheduled --> Enqueued: due time reached
+    Enqueued --> Processing: worker claims (atomic)
+    Processing --> Succeeded
+    Processing --> AwaitingRetry: retry policy
+    Processing --> Failed: attempts exhausted
+    AwaitingRetry --> Enqueued: backoff elapsed
+    Succeeded --> [*]: CleanupWorker (expires_at)
+    Failed --> [*]: CleanupWorker (expires_at)
+    Enqueued --> Deleted: delete()
+    Scheduled --> Deleted: delete()
+    Processing --> Deleted: delete()
 ```
 
 State transitions are validated by `Job::set_state`. `Succeeded` and permanently-`Failed` jobs are stamped with `expires_at` and swept out-of-band by `CleanupWorker` (TTLs configurable via `succeeded_ttl` / `failed_ttl`, default 24h / 7d).
@@ -356,21 +366,24 @@ The locking contract (atomic fetch-and-claim, no double-dispatch) is exercised a
 
 ## 🏗 **Architecture Overview**
 
-```text
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Web Dashboard │    │   Job Client    │    │  Worker Nodes   │
-│   (WebSocket)   │    │  (enqueue API)  │    │  (BackgroundJobServer) │
-└─────────┬───────┘    └─────────┬───────┘    └─────────┬───────┘
-          │                      │                      │
-          └──────────────────────┼──────────────────────┘
-                                 │
-                ┌────────────────┴────────────────┐
-                │  Storage backend (pick one)     │
-                │   Memory  |  Redis  |  Postgres │
-                └─────────────────────────────────┘
+```mermaid
+flowchart TB
+    D[Web Dashboard<br/>WebSocket UI]
+    C[Job Client<br/>enqueue API]
+    W[Worker Nodes<br/>BackgroundJobServer]
+
+    D --> S
+    C --> S
+    W --> S
+
+    S[Storage trait]
+
+    S --> M[(Memory)]
+    S --> R[(Redis)]
+    S --> P[(PostgreSQL)]
 ```
 
-A deployment chooses **one** storage backend; the three boxes above are alternatives, not layers.
+A deployment chooses **one** storage backend; `Memory` / `Redis` / `PostgreSQL` are alternative implementations of the same `Storage` trait, not layered on top of each other.
 
 ### **Core Components**
 
